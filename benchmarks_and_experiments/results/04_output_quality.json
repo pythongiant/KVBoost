@@ -1,0 +1,197 @@
+{
+  "perplexity": [
+    {
+      "passage_idx": 0,
+      "perplexity": 5.89,
+      "tokens": 222
+    },
+    {
+      "passage_idx": 1,
+      "perplexity": 8.41,
+      "tokens": 166
+    },
+    {
+      "passage_idx": 2,
+      "perplexity": 9.77,
+      "tokens": 185
+    }
+  ],
+  "kl_divergence": [
+    {
+      "query_idx": 0,
+      "per_step_kl": [
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "mean_kl": NaN,
+      "max_kl": NaN,
+      "n_steps": 16
+    },
+    {
+      "query_idx": 1,
+      "per_step_kl": [
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "mean_kl": NaN,
+      "max_kl": NaN,
+      "n_steps": 16
+    },
+    {
+      "query_idx": 2,
+      "per_step_kl": [
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "mean_kl": NaN,
+      "max_kl": NaN,
+      "n_steps": 16
+    }
+  ],
+  "recompute_ablation": {
+    "with_recompute_match_rate": 1.0,
+    "without_recompute_match_rate": 1.0
+  },
+  "long_range_dependencies": {
+    "match_rate": 1.0,
+    "tests": [
+      {
+        "description": "multi-step logical reasoning across boundary",
+        "prompt_tokens": 182,
+        "chunk_boundaries": [
+          [
+            0,
+            128
+          ],
+          [
+            128,
+            182
+          ]
+        ],
+        "chunk_size": 128,
+        "baseline_output": "SLA violations occur.\n\nExample:\n\nQ: How can",
+        "chunk_kv_output": "SLA violations occur.\n\nExample:\n\nQ: How can",
+        "outputs_match": true,
+        "reuse_ratio": 0.0
+      },
+      {
+        "description": "code completion across boundary",
+        "prompt_tokens": 250,
+        "chunk_boundaries": [
+          [
+            0,
+            128
+          ],
+          [
+            128,
+            250
+          ]
+        ],
+        "chunk_size": 128,
+        "baseline_output": "\n\nThe function takes two lists as input, and returns a new list containing",
+        "chunk_kv_output": "\n\nThe function takes two lists as input, and returns a new list containing",
+        "outputs_match": true,
+        "reuse_ratio": 0.0
+      },
+      {
+        "description": "cross-reference across document sections",
+        "prompt_tokens": 497,
+        "chunk_boundaries": [
+          [
+            0,
+            128
+          ],
+          [
+            128,
+            256
+          ],
+          [
+            256,
+            384
+          ],
+          [
+            384,
+            497
+          ]
+        ],
+        "chunk_size": 128,
+        "baseline_output": "",
+        "chunk_kv_output": "",
+        "outputs_match": true,
+        "reuse_ratio": 0.772635814889336
+      }
+    ]
+  },
+  "sampling_temperatures": {
+    "0.5": {
+      "baseline_unique_outputs": 9,
+      "cached_unique_outputs": 9,
+      "overlapping_outputs": 2,
+      "jaccard_similarity": 0.125,
+      "n_samples": 10
+    },
+    "0.8": {
+      "baseline_unique_outputs": 10,
+      "cached_unique_outputs": 9,
+      "overlapping_outputs": 0,
+      "jaccard_similarity": 0.0,
+      "n_samples": 10
+    },
+    "1.0": {
+      "baseline_unique_outputs": 10,
+      "cached_unique_outputs": 10,
+      "overlapping_outputs": 1,
+      "jaccard_similarity": 0.053,
+      "n_samples": 10
+    },
+    "1.2": {
+      "baseline_unique_outputs": 10,
+      "cached_unique_outputs": 10,
+      "overlapping_outputs": 0,
+      "jaccard_similarity": 0.0,
+      "n_samples": 10
+    }
+  }
+}

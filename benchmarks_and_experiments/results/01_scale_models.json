@@ -1,0 +1,165 @@
+[
+  {
+    "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "params_billions": 1.1,
+    "num_layers": 22,
+    "num_heads": 32,
+    "head_dim": 64,
+    "device": "mps",
+    "chunk_size": 128,
+    "workloads": {
+      "system_prompt_reuse": {
+        "baseline": {
+          "ttft_ms": {
+            "mean": 191.693,
+            "median": 128.456,
+            "min": 71.472,
+            "max": 321.816,
+            "stdev": 119.247
+          },
+          "total_ms": {
+            "mean": 2091.258,
+            "median": 1926.866,
+            "min": 1854.548,
+            "max": 2623.565,
+            "stdev": 328.227
+          },
+          "tokens_per_sec": {
+            "mean": 7.787,
+            "median": 8.304,
+            "min": 6.099,
+            "max": 8.627,
+            "stdev": 1.089
+          },
+          "n_samples": 5
+        },
+        "prefix_cache": {
+          "ttft_ms": {
+            "mean": 66.479,
+            "median": 59.354,
+            "min": 44.418,
+            "max": 122.457,
+            "stdev": 32.05
+          },
+          "total_ms": {
+            "mean": 1897.022,
+            "median": 1875.653,
+            "min": 1612.379,
+            "max": 2123.866,
+            "stdev": 201.296
+          },
+          "tokens_per_sec": {
+            "mean": 8.514,
+            "median": 8.53,
+            "min": 7.533,
+            "max": 9.923,
+            "stdev": 0.939
+          },
+          "n_samples": 5,
+          "ttft_speedup": 2.88
+        },
+        "chunk_kv_reuse": {
+          "ttft_ms": {
+            "mean": 68.876,
+            "median": 67.899,
+            "min": 52.91,
+            "max": 84.217,
+            "stdev": 12.779
+          },
+          "total_ms": {
+            "mean": 1788.943,
+            "median": 1783.602,
+            "min": 1735.706,
+            "max": 1852.387,
+            "stdev": 50.152
+          },
+          "tokens_per_sec": {
+            "mean": 8.949,
+            "median": 8.971,
+            "min": 8.638,
+            "max": 9.218,
+            "stdev": 0.25
+          },
+          "n_samples": 5,
+          "ttft_speedup": 2.78
+        }
+      },
+      "rag_doc_reuse": {
+        "baseline": {
+          "ttft_ms": {
+            "mean": 75.153,
+            "median": 97.671,
+            "min": 29.306,
+            "max": 109.511,
+            "stdev": 36.923
+          },
+          "total_ms": {
+            "mean": 3508.424,
+            "median": 2050.511,
+            "min": 1923.11,
+            "max": 6519.79,
+            "stdev": 2159.344
+          },
+          "tokens_per_sec": {
+            "mean": 1.423,
+            "median": 0.52,
+            "min": 0.488,
+            "max": 3.139,
+            "stdev": 1.278
+          },
+          "n_samples": 5
+        },
+        "prefix_cache": {
+          "ttft_ms": {
+            "mean": 95.738,
+            "median": 89.539,
+            "min": 73.879,
+            "max": 128.498,
+            "stdev": 21.29
+          },
+          "total_ms": {
+            "mean": 629.258,
+            "median": 243.39,
+            "min": 230.351,
+            "max": 1330.007,
+            "stdev": 544.883
+          },
+          "tokens_per_sec": {
+            "mean": 7.839,
+            "median": 4.341,
+            "min": 4.109,
+            "max": 14.414,
+            "stdev": 4.987
+          },
+          "n_samples": 5,
+          "ttft_speedup": 0.78
+        },
+        "chunk_kv_reuse": {
+          "ttft_ms": {
+            "mean": 25.46,
+            "median": 22.339,
+            "min": 18.478,
+            "max": 41.806,
+            "stdev": 9.347
+          },
+          "total_ms": {
+            "mean": 722.983,
+            "median": 268.962,
+            "min": 158.154,
+            "max": 2231.936,
+            "stdev": 877.347
+          },
+          "tokens_per_sec": {
+            "mean": 8.674,
+            "median": 6.323,
+            "min": 3.718,
+            "max": 21.111,
+            "stdev": 7.074
+          },
+          "n_samples": 5,
+          "ttft_speedup": 2.95
+        }
+      }
+    }
+  }
+]

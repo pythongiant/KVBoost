@@ -1,0 +1,398 @@
+{
+  "system_prompt": {
+    "baseline": {
+      "ttft_ms": {
+        "label": "baseline_ttft",
+        "n": 10,
+        "mean": 87.607,
+        "median": 94.936,
+        "min": 60.148,
+        "max": 105.335,
+        "stdev": 15.229,
+        "stderr": 4.816,
+        "ci_95": [
+          78.168,
+          97.046
+        ],
+        "cv": 0.174,
+        "p5": 60.148,
+        "p95": 105.335,
+        "outliers": 0
+      },
+      "total_ms": {
+        "label": "baseline_total",
+        "n": 10,
+        "mean": 1616.353,
+        "median": 1650.71,
+        "min": 1450.06,
+        "max": 1760.382,
+        "stdev": 91.585,
+        "stderr": 28.962,
+        "ci_95": [
+          1559.588,
+          1673.118
+        ],
+        "cv": 0.057,
+        "p5": 1450.06,
+        "p95": 1760.382,
+        "outliers": 0
+      },
+      "tokens_per_sec": {
+        "label": "baseline_tps",
+        "n": 10,
+        "mean": 9.928,
+        "median": 9.693,
+        "min": 9.089,
+        "max": 11.034,
+        "stdev": 0.576,
+        "stderr": 0.182,
+        "ci_95": [
+          9.571,
+          10.285
+        ],
+        "cv": 0.058,
+        "p5": 9.089,
+        "p95": 11.034,
+        "outliers": 0
+      },
+      "cold_start_ttft_ms": {
+        "label": "cold_start",
+        "n": 5,
+        "mean": 121.196,
+        "median": 134.974,
+        "min": 41.283,
+        "max": 165.303,
+        "stdev": 50.528,
+        "stderr": 22.597,
+        "ci_95": [
+          76.906,
+          165.486
+        ],
+        "cv": 0.417,
+        "outliers": 0
+      },
+      "outlier_analysis": {
+        "n_outliers": 0,
+        "outlier_values": [],
+        "bounds": [
+          31.816,
+          136.703
+        ]
+      },
+      "raw_ttfts": [
+        97.37,
+        94.34,
+        96.45,
+        100.94,
+        105.34,
+        95.53,
+        71.15,
+        83.73,
+        71.07,
+        60.15
+      ]
+    },
+    "chunk_kv_reuse": {
+      "ttft_ms": {
+        "label": "chunk_kv_reuse_ttft",
+        "n": 10,
+        "mean": 44.106,
+        "median": 41.919,
+        "min": 22.992,
+        "max": 66.56,
+        "stdev": 12.154,
+        "stderr": 3.843,
+        "ci_95": [
+          36.573,
+          51.639
+        ],
+        "cv": 0.276,
+        "p5": 22.992,
+        "p95": 66.56,
+        "outliers": 0
+      },
+      "total_ms": {
+        "label": "chunk_kv_reuse_total",
+        "n": 10,
+        "mean": 1559.071,
+        "median": 1492.429,
+        "min": 1424.93,
+        "max": 2083.181,
+        "stdev": 198.072,
+        "stderr": 62.636,
+        "ci_95": [
+          1436.305,
+          1681.837
+        ],
+        "cv": 0.127,
+        "p5": 1424.93,
+        "p95": 2083.181,
+        "outliers": 1
+      },
+      "tokens_per_sec": {
+        "label": "chunk_kv_reuse_tps",
+        "n": 10,
+        "mean": 10.384,
+        "median": 10.721,
+        "min": 7.681,
+        "max": 11.229,
+        "stdev": 1.069,
+        "stderr": 0.338,
+        "ci_95": [
+          9.722,
+          11.047
+        ],
+        "cv": 0.103,
+        "p5": 7.681,
+        "p95": 11.229,
+        "outliers": 1
+      },
+      "cold_start_ttft_ms": {
+        "label": "cold_start",
+        "n": 5,
+        "mean": 39.269,
+        "median": 23.446,
+        "min": 19.809,
+        "max": 79.036,
+        "stdev": 26.135,
+        "stderr": 11.688,
+        "ci_95": [
+          16.361,
+          62.177
+        ],
+        "cv": 0.666,
+        "outliers": 0
+      },
+      "outlier_analysis": {
+        "n_outliers": 0,
+        "outlier_values": [],
+        "bounds": [
+          12.025,
+          78.376
+        ]
+      },
+      "raw_ttfts": [
+        22.99,
+        66.56,
+        56.64,
+        53.49,
+        40.62,
+        41.51,
+        36.35,
+        36.91,
+        43.66,
+        42.32
+      ]
+    },
+    "significance_test": {
+      "mean_a": 87.607,
+      "mean_b": 44.105,
+      "difference": 43.502,
+      "t_statistic": 7.061,
+      "degrees_of_freedom": 17.2,
+      "p_value_approx": 0.0,
+      "significant_at_005": true,
+      "significant_at_001": true
+    },
+    "effect_size_cohens_d": 3.158,
+    "effect_size_label": "large"
+  },
+  "rag_document": {
+    "baseline": {
+      "ttft_ms": {
+        "label": "baseline_ttft",
+        "n": 10,
+        "mean": 13.58,
+        "median": 12.449,
+        "min": 10.169,
+        "max": 20.747,
+        "stdev": 3.45,
+        "stderr": 1.091,
+        "ci_95": [
+          11.442,
+          15.718
+        ],
+        "cv": 0.254,
+        "p5": 10.169,
+        "p95": 20.747,
+        "outliers": 0
+      },
+      "total_ms": {
+        "label": "baseline_total",
+        "n": 10,
+        "mean": 2238.837,
+        "median": 2204.992,
+        "min": 1070.471,
+        "max": 3538.326,
+        "stdev": 681.95,
+        "stderr": 215.651,
+        "ci_95": [
+          1816.16,
+          2661.513
+        ],
+        "cv": 0.305,
+        "p5": 1070.471,
+        "p95": 3538.326,
+        "outliers": 0
+      },
+      "tokens_per_sec": {
+        "label": "baseline_tps",
+        "n": 10,
+        "mean": 2.947,
+        "median": 0.766,
+        "min": 0.283,
+        "max": 7.834,
+        "stdev": 3.149,
+        "stderr": 0.996,
+        "ci_95": [
+          0.995,
+          4.899
+        ],
+        "cv": 1.068,
+        "p5": 0.283,
+        "p95": 7.834,
+        "outliers": 0
+      },
+      "cold_start_ttft_ms": {
+        "label": "cold_start",
+        "n": 5,
+        "mean": 56.004,
+        "median": 47.237,
+        "min": 41.103,
+        "max": 91.138,
+        "stdev": 20.193,
+        "stderr": 9.031,
+        "ci_95": [
+          38.304,
+          73.704
+        ],
+        "cv": 0.361,
+        "outliers": 1
+      },
+      "outlier_analysis": {
+        "n_outliers": 0,
+        "outlier_values": [],
+        "bounds": [
+          2.554,
+          23.945
+        ]
+      },
+      "raw_ttfts": [
+        14.71,
+        13.04,
+        20.75,
+        11.68,
+        10.27,
+        10.58,
+        10.17,
+        16.82,
+        11.86,
+        15.92
+      ]
+    },
+    "chunk_kv_reuse": {
+      "ttft_ms": {
+        "label": "chunk_kv_reuse_ttft",
+        "n": 10,
+        "mean": 53.634,
+        "median": 43.034,
+        "min": 40.247,
+        "max": 82.115,
+        "stdev": 16.147,
+        "stderr": 5.106,
+        "ci_95": [
+          43.626,
+          63.642
+        ],
+        "cv": 0.301,
+        "p5": 40.247,
+        "p95": 82.115,
+        "outliers": 0
+      },
+      "total_ms": {
+        "label": "chunk_kv_reuse_total",
+        "n": 10,
+        "mean": 958.275,
+        "median": 634.423,
+        "min": 418.747,
+        "max": 1855.227,
+        "stdev": 599.81,
+        "stderr": 189.677,
+        "ci_95": [
+          586.508,
+          1330.041
+        ],
+        "cv": 0.626,
+        "p5": 418.747,
+        "p95": 1855.227,
+        "outliers": 0
+      },
+      "tokens_per_sec": {
+        "label": "chunk_kv_reuse_tps",
+        "n": 10,
+        "mean": 5.245,
+        "median": 2.327,
+        "min": 1.315,
+        "max": 12.714,
+        "stdev": 4.312,
+        "stderr": 1.364,
+        "ci_95": [
+          2.572,
+          7.918
+        ],
+        "cv": 0.822,
+        "p5": 1.315,
+        "p95": 12.714,
+        "outliers": 0
+      },
+      "cold_start_ttft_ms": {
+        "label": "cold_start",
+        "n": 5,
+        "mean": 72.346,
+        "median": 71.903,
+        "min": 54.221,
+        "max": 91.198,
+        "stdev": 15.998,
+        "stderr": 7.155,
+        "ci_95": [
+          58.323,
+          86.369
+        ],
+        "cv": 0.221,
+        "outliers": 0
+      },
+      "outlier_analysis": {
+        "n_outliers": 0,
+        "outlier_values": [],
+        "bounds": [
+          3.416,
+          104.618
+        ]
+      },
+      "raw_ttfts": [
+        43.19,
+        41.16,
+        40.25,
+        41.37,
+        42.56,
+        60.47,
+        42.88,
+        75.69,
+        82.11,
+        66.67
+      ]
+    },
+    "significance_test": {
+      "mean_a": 13.58,
+      "mean_b": 53.635,
+      "difference": -40.055,
+      "t_statistic": -7.671,
+      "degrees_of_freedom": 9.8,
+      "p_value_approx": 0.0,
+      "significant_at_005": true,
+      "significant_at_001": true
+    },
+    "effect_size_cohens_d": -3.431,
+    "effect_size_label": "large"
+  }
+}
