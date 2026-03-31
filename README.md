@@ -14,7 +14,7 @@
   <a href="https://pypi.org/project/kvboost/0.1.0/"><img src="https://img.shields.io/pypi/pyversions/kvboost" alt="Python"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
   <a href="https://github.com/srihariunnikrishnan/kvboost"><img src="https://img.shields.io/badge/platform-CUDA%20%7C%20MPS%20%7C%20CPU-orange" alt="Platform"></a>
-  <a href="https://github.com/srihariunnikrishnan/kvboost/stargazers"><img src="https://img.shields.io/github/stars/srihariunnikrishnan/kvboost?style=social" alt="Stars"></a>
+  <a href="https://github.com/srihariunnikrishnan/kvboost/stargazers"><img src="https://img.shields.io/github/stars/pythongiant/kvboost?style=social" alt="Stars"></a>
 </p>
 
 <p align="center">
