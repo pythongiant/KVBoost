@@ -26,7 +26,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -53,9 +52,6 @@ def _load_dotenv(path: Path) -> None:
 
 
 _load_dotenv(_ENV_FILE)
-
-# ── Make the parent package importable ──────────────────────────────
-sys.path.insert(0, str(_SCRIPT_DIR.parent))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s — %(message)s")
 log = logging.getLogger("examples")
@@ -87,14 +83,14 @@ def get_engine(cfg: dict):
     if _engine is not None:
         return _engine
 
-    from engine import InferenceEngine
+    from kvboost import KVBoost
 
     # Set HF token for gated models
     if cfg["hf_token"]:
         os.environ["HF_TOKEN"] = cfg["hf_token"]
 
     log.info("Loading model: %s", cfg["model_name"])
-    _engine = InferenceEngine.from_pretrained(
+    _engine = KVBoost.from_pretrained(
         model_name=cfg["model_name"],
         chunk_size=cfg["chunk_size"],
         max_chunks=cfg["max_chunks"],
@@ -109,7 +105,7 @@ def get_engine(cfg: dict):
 # ── Helper ──────────────────────────────────────────────────────────
 def _compare(engine, prompt: str, cfg: dict, label: str = ""):
     """Run baseline vs chunk KV reuse side-by-side and print results."""
-    from engine import GenerationMode
+    from kvboost import GenerationMode
 
     if label:
         print(f"\n  --- {label} ---")
@@ -318,7 +314,7 @@ def example_multiturn(cfg: dict):
     Cache reuse increases with each turn as more history is cached.
     """
     engine = get_engine(cfg)
-    from engine import GenerationMode
+    from kvboost import GenerationMode
 
     system = (
         "You are an expert mathematics tutor specializing in calculus, linear algebra, "

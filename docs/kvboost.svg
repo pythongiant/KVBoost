@@ -1,0 +1,52 @@
+<svg width="500" height="160" viewBox="0 0 500 160" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#12121a" />
+      <stop offset="100%" stop-color="#09090d" />
+    </linearGradient>
+
+    <linearGradient id="boostGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f59e0b" />
+      <stop offset="100%" stop-color="#ef4444" />
+    </linearGradient>
+
+    <linearGradient id="kvTop" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8b5cf6" />
+      <stop offset="100%" stop-color="#6d28d9" />
+    </linearGradient>
+    
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="4" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <rect width="500" height="160" rx="20" fill="url(#bgGrad)" stroke="#2a2a35" stroke-width="1.5" />
+
+  <g transform="translate(35, 20)">
+    
+    <path d="M 10 70 L 35 55 L 60 70 L 35 85 Z" fill="#2e1065" />
+    <path d="M 10 70 L 35 85 L 35 115 L 10 100 Z" fill="#3b0764" />
+    <path d="M 60 70 L 35 85 L 35 115 L 60 100 Z" fill="#17042e" />
+
+    <path d="M 10 50 L 35 35 L 60 50 L 35 65 Z" fill="#5b21b6" />
+    <path d="M 10 50 L 35 65 L 35 95 L 10 80 Z" fill="#4c1d95" />
+    <path d="M 60 50 L 35 65 L 35 95 L 60 80 Z" fill="#2e1065" />
+
+    <path d="M 10 30 L 35 15 L 60 30 L 35 45 Z" fill="url(#kvTop)" />
+    <path d="M 10 30 L 35 45 L 35 75 L 10 60 Z" fill="#7c3aed" />
+    <path d="M 60 30 L 35 45 L 35 75 L 60 60 Z" fill="#5b21b6" />
+    
+    <path d="M 52 10 L 25 60 L 45 60 L 35 105 L 75 48 L 52 48 Z" fill="url(#boostGrad)" filter="url(#glow)" />
+  </g>
+
+  <g transform="translate(140, 95)">
+    <text x="0" y="0" font-family="system-ui, -apple-system, sans-serif" font-weight="800" font-size="52" fill="#ffffff" letter-spacing="-1">
+      KV<tspan fill="url(#boostGrad)">Boost</tspan>
+    </text>
+    
+    <text x="4" y="28" font-family="monospace, source-code-pro, Menlo, sans-serif" font-size="13" fill="#9ca3af" letter-spacing="2.5" opacity="0.8">
+      LLM CACHE ACCELERATION
+    </text>
+  </g>
+</svg>
