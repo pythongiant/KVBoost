@@ -112,6 +112,17 @@ Baseline TTFT scales linearly with history. KVBoost stays **flat at ~62ms**.
 | Q2 (warm) | 1,577ms | **75ms** | 92% | **21.1x** |
 | Q3 (warm) | 2,133ms | **128ms** | 92% | **16.6x** |
 
+### System Prompt Reuse (~250 tokens)
+
+Identical outputs, but prompts are too short for speedup at 3B scale:
+
+| Query | Baseline | KVBoost | Reuse | Speedup |
+|---|---:|---:|:---:|:---:|
+| Q1 (cold) | 40ms | 76ms | 60% | 0.5x |
+| Q2 | 34ms | 75ms | 60% | 0.4x |
+| Q3 | 34ms | 96ms | 60% | 0.4x |
+| Q4 | 34ms | 121ms | 61% | 0.3x |
+
 ### RAG Document Reuse (~500 tokens)
 
 | Query | Baseline | KVBoost | Reuse | Speedup |
@@ -120,9 +131,69 @@ Baseline TTFT scales linearly with history. KVBoost stays **flat at ~62ms**.
 | Q2 (warm) | 78ms | **51ms** | 86% | 1.5x |
 | Q3 (warm) | 47ms | 55ms | 85% | 0.9x |
 
-> **When does it help?** KVBoost shines when prefill is the bottleneck -- prompts
-> above ~500 tokens on 3B+ models. At shorter prompts, prefill is already fast
-> enough that cache overhead offsets savings.
+### Few-Shot Classification (~500 tokens)
+
+| Review | Baseline | KVBoost | Reuse | Speedup |
+|---|---:|---:|:---:|:---:|
+| Review 1 | 75ms | 53ms | 81% | 1.4x |
+| Review 2 | 52ms | 54ms | 81% | 1.0x |
+| Review 3 | 40ms | 52ms | 81% | 0.8x |
+
+> **Pattern:** At ~250-500 tokens, KVBoost is roughly break-even. The cache
+> overhead (~60-100ms) matches the prefill savings. Speedups become dramatic
+> above ~600 tokens where prefill dominates.
+
+### When Does It Help? (Model Size Matters)
+
+The same examples on **Qwen2-0.5B** tell the opposite story -- cache overhead
+*exceeds* prefill savings because the model is too small for prefill to be a
+bottleneck.
+
+<details>
+<summary><strong>Qwen2-0.5B results (click to expand)</strong></summary>
+
+> Qwen/Qwen2-0.5B (float16), chunk_size=64, same MacBook Air.
+
+**RAG Document Reuse** -- high reuse, but KVBoost is *slower*:
+
+| Query | Baseline | KVBoost | Reuse | Speedup |
+|---|---:|---:|:---:|:---:|
+| Q1 (cold) | 244ms | 12ms | 0% | 20.3x |
+| Q2 (warm) | 29ms | 152ms | 83% | **0.2x** |
+| Q3 (warm) | 27ms | 141ms | 81% | **0.2x** |
+
+**Code Context Reuse** -- same pattern:
+
+| Query | Baseline | KVBoost | Reuse | Speedup |
+|---|---:|---:|:---:|:---:|
+| Q1 (cold) | 216ms | 13ms | 0% | 16.6x |
+| Q2 (warm) | 32ms | 94ms | 74% | **0.3x** |
+| Q3 (warm) | 29ms | 41ms | 73% | **0.7x** |
+
+**Multi-Turn** -- never reaches the crossover:
+
+| Turn | Tokens | Baseline | KVBoost | Reuse | Speedup |
+|:---:|:---:|---:|---:|:---:|:---:|
+| 1 | 23 | 47ms | 12ms | 0% | 4.0x |
+| 2 | 48 | 12ms | 12ms | 0% | 1.0x |
+| 3 | 83 | 55ms | 12ms | 0% | 4.6x |
+| 4 | 110 | 197ms | 100ms | 58% | 2.0x |
+
+</details>
+
+**Why?** At 0.5B, prefill costs ~30ms after MPS kernel warmup -- there's nothing
+meaningful to save. The cache lookup + CPU-to-MPS transfer + selective recompute
+overhead (~100ms) exceeds the prefill it replaces.
+
+| | Qwen2-0.5B | Qwen2.5-3B |
+|---|:---:|:---:|
+| Prefill cost (500 tok) | ~30ms | ~400ms |
+| Cache overhead | ~100ms | ~60ms |
+| Break-even | Never (overhead > savings) | ~350 tokens |
+| Peak speedup | 2.0x (110 tok) | **47.9x** (1353 tok) |
+
+> **Rule of thumb:** KVBoost pays off on **3B+ models** with **500+ token prompts**.
+> The bigger the model and the longer the prompt, the larger the win.
 
 <details>
 <summary><strong>Methodology validation</strong></summary>
