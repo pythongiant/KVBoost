@@ -5,8 +5,8 @@
 <h1 align="center">KVBoost</h1>
 
 <p align="center">
-  <strong>Chunk-level KV cache reuse for faster HuggingFace inference.</strong><br>
-  Drop-in acceleration for any decoder-only causal LM.
+  <strong>Up to 48x faster HuggingFace inference through chunk-level KV cache reuse.</strong><br>
+  Drop-in acceleration for any decoder-only causal LM -- 3 lines to integrate.
 </p>
 
 <p align="center">
