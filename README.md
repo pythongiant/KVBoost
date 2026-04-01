@@ -35,7 +35,7 @@
 | **47.9x faster TTFT** | On 1350-token multi-turn prompts (Qwen2.5-3B, Apple Silicon) |
 | **Zero output degradation** | Greedy decoding produces identical text to baseline |
 | **3 lines to integrate** | `from_pretrained` / `warm` / `generate` |
-| **Any HF model** | Works with any `AutoModelForCausalLM` on CUDA, MPS, or CPU |
+| **11+ architectures** | Llama, Qwen, Gemma, Mistral, Phi, and more -- any RoPE model on CUDA, MPS, or CPU |
 | **Content-addressed** | SHA256 chunk keys -- same tokens always hit cache |
 | **Two-tier storage** | Hot RAM cache + optional disk-backed cold tier |
 
@@ -254,11 +254,13 @@ python benchmarks_and_experiments/benchmark_vs_mlx.py --workload code
 
 ### `KVBoost.from_pretrained(model_name, **kwargs)`
 
-Factory method. Loads a HuggingFace model and tokenizer.
+Factory method. Loads a HuggingFace model and tokenizer. Validates architecture
+compatibility at load time.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `model_name` | `str` | `"TinyLlama/TinyLlama-1.1B-Chat-v1.0"` | Any HF decoder-only causal LM |
+| `model_name` | `str` | `"TinyLlama/TinyLlama-1.1B-Chat-v1.0"` | HF decoder-only causal LM (must use RoPE) |
+| `strict` | `bool` | `True` | Raise on unsupported architectures, warn on untested |
 | `chunk_size` | `int` | `128` | Tokens per cache chunk |
 | `max_chunks` | `int` | `128` | Max chunks in RAM before LRU eviction |
 | `recompute_strategy` | `str` | `"selective"` | `"selective"`, `"cacheblend"`, or `"none"` (see below) |
@@ -319,7 +321,46 @@ Generate text with automatic KV cache reuse.
 
 ### `engine.cache_stats() -> dict`
 
-Returns: `hot_chunks`, `hot_memory_mb`, `cache_hits`, `cache_misses`, `hit_rate`.
+Returns: `hot_chunks`, `hot_memory_mb`, `cache_hits`, `approximate_hits`,
+`cache_misses`, `hit_rate`, `exact_hit_rate`.
+
+### `engine.verify_correctness(max_new_tokens=32) -> bool`
+
+Runs a quick greedy-decode comparison (baseline vs cached) on a synthetic prompt.
+Returns `True` if outputs match. Use this to validate untested architectures.
+
+```python
+engine = KVBoost.from_pretrained("some/untested-model", strict=False)
+assert engine.verify_correctness(), "KV cache stitching produces wrong outputs!"
+```
+
+### Model Compatibility
+
+KVBoost's KV cache stitching requires **RoPE positional encoding** with explicit
+`position_ids` support. Models using ALiBi, learned absolute embeddings, or
+sliding window attention are not compatible.
+
+| Status | Architectures |
+|---|---|
+| **Supported** | Llama, Qwen2, Qwen2.5, Gemma, Gemma2, Mistral (full attn), Phi, Phi3, StableLM, InternLM |
+| **Unsupported** | GPT-2, GPT-Neo, GPT-NeoX, MPT, Falcon, BLOOM |
+| **Conditional** | Mistral with `sliding_window != None` -- blocked |
+
+```python
+# Supported model -- loads normally
+engine = KVBoost.from_pretrained("Qwen/Qwen2.5-3B")
+
+# Unsupported model -- raises ValueError with explanation
+engine = KVBoost.from_pretrained("gpt2")
+# ValueError: GPT-2 uses learned absolute positional embeddings...
+
+# Unknown model -- warns, user can self-certify
+engine = KVBoost.from_pretrained("some/new-rope-model", strict=False)
+assert engine.verify_correctness()
+
+# Skip all checks (you know what you're doing)
+engine = KVBoost.from_pretrained("some/model", strict=False)
+```
 
 ---
 
