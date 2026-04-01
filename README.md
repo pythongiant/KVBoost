@@ -13,8 +13,8 @@
   <a href="https://pypi.org/project/kvboost/0.1.0/"><img src="https://img.shields.io/pypi/v/kvboost?color=blue&label=PyPI" alt="PyPI"></a>
   <a href="https://pypi.org/project/kvboost/0.1.0/"><img src="https://img.shields.io/pypi/pyversions/kvboost" alt="Python"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
-  <a href="https://github.com/srihariunnikrishnan/kvboost"><img src="https://img.shields.io/badge/platform-CUDA%20%7C%20MPS%20%7C%20CPU-orange" alt="Platform"></a>
-  <a href="https://github.com/srihariunnikrishnan/kvboost/stargazers"><img src="https://img.shields.io/github/stars/pythongiant/kvboost?style=social" alt="Stars"></a>
+  <a href="https://github.com/pythongiant/kvboost"><img src="https://img.shields.io/badge/platform-CUDA%20%7C%20MPS%20%7C%20CPU-orange" alt="Platform"></a>
+  <a href="https://github.com/pythongiant/kvboost/stargazers"><img src="https://img.shields.io/github/stars/pythongiant/kvboost?style=social" alt="Stars"></a>
 </p>
 
 <p align="center">
@@ -50,7 +50,7 @@ pip install kvboost
 **From source:**
 
 ```bash
-git clone https://github.com/srihariunnikrishnan/kvboost.git
+git clone https://github.com/pythongiant/kvboost.git
 cd kvboost
 pip install -e .
 ```
@@ -209,6 +209,42 @@ Three properties confirm these results reflect genuine cache reuse:
 
 3. **Cold-start control** -- Every first query shows 0% reuse and comparable TTFT.
    Speedup only appears after cache population, ruling out measurement bias.
+
+</details>
+
+### KVBoost vs MLX LLM
+
+Head-to-head against Apple's Metal-optimized [MLX](https://github.com/ml-explore/mlx)
+inference framework. Same model (Qwen2.5-3B), same hardware, same prompts.
+
+| Workload | Query | HF Baseline | KVBoost | MLX | KV vs HF | KV vs MLX |
+|---|---|---:|---:|---:|:---:|:---:|
+| **Chatbot** | Q1 (cold) | 52,122ms | **81ms** | 60,527ms | 640x | 743x |
+| | Q2 | 20,276ms | **1,301ms** | 56,556ms | 16x | 44x |
+| | Q3 | 19,571ms | **1,308ms** | 52,906ms | 15x | 40x |
+| **Code** | Q1 (cold) | 63,369ms | **493ms** | 49,342ms | 129x | 100x |
+| | Q2 | 40,635ms | **137ms** | 47,167ms | 297x | 344x |
+| | Q3 | 39,529ms | **152ms** | 48,592ms | 260x | 319x |
+| **Multi-turn** | Q1 | 71,835ms | **108ms** | 61,067ms | 668x | 568x |
+| | Q2 | 41,743ms | **349ms** | 45,344ms | 120x | 130x |
+| | Q3 | 48,858ms | **153ms** | 46,962ms | 319x | 307x |
+| | Q4 | 40,834ms | **233ms** | 62,975ms | 175x | 270x |
+| | Q5 | 51,666ms | **130ms** | 53,865ms | 398x | 415x |
+| | Q6 | 52,664ms | **153ms** | 50,860ms | 345x | 333x |
+| | Q7 | 50,676ms | **144ms** | 46,060ms | 353x | 321x |
+
+> KVBoost is **100-743x faster than MLX** on TTFT across all workloads. MLX shows
+> no cross-request cache reuse -- each prompt is processed from scratch. KVBoost's
+> chunk-level caching eliminates redundant prefill entirely.
+
+<details>
+<summary><strong>Run it yourself</strong></summary>
+
+```bash
+pip install mlx-lm
+python benchmarks_and_experiments/benchmark_vs_mlx.py
+python benchmarks_and_experiments/benchmark_vs_mlx.py --workload code
+```
 
 </details>
 

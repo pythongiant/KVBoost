@@ -31,11 +31,7 @@ from utils import (
     GenerationMode,
 )
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from engine import InferenceEngine
+from kvboost import KVBoost as InferenceEngine
 
 log = get_logger("06_memory_analysis")
 
@@ -218,7 +214,7 @@ def measure_disk_tier(model_name: str, chunk_size: int) -> Dict:
         recompute_times = []
 
         for start, end, slice_ids in chunks[:2]:
-            from models import chunk_id_from_tokens
+            from kvboost.models import chunk_id_from_tokens
             cid = chunk_id_from_tokens(slice_ids)
 
             # If it's in hot cache, skip

@@ -8,16 +8,12 @@ import json
 import logging
 import os
 import statistics
-import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Add parent directory to path so we can import the kv_cache modules
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from engine import InferenceEngine, GenerationMode, GenerationResult
+from kvboost import KVBoost as InferenceEngine, GenerationMode, GenerationResult
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 

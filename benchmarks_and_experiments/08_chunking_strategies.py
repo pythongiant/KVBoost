@@ -29,12 +29,7 @@ from utils import (
     GenerationMode,
 )
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from engine import InferenceEngine
-from chunk_registry import ChunkStrategy
+from kvboost import KVBoost as InferenceEngine, ChunkStrategy
 
 log = get_logger("08_chunking_strategies")
 

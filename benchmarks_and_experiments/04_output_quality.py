@@ -31,11 +31,7 @@ from utils import (
     GenerationMode,
 )
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from engine import InferenceEngine
+from kvboost import KVBoost as InferenceEngine
 
 log = get_logger("04_output_quality")
 

@@ -31,15 +31,7 @@ from utils import (
     GenerationMode,
 )
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from cache_manager import KVCacheManager
-from chunk_registry import ChunkRegistry
-from prompt_assembler import PromptAssembler, AssemblyMode
-from selective_recompute import SelectiveRecompute
-from models import AssembledPrompt
+from kvboost import KVCacheManager, ChunkRegistry, PromptAssembler, AssemblyMode, SelectiveRecompute, AssembledPrompt
 from transformers import DynamicCache
 
 log = get_logger("02_latency_breakdown")

@@ -33,12 +33,8 @@ from utils import (
     GenerationMode,
 )
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from engine import InferenceEngine
-from models import chunk_id_from_tokens
+from kvboost import KVBoost as InferenceEngine
+from kvboost.models import chunk_id_from_tokens
 
 log = get_logger("09_cache_hit_simulation")
 
