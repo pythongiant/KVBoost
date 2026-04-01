@@ -261,9 +261,32 @@ Factory method. Loads a HuggingFace model and tokenizer.
 | `model_name` | `str` | `"TinyLlama/TinyLlama-1.1B-Chat-v1.0"` | Any HF decoder-only causal LM |
 | `chunk_size` | `int` | `128` | Tokens per cache chunk |
 | `max_chunks` | `int` | `128` | Max chunks in RAM before LRU eviction |
-| `recompute_overlap` | `int` | `16` | Tokens to recompute at chunk seams |
+| `recompute_strategy` | `str` | `"selective"` | `"selective"`, `"cacheblend"`, or `"none"` (see below) |
+| `recompute_overlap` | `int` | `16` | Tokens to recompute at seams (selective only) |
+| `recompute_ratio` | `float` | `0.15` | Fraction of tokens to recompute (cacheblend only) |
 | `disk_cache_dir` | `str \| None` | `None` | Path for disk-backed cold storage |
 | `device` | `str \| None` | `None` | `"cuda"`, `"mps"`, `"cpu"`, or auto-detect |
+
+**Recompute strategies:**
+
+| Strategy | How it works | When to use |
+|---|---|---|
+| `"selective"` | Recomputes last R tokens at each chunk boundary | Default, safe baseline |
+| `"cacheblend"` | Measures per-token KV deviation, recomputes only the ~15% that actually changed | Better quality/speed trade-off on long prompts |
+| `"none"` | Skips recompute entirely | Maximum speed, acceptable when chunks are from the same original encoding |
+
+```python
+from kvboost import KVBoost
+
+# Default: selective recompute at boundaries
+engine = KVBoost.from_pretrained("Qwen/Qwen2.5-3B")
+
+# CacheBlend: smarter, recomputes only deviated tokens
+engine = KVBoost.from_pretrained("Qwen/Qwen2.5-3B", recompute_strategy="cacheblend")
+
+# No recompute: fastest, use when chunks share original context
+engine = KVBoost.from_pretrained("Qwen/Qwen2.5-3B", recompute_strategy="none")
+```
 
 ### `engine.warm(text, position_offset=0) -> int`
 
@@ -343,7 +366,7 @@ prompt_text
  PromptAssembler.assemble()     -- stitch cached KV + live tokens
     |
     v
- SelectiveRecompute.apply()     -- fix boundary seams (last R tokens)
+ Recompute (selective OR cacheblend) -- fix stale KV from stitching
     |
     v
  model.forward(live_tokens, past_key_values=cached_kv)
@@ -361,10 +384,20 @@ Same tokens always produce the same key, regardless of surrounding context.
 positions. Live tokens get `position_ids` starting at `cached_length`, so
 positional encodings remain monotonically correct.
 
-**Selective boundary recompute** -- When chunks are stitched together, the last
-`R` tokens at each seam are recomputed with full cross-chunk attention context.
-This fixes "stale" KV from independent chunk encoding. Cost: `O(R * num_seams)`
-instead of `O(full_prompt)`.
+**Two recompute strategies** -- When chunks are stitched together, their KV
+tensors are "stale" (computed without cross-chunk attention). KVBoost offers
+two ways to fix this:
+
+*Selective recompute* (default) recomputes the last `R` tokens at each chunk
+seam. Simple and correct, but costs `O(R * num_seams)` — which can be up to
+79% of full prefill cost.
+
+*CacheBlend recompute* runs a cheap forward pass over the assembled KV, measures
+per-token cosine deviation between cached and full-context KV vectors, and
+recomputes only the ~15% of tokens that actually deviate. This is both faster
+(fewer tokens recomputed) and more accurate (fixes tokens *inside* chunks that
+depend on cross-chunk context, not just boundaries). Based on the CacheBlend
+paper (USENIX ATC '25).
 
 **Two-tier storage** -- Hot tier is an in-memory `OrderedDict` with LRU eviction.
 Optional cold tier serializes evicted chunks to disk via `torch.save()` and

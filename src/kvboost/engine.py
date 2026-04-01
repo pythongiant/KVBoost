@@ -40,6 +40,7 @@ from .cache_manager import KVCacheManager
 from .chunk_registry import ChunkRegistry, ChunkStrategy
 from .prompt_assembler import AssemblyMode, PromptAssembler
 from .selective_recompute import SelectiveRecompute
+from .cacheblend import CacheBlendRecompute
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,12 @@ class GenerationMode(str, enum.Enum):
     BASELINE = "baseline"
     PREFIX_CACHE = "prefix_cache"
     CHUNK_KV_REUSE = "chunk_kv_reuse"
+
+
+class RecomputeStrategy(str, enum.Enum):
+    SELECTIVE = "selective"    # fix last R tokens at each seam (original)
+    CACHEBLEND = "cacheblend"  # fix top-k% most deviated tokens (smarter)
+    NONE = "none"              # no recompute — fastest, slight quality risk
 
 
 @dataclass
@@ -72,6 +79,8 @@ class InferenceEngine:
         chunk_size: int = 128,
         max_chunks: int = 128,
         recompute_overlap: int = 16,
+        recompute_strategy: RecomputeStrategy = RecomputeStrategy.SELECTIVE,
+        recompute_ratio: float = 0.15,
         disk_cache_dir: Optional[str] = None,
         device: Optional[str] = None,
     ):
@@ -86,6 +95,7 @@ class InferenceEngine:
         self.model = model.to(device)
         self.tokenizer = tokenizer
         self.device = device
+        self.recompute_strategy = RecomputeStrategy(recompute_strategy)
 
         # Sub-systems (CPU storage for cache tensors, move to device on use)
         self.cache_manager = KVCacheManager(
@@ -105,6 +115,10 @@ class InferenceEngine:
         self.selective_recompute = SelectiveRecompute(
             recompute_overlap=recompute_overlap,
             skip_if_no_seams=True,
+            device="cpu",
+        )
+        self.cacheblend_recompute = CacheBlendRecompute(
+            recompute_ratio=recompute_ratio,
             device="cpu",
         )
 
@@ -270,12 +284,16 @@ class InferenceEngine:
         temperature: float,
         do_sample: bool,
     ) -> GenerationResult:
-        """Full chunk-level KV reuse + selective boundary recompute."""
+        """Full chunk-level KV reuse + recompute (strategy-dependent)."""
         assembled = self.assembler.assemble(token_ids)
 
-        # Selective recompute at seams (only if multiple chunks stitched)
+        # Apply recompute strategy when multiple chunks are stitched
         if len(assembled.chunk_boundaries) > 1:
-            assembled = self.selective_recompute.apply(assembled, self.model)
+            if self.recompute_strategy == RecomputeStrategy.SELECTIVE:
+                assembled = self.selective_recompute.apply(assembled, self.model)
+            elif self.recompute_strategy == RecomputeStrategy.CACHEBLEND:
+                assembled = self.cacheblend_recompute.apply(assembled, self.model)
+            # NONE: skip recompute entirely
 
         return self._decode_with_kv(
             prompt, token_ids,
