@@ -35,7 +35,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import DynamicCache
 
-from .models import AssembledPrompt, CachedChunk, PastKVType, chunk_id_from_tokens
+from .models import AssembledPrompt, CachedChunk, PastKVType, content_hash_from_tokens, chained_hash
 from .cache_manager import KVCacheManager
 from .chunk_registry import ChunkRegistry, ChunkStrategy
 from .prompt_assembler import AssemblyMode, PromptAssembler
@@ -182,23 +182,30 @@ class InferenceEngine:
         token_ids = self._encode(text)
         chunks_added = 0
         pos = position_offset
+        parent_hash = None
 
         for start, end, slice_ids in self.chunk_registry.split(token_ids, text):
-            cid = chunk_id_from_tokens(slice_ids)
-            if self.cache_manager.get(cid) is not None:
+            p_hash = chained_hash(slice_ids, parent_hash)
+            c_hash = content_hash_from_tokens(slice_ids)
+
+            if self.cache_manager.get(p_hash) is not None:
+                parent_hash = p_hash
                 pos += len(slice_ids)
                 continue
 
             kv = self._encode_to_kv(slice_ids, position_offset=pos)
             chunk = CachedChunk(
-                chunk_id=cid,
+                chunk_id=p_hash,
                 text=self.tokenizer.decode(slice_ids),
                 token_ids=slice_ids,
                 past_key_values=kv,
                 position_start=pos,
                 position_end=pos + len(slice_ids),
+                prefix_hash=p_hash,
+                content_hash=c_hash,
             )
             self.cache_manager.store(chunk)
+            parent_hash = p_hash
             pos += len(slice_ids)
             chunks_added += 1
 
@@ -289,7 +296,13 @@ class InferenceEngine:
 
         # Apply recompute strategy when multiple chunks are stitched
         if len(assembled.chunk_boundaries) > 1:
-            if self.recompute_strategy == RecomputeStrategy.SELECTIVE:
+            if assembled.has_approximate:
+                # Approximate matches (content-only key) have wrong position
+                # encodings and/or wrong preceding context — always use
+                # CacheBlend to fix the full KV, not just boundaries
+                log.debug("Approximate match detected — forcing CacheBlend recompute")
+                assembled = self.cacheblend_recompute.apply(assembled, self.model)
+            elif self.recompute_strategy == RecomputeStrategy.SELECTIVE:
                 assembled = self.selective_recompute.apply(assembled, self.model)
             elif self.recompute_strategy == RecomputeStrategy.CACHEBLEND:
                 assembled = self.cacheblend_recompute.apply(assembled, self.model)
@@ -487,19 +500,24 @@ class InferenceEngine:
     def _store_prompt_chunks(self, token_ids: List[int]) -> None:
         """Cache all un-cached fixed-size chunks from this prompt."""
         pos = 0
+        parent_hash = None
         for start, end, slice_ids in self.chunk_registry.split(token_ids):
-            cid = chunk_id_from_tokens(slice_ids)
-            if self.cache_manager.get(cid) is None:
+            p_hash = chained_hash(slice_ids, parent_hash)
+            c_hash = content_hash_from_tokens(slice_ids)
+            if self.cache_manager.get(p_hash) is None:
                 kv = self._encode_to_kv(slice_ids, position_offset=pos)
                 chunk = CachedChunk(
-                    chunk_id=cid,
+                    chunk_id=p_hash,
                     text=self.tokenizer.decode(slice_ids),
                     token_ids=slice_ids,
                     past_key_values=kv,
                     position_start=pos,
                     position_end=pos + len(slice_ids),
+                    prefix_hash=p_hash,
+                    content_hash=c_hash,
                 )
                 self.cache_manager.store(chunk)
+            parent_hash = p_hash
             pos += len(slice_ids)
 
     @staticmethod

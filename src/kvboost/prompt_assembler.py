@@ -7,13 +7,14 @@ Given a full prompt (token_ids) and the KVCacheManager, assembles:
   live_token_ids    — tokens still needing a forward pass
   live_position_ids — absolute positions for each live token
   chunk_boundaries  — seam positions for SelectiveRecompute
+  has_approximate   — True if any chunk was an approximate (content-only) match
 
 Two assembly modes
 ------------------
 PREFIX_ONLY  : only the leading contiguous cached prefix is reused
                (safe, correct, no seam issues)
 CHUNK_REUSE  : any matching chunk, anywhere in the prompt, is reused
-               (faster, seams exist → feed to SelectiveRecompute)
+               (faster, seams exist → feed to recompute strategy)
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from .models import AssembledPrompt, PastKVType
-from .cache_manager import KVCacheManager
+from .cache_manager import KVCacheManager, ChunkMatch
 from .chunk_registry import ChunkRegistry
 
 log = logging.getLogger(__name__)
@@ -68,7 +69,6 @@ class PromptAssembler:
         live_pos = list(range(covered, len(token_ids)))
         hit_ratio = covered / max(len(token_ids), 1)
 
-        # Boundaries: one boundary at position 0 → covered (if any cached)
         boundaries: List[Tuple[int, int]] = []
         if covered > 0:
             boundaries = [(0, covered)]
@@ -81,10 +81,11 @@ class PromptAssembler:
             live_position_ids=live_pos,
             chunk_boundaries=boundaries,
             cache_hit_ratio=hit_ratio,
+            has_approximate=False,  # prefix mode only uses exact matches
         )
 
     # ------------------------------------------------------------------
-    # Mode: chunk reuse (any matching chunk)
+    # Mode: chunk reuse (any matching chunk, two-tier keying)
     # ------------------------------------------------------------------
 
     def _chunk_reuse(self, token_ids: List[int]) -> AssembledPrompt:
@@ -100,35 +101,32 @@ class PromptAssembler:
                 live_position_ids=list(range(len(token_ids))),
                 chunk_boundaries=[],
                 cache_hit_ratio=0.0,
+                has_approximate=False,
             )
 
-        # Build coverage map: which token positions are covered by a cache hit
-        # We assemble chunks in order, skip overlapping regions
         covered_end = 0
         kv_parts: List[PastKVType] = []
         boundaries: List[Tuple[int, int]] = []
         total_cached = 0
+        any_approximate = False
 
-        # Sort by start position
         matching.sort(key=lambda x: x[0])
 
-        # The strategy: collect contiguous or gap-free cached regions
-        # from the start of the prompt (prefix style, but across registered chunks)
-        for start_pos, chunk in matching:
+        for start_pos, chunk_match in matching:
+            chunk = chunk_match.chunk
             end_pos = start_pos + chunk.length
 
             if start_pos != covered_end:
-                # There's a gap — stop extending cache prefix
-                # (gaps would require re-encoding the gap tokens into
-                # the attention stream, which breaks prefix semantics)
                 break
 
-            # Move chunk KV to inference device
             kv = KVCacheManager._move_kv(chunk.past_key_values, self.cache.device)
             kv_parts.append(kv)
             boundaries.append((start_pos, end_pos))
             covered_end = end_pos
             total_cached += chunk.length
+
+            if chunk_match.approximate:
+                any_approximate = True
 
         if not kv_parts:
             return AssembledPrompt(
@@ -139,6 +137,7 @@ class PromptAssembler:
                 live_position_ids=list(range(len(token_ids))),
                 chunk_boundaries=[],
                 cache_hit_ratio=0.0,
+                has_approximate=False,
             )
 
         merged_kv = KVCacheManager.merge_kv_list(kv_parts)
@@ -147,8 +146,8 @@ class PromptAssembler:
         hit_ratio = total_cached / max(len(token_ids), 1)
 
         log.debug(
-            "Assembled: %d cached tokens, %d live tokens (%.0f%% hit)",
-            total_cached, len(live_ids), hit_ratio * 100,
+            "Assembled: %d cached tokens, %d live tokens (%.0f%% hit, approximate=%s)",
+            total_cached, len(live_ids), hit_ratio * 100, any_approximate,
         )
 
         return AssembledPrompt(
@@ -159,10 +158,11 @@ class PromptAssembler:
             live_position_ids=live_pos,
             chunk_boundaries=boundaries,
             cache_hit_ratio=hit_ratio,
+            has_approximate=any_approximate,
         )
 
     # ------------------------------------------------------------------
-    # Utility: build position_ids tensor for live tokens
+    # Utility
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -175,14 +175,8 @@ class PromptAssembler:
     def make_attention_mask(
         cached_len: int, live_len: int, device: str
     ) -> torch.Tensor:
-        """
-        Causal attention mask for a prompt with cached prefix.
-        Shape: [1, live_len, cached_len + live_len]
-        All live tokens attend to full cached prefix + their causal prefix.
-        """
         total = cached_len + live_len
         mask = torch.ones(1, live_len, total, dtype=torch.bool, device=device)
-        # Apply causal mask for the live-to-live portion
         for i in range(live_len):
             mask[0, i, cached_len + i + 1 :] = False
         return mask
