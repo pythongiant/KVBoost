@@ -41,6 +41,7 @@ from .chunk_registry import ChunkRegistry, ChunkStrategy
 from .prompt_assembler import AssemblyMode, PromptAssembler
 from .selective_recompute import SelectiveRecompute
 from .cacheblend import CacheBlendRecompute
+from .compat import check_model_compatibility, SUPPORTED_ARCHITECTURES
 
 log = logging.getLogger(__name__)
 
@@ -130,8 +131,18 @@ class InferenceEngine:
     def from_pretrained(
         cls,
         model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        strict: bool = True,
         **kwargs,
     ) -> "InferenceEngine":
+        """
+        Load a HuggingFace model and create a KVBoost engine.
+
+        Args:
+            model_name: Any HF decoder-only causal LM (must use RoPE).
+            strict: If True (default), raise on unsupported architectures
+                    and warn on untested ones. Set False to skip checks.
+            **kwargs: Passed to InferenceEngine.__init__().
+        """
         log.info("Loading model %s ...", model_name)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if tokenizer.pad_token is None:
@@ -143,6 +154,9 @@ class InferenceEngine:
             low_cpu_mem_usage=True,
         )
         model.eval()
+
+        check_model_compatibility(model, strict=strict)
+
         return cls(model=model, tokenizer=tokenizer, **kwargs)
 
     # ------------------------------------------------------------------
@@ -531,3 +545,52 @@ class InferenceEngine:
 
     def cache_stats(self) -> Dict:
         return self.cache_manager.stats()
+
+    def verify_correctness(self, max_new_tokens: int = 32) -> bool:
+        """
+        Quick self-test: runs greedy decode on a synthetic prompt with
+        both BASELINE and CHUNK_KV_REUSE, verifies identical output.
+
+        Returns True if outputs match, False otherwise.
+        Use this to validate untested model architectures before trusting
+        cached outputs in production.
+        """
+        test_prefix = (
+            "The following is a factual statement about mathematics. "
+            "Two plus two equals four. Three times three equals nine. "
+            "The square root of sixteen is four. Pi is approximately "
+            "three point one four one five nine. Euler's number e is "
+            "approximately two point seven one eight."
+        )
+        test_query = "\n\nQuestion: What is two plus two?\nAnswer:"
+        prompt = test_prefix + test_query
+
+        # Warm the prefix
+        self.warm(test_prefix)
+
+        # Run both modes with greedy decoding
+        r_base = self.generate(
+            prompt, max_new_tokens=max_new_tokens,
+            mode=GenerationMode.BASELINE, do_sample=False,
+        )
+        r_cached = self.generate(
+            prompt, max_new_tokens=max_new_tokens,
+            mode=GenerationMode.CHUNK_KV_REUSE, do_sample=False,
+        )
+
+        match = r_base.output_text == r_cached.output_text
+        arch = type(self.model).__name__
+
+        if match:
+            log.info(
+                "verify_correctness PASSED for %s — "
+                "baseline and cached outputs are identical", arch,
+            )
+        else:
+            log.warning(
+                "verify_correctness FAILED for %s — "
+                "outputs differ!\n  baseline: %r\n  cached:   %r",
+                arch, r_base.output_text[:100], r_cached.output_text[:100],
+            )
+
+        return match
