@@ -343,8 +343,32 @@ compatibility at load time.
 | `recompute_strategy` | `str` | `"selective"` | `"selective"`, `"cacheblend"`, or `"none"` (see below) |
 | `recompute_overlap` | `int` | `16` | Tokens to recompute at seams (selective only) |
 | `recompute_ratio` | `float` | `0.15` | Fraction of tokens to recompute (cacheblend only) |
+| `kv_cache_bits` | `int` | `16` | `16` (float16), `8` (int8), or `4` (int4) -- see below |
 | `disk_cache_dir` | `str \| None` | `None` | Path for disk-backed cold storage |
 | `device` | `str \| None` | `None` | `"cuda"`, `"mps"`, `"cpu"`, or auto-detect |
+
+**KV cache quantization:**
+
+Compresses cached KV tensors using KIVI-style asymmetric quantization (ICML 2024):
+key cache is quantized per-channel (handles channel-specific outliers), value cache
+is quantized per-token (handles token-specific outliers).
+
+| Precision | Compression | Per-chunk (Qwen2.5-3B) | 128 chunks | Quality |
+|---|:---:|---:|---:|---|
+| `16` (float16) | 1x | 9.4 MB | 1.2 GB | Baseline |
+| `8` (int8) | 2x | 4.7 MB | 0.6 GB | Near-lossless (max error ~0.016) |
+| `4` (int4) | 4x | 2.4 MB | 0.3 GB | Aggressive (validate with `verify_correctness()`) |
+
+```python
+from kvboost import KVBoost
+
+# int8 -- 2x RAM savings, near-lossless (recommended for memory-constrained)
+engine = KVBoost.from_pretrained("Qwen/Qwen2.5-3B", kv_cache_bits=8)
+
+# int4 -- 4x RAM savings, aggressive (validate before trusting)
+engine = KVBoost.from_pretrained("Qwen/Qwen2.5-3B", kv_cache_bits=4)
+assert engine.verify_correctness()
+```
 
 **Recompute strategies:**
 

@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from .models import CachedChunk, PastKVType, content_hash_from_tokens, chained_hash
+from .kv_quantize import QuantizedKV, quantize_kv, dequantize_kv
 
 log = logging.getLogger(__name__)
 
@@ -49,12 +50,17 @@ class KVCacheManager:
         max_chunks: int = 64,
         disk_dir: Optional[str] = None,
         device: str = "cpu",
+        kv_cache_bits: int = 16,
     ):
         self.max_chunks = max_chunks
         self.device = device
+        self.kv_cache_bits = kv_cache_bits  # 16 = no quantization, 8 = int8, 4 = int4
 
         # Primary store keyed by prefix_hash (exact match)
         self._hot: OrderedDict[str, CachedChunk] = OrderedDict()
+
+        # Quantized storage: chunk_id → QuantizedKV (when bits < 16)
+        self._quantized: Dict[str, QuantizedKV] = {}
 
         # Secondary index: content_hash → prefix_hash for approximate lookup
         self._content_index: Dict[str, str] = {}
@@ -91,6 +97,19 @@ class KVCacheManager:
         # Move KV tensors to storage device
         chunk.past_key_values = self._move_kv(chunk.past_key_values, self.device)
 
+        # Quantize for compressed storage (if enabled)
+        if self.kv_cache_bits < 16:
+            qkv = quantize_kv(chunk.past_key_values, bits=self.kv_cache_bits)
+            self._quantized[key] = qkv
+            # Release the full-precision tensors — they'll be dequantized on get()
+            chunk.past_key_values = ()  # empty sentinel
+            log.debug(
+                "Stored chunk %s quantized int%d (%.2fMB → %.2fMB)",
+                key[:8], self.kv_cache_bits,
+                qkv.memory_bytes() / 1e6 * (16 / self.kv_cache_bits),
+                qkv.memory_bytes() / 1e6,
+            )
+
         if len(self._hot) >= self.max_chunks:
             self._evict_lfu()
 
@@ -101,15 +120,21 @@ class KVCacheManager:
         if chunk.content_hash:
             self._content_index[chunk.content_hash] = key
 
-        log.debug("Stored chunk %s (%.2fMB)", key[:8], chunk.memory_bytes() / 1e6)
+        if self.kv_cache_bits >= 16:
+            log.debug("Stored chunk %s (%.2fMB)", key[:8], chunk.memory_bytes() / 1e6)
 
     def get(self, chunk_id: str) -> Optional[CachedChunk]:
-        """Retrieve a chunk by prefix_hash (exact match only)."""
+        """Retrieve a chunk by prefix_hash (exact match only). Dequantizes if needed."""
         if chunk_id in self._hot:
             self.hits += 1
             chunk = self._hot[chunk_id]
             chunk.touch()
             self._hot.move_to_end(chunk_id)
+
+            # Dequantize on load if stored quantized
+            if chunk_id in self._quantized:
+                chunk = self._dequantize_chunk(chunk, chunk_id)
+
             return chunk
 
         # Try disk tier
@@ -119,10 +144,19 @@ class KVCacheManager:
                 self.hits += 1
                 chunk = self._load_from_disk(path)
                 self.store(chunk)
-                return chunk
+                return self.get(chunk_id)  # re-enter to handle quantization
 
         self.misses += 1
         return None
+
+    def _dequantize_chunk(self, chunk: CachedChunk, key: str) -> CachedChunk:
+        """Reconstruct full-precision KV tensors from quantized storage."""
+        qkv = self._quantized[key]
+        # Return a copy with dequantized tensors (don't modify stored chunk)
+        import copy
+        out = copy.copy(chunk)
+        out.past_key_values = dequantize_kv(qkv)
+        return out
 
     def get_by_content(self, content_hash: str) -> Optional[ChunkMatch]:
         """
@@ -137,6 +171,9 @@ class KVCacheManager:
                 chunk = self._hot[prefix_key]
                 chunk.touch()
                 self._hot.move_to_end(prefix_key)
+                # Dequantize if needed
+                if prefix_key in self._quantized:
+                    chunk = self._dequantize_chunk(chunk, prefix_key)
                 return ChunkMatch(chunk=chunk, approximate=True)
 
         return None
@@ -236,6 +273,8 @@ class KVCacheManager:
         if chunk and chunk.content_hash in self._content_index:
             if self._content_index[chunk.content_hash] == chunk_id:
                 del self._content_index[chunk.content_hash]
+        self._quantized.pop(chunk_id, None)
+        self._frequency.pop(chunk_id, None)
         if self._disk_dir:
             path = self._disk_dir / f"{chunk_id}.pt"
             path.unlink(missing_ok=True)
@@ -321,6 +360,7 @@ class KVCacheManager:
             self._save_to_disk(victim)
         del self._hot[victim_id]
         self._frequency.pop(victim_id, None)
+        self._quantized.pop(victim_id, None)
 
     def _save_to_disk(self, chunk: CachedChunk) -> None:
         key = chunk.prefix_hash or chunk.chunk_id

@@ -82,6 +82,7 @@ class InferenceEngine:
         recompute_overlap: int = 16,
         recompute_strategy: RecomputeStrategy = RecomputeStrategy.SELECTIVE,
         recompute_ratio: float = 0.15,
+        kv_cache_bits: int = 16,
         disk_cache_dir: Optional[str] = None,
         device: Optional[str] = None,
     ):
@@ -103,6 +104,7 @@ class InferenceEngine:
             max_chunks=max_chunks,
             disk_dir=disk_cache_dir,
             device="cpu",
+            kv_cache_bits=kv_cache_bits,
         )
         self.chunk_registry = ChunkRegistry(
             chunk_size=chunk_size,

@@ -29,6 +29,7 @@ from .chunk_registry import ChunkRegistry, ChunkStrategy
 from .prompt_assembler import PromptAssembler, AssemblyMode
 from .selective_recompute import SelectiveRecompute
 from .cacheblend import CacheBlendRecompute
+from .kv_quantize import quantize_kv, dequantize_kv, QuantizedKV
 from .compat import SUPPORTED_ARCHITECTURES, UNSUPPORTED_ARCHITECTURES, check_model_compatibility
 
 __version__ = "0.1.0"
@@ -51,4 +52,7 @@ __all__ = [
     "SUPPORTED_ARCHITECTURES",
     "UNSUPPORTED_ARCHITECTURES",
     "check_model_compatibility",
+    "quantize_kv",
+    "dequantize_kv",
+    "QuantizedKV",
 ]
