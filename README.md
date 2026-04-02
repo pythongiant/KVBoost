@@ -5,8 +5,8 @@
 <h1 align="center">KVBoost</h1>
 
 <p align="center">
-  <strong>Up to 48x faster HuggingFace inference through chunk-level KV cache reuse.</strong><br>
-  Drop-in acceleration for any decoder-only causal LM -- 3 lines to integrate.
+  <strong>Chunk-level KV cache reuse for HuggingFace inference.</strong><br>
+  5-48x TTFT reduction on 3B+ models with repeated long context. 3 lines to integrate.
 </p>
 
 <p align="center">
@@ -28,16 +28,30 @@
 
 ---
 
-### Highlights
+### When KVBoost Helps
+
+| Condition | Expected TTFT Speedup |
+|---|---|
+| Multi-turn conversation, 8+ turns, 3B+ model | **10-48x** |
+| Code context / document reuse, 800+ tokens | **15-21x** |
+| RAG document reuse, ~500 tokens | 1-2x |
+| System prompt reuse, ~250 tokens | 0.3-0.5x (overhead > savings) |
+| Any workload, 0.5B model | < 1x (overhead exceeds prefill) |
+
+> **Rule of thumb:** Benefits appear on **3B+ models** with **500+ token shared
+> context**. Below this, caching overhead exceeds prefill savings. The peak 47.9x
+> is at 1350 tokens on Qwen2.5-3B — see [benchmarks](#benchmarks) for full data.
+
+### Features
 
 | | |
 |---|---|
-| **47.9x faster TTFT** | On 1350-token multi-turn prompts (Qwen2.5-3B, Apple Silicon) |
-| **Zero output degradation** | Greedy decoding produces identical text to baseline |
+| **Identical outputs** | Greedy decoding produces the same text as baseline |
 | **3 lines to integrate** | `from_pretrained` / `warm` / `generate` |
-| **11+ architectures** | Llama, Qwen, Gemma, Mistral, Phi, and more -- any RoPE model on CUDA, MPS, or CPU |
-| **Content-addressed** | SHA256 chunk keys -- same tokens always hit cache |
-| **Two-tier storage** | Hot RAM cache + optional disk-backed cold tier |
+| **11+ architectures** | Llama, Qwen, Gemma, Mistral, Phi -- any RoPE model on CUDA, MPS, or CPU |
+| **Two recompute strategies** | Selective boundary recompute or CacheBlend deviation-guided |
+| **Two-tier storage** | Hot RAM (frequency-based eviction) + optional disk-backed cold tier |
+| **Prefix-chained keys** | vLLM-style hash chaining for positional correctness |
 
 ---
 
