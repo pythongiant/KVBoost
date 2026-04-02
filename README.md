@@ -248,6 +248,69 @@ python benchmarks_and_experiments/benchmark_vs_mlx.py --workload code
 
 </details>
 
+### KVBoost vs vLLM Prefix Caching (vllm-mlx)
+
+Head-to-head against [vLLM-MLX](https://github.com/waybarrios/vllm-mlx) prefix
+caching on Apple Silicon. vLLM caches system prompt KV and reuses on exact prefix
+match. KVBoost reuses any matching chunk, including non-prefix interior content.
+
+> KVBoost: Qwen2.5-3B float16 (MPS) | vLLM-MLX: Qwen2.5-3B 4-bit (MLX Metal)
+
+**Axis 1: Non-Prefix Interior Reuse** (KVBoost's differentiator)
+
+Document placed at the start, in the middle, or not at all:
+
+| Pattern | Query | HF Baseline | KVBoost | vLLM-MLX | KV vs vLLM |
+|---|---|---:|---:|---:|:---:|
+| **Exact prefix** | Q1 | 51ms | **58ms** (89%) | 1,722ms | 29.6x |
+| | Q2 | 673ms | **291ms** (90%) | 928ms | 3.2x |
+| | Q3 | 226ms | **72ms** (88%) | 856ms | 11.9x |
+| **Interior** | Q1 | 307ms | **33ms** (0%) | 1,219ms | 36.8x |
+| | Q2 | 321ms | **103ms** (83%) | 1,214ms | 11.8x |
+| | Q3 | 324ms | **57ms** (82%) | 1,294ms | 22.8x |
+| **No reuse** | Q1 | 287ms | **33ms** | 1,346ms | 40.7x |
+| | Q2 | 335ms | **33ms** | 1,313ms | 39.5x |
+| | Q3 | 313ms | **33ms** | 1,279ms | 38.7x |
+
+**Axis 2: Cold-Start Overhead**
+
+| Cache State | HF Baseline | KVBoost | vLLM-MLX |
+|---|---:|---:|---:|
+| Cold | 206ms | **32ms** | 777ms |
+| Warm Q2 | 204ms | **44ms** (90%) | 891ms |
+| Warm Q3 | 210ms | **62ms** (88%) | 942ms |
+
+**Axis 3: Break-Even Prompt Length**
+
+| Prompt Length | Baseline | KVBoost (cold) | KVBoost (warm) | vLLM (cold) | vLLM (warm) |
+|---|---:|---:|---:|---:|---:|
+| ~100 words | 154ms | 28ms | 124ms (0%) | 549ms | 438ms |
+| ~250 words | 244ms | 33ms | **37ms** (89%) | 1,039ms | 849ms |
+| ~500 words | 403ms | 76ms | **48ms** (88%) | 1,882ms | 1,960ms |
+| ~1000 words | 2,329ms | 2,218ms | **242ms** (98%) | 21,047ms | 61,131ms |
+| ~2000 words | 76,864ms | 7,302ms | **1,452ms** (98%) | 49,015ms | 66,714ms |
+
+> **Key findings:**
+> - KVBoost is **3-41x faster than vLLM-MLX** on TTFT across all patterns
+> - On **interior reuse** (document in the middle), vLLM gets zero cache hits
+>   while KVBoost achieves 82-83% reuse -- this is the core differentiator
+> - At 2000 words warm, KVBoost is **46x faster** than vLLM-MLX (1.5s vs 66.7s)
+> - Even with **no reuse possible**, KVBoost's HF baseline (33ms) beats vLLM-MLX (1.3s)
+>   due to MPS vs MLX Metal overhead differences
+> - Overall mean TTFT: KVBoost **564ms** vs vLLM-MLX **9,928ms**
+
+<details>
+<summary><strong>Run it yourself</strong></summary>
+
+```bash
+pip install vllm-mlx
+python benchmarks_and_experiments/benchmark_vs_vllm.py
+python benchmarks_and_experiments/benchmark_vs_vllm.py --axis non_prefix
+python benchmarks_and_experiments/benchmark_vs_vllm.py --skip-vllm  # KVBoost only
+```
+
+</details>
+
 ---
 
 ## API Reference
