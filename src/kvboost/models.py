@@ -105,6 +105,21 @@ class AssembledPrompt:
         return len(self.full_token_ids)
 
 
+@dataclass
+class WarmResult:
+    """Diagnostic returned by engine.warm() to help catch alignment issues."""
+    chunks_stored: int
+    token_count: int
+    chunk_size: int
+    chunk_boundary_aligned: bool
+    partial_tail_tokens: int
+    alignment_warning: Optional[str] = None
+
+    def __repr__(self) -> str:
+        aligned = "aligned" if self.chunk_boundary_aligned else f"partial tail={self.partial_tail_tokens}"
+        return f"WarmResult(stored={self.chunks_stored}, tokens={self.token_count}, {aligned})"
+
+
 # ── Hashing helpers ────────────────────────────────────────────────
 
 def content_hash_from_tokens(token_ids: List[int]) -> str:

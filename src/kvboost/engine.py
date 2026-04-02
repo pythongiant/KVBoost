@@ -35,7 +35,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import DynamicCache
 
-from .models import AssembledPrompt, CachedChunk, PastKVType, content_hash_from_tokens, chained_hash
+from .models import AssembledPrompt, CachedChunk, PastKVType, WarmResult, content_hash_from_tokens, chained_hash
 from .cache_manager import KVCacheManager
 from .chunk_registry import ChunkRegistry, ChunkStrategy
 from .prompt_assembler import AssemblyMode, PromptAssembler
@@ -185,10 +185,12 @@ class InferenceEngine:
     # Cache population helper
     # ------------------------------------------------------------------
 
-    def warm(self, text: str, position_offset: int = 0) -> int:
+    def warm(self, text: str, position_offset: int = 0) -> WarmResult:
         """
         Encode `text` and cache all its fixed-size chunks.
-        Returns number of new chunks stored.
+
+        Returns a WarmResult with diagnostics including alignment warnings.
+        The result is truthy (usable as int) via chunks_stored.
 
         Call this for your system prompt / few-shot examples / documents
         BEFORE calling generate() so the cache is already populated.
@@ -223,7 +225,30 @@ class InferenceEngine:
             pos += len(slice_ids)
             chunks_added += 1
 
-        return chunks_added
+        # Build diagnostic
+        chunk_size = self.chunk_registry.chunk_size
+        n_tokens = len(token_ids)
+        partial_tail = n_tokens % chunk_size
+        aligned = partial_tail == 0 or partial_tail < self.chunk_registry.min_chunk_tokens
+
+        warning = None
+        if not aligned:
+            warning = (
+                f"Prompt length {n_tokens} tokens is not a multiple of "
+                f"chunk_size {chunk_size}. The last {partial_tail} tokens "
+                f"will not be cached and must be recomputed on every "
+                f"generate() call."
+            )
+            log.warning("warm(): %s", warning)
+
+        return WarmResult(
+            chunks_stored=chunks_added,
+            token_count=n_tokens,
+            chunk_size=chunk_size,
+            chunk_boundary_aligned=aligned,
+            partial_tail_tokens=partial_tail,
+            alignment_warning=warning,
+        )
 
     # Keep old name as alias
     warm_chunks = warm

@@ -23,7 +23,7 @@ Recompute strategies:
 """
 
 from .engine import InferenceEngine as KVBoost, GenerationMode, GenerationResult, RecomputeStrategy
-from .models import CachedChunk, AssembledPrompt, content_hash_from_tokens, chained_hash
+from .models import CachedChunk, AssembledPrompt, WarmResult, content_hash_from_tokens, chained_hash
 from .cache_manager import KVCacheManager
 from .chunk_registry import ChunkRegistry, ChunkStrategy
 from .prompt_assembler import PromptAssembler, AssemblyMode
@@ -40,6 +40,7 @@ __all__ = [
     "RecomputeStrategy",
     "CachedChunk",
     "AssembledPrompt",
+    "WarmResult",
     "KVCacheManager",
     "ChunkRegistry",
     "ChunkStrategy",

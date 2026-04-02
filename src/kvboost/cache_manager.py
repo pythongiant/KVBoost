@@ -59,6 +59,11 @@ class KVCacheManager:
         # Secondary index: content_hash → prefix_hash for approximate lookup
         self._content_index: Dict[str, str] = {}
 
+        # Frequency counter: chunk_id → number of generate() calls it appeared in.
+        # Chunks that appear across many requests (system prompts) get high counts
+        # and are protected from eviction. One-off document chunks stay at 1.
+        self._frequency: Dict[str, int] = {}
+
         # Optional disk tier
         self._disk_dir: Optional[Path] = None
         if disk_dir:
@@ -75,20 +80,22 @@ class KVCacheManager:
     # ------------------------------------------------------------------
 
     def store(self, chunk: CachedChunk) -> None:
-        """Store a chunk. Evicts LRU entry if over capacity."""
+        """Store a chunk. Evicts lowest-frequency entry if over capacity."""
         key = chunk.prefix_hash or chunk.chunk_id
 
         if key in self._hot:
             self._hot.move_to_end(key)
+            self._frequency[key] = self._frequency.get(key, 0) + 1
             return
 
         # Move KV tensors to storage device
         chunk.past_key_values = self._move_kv(chunk.past_key_values, self.device)
 
         if len(self._hot) >= self.max_chunks:
-            self._evict_lru()
+            self._evict_lfu()
 
         self._hot[key] = chunk
+        self._frequency[key] = 1
 
         # Index by content_hash for approximate lookup
         if chunk.content_hash:
@@ -279,18 +286,41 @@ class KVCacheManager:
     # Internal
     # ------------------------------------------------------------------
 
-    def _evict_lru(self) -> None:
+    def _evict_lfu(self) -> None:
+        """
+        Frequency-aware eviction: evict the chunk with the lowest frequency
+        count. Chunks that appear across many generate() calls (system prompts)
+        are protected; one-off document chunks are evicted first.
+
+        Tie-breaking: among chunks with equal frequency, evict the LRU one
+        (first in OrderedDict insertion order).
+        """
         if not self._hot:
             return
-        lru_id, lru_chunk = next(iter(self._hot.items()))
-        log.debug("Evicting LRU chunk %s", lru_id[:8])
+
+        # Find the entry with the lowest frequency
+        min_freq = float("inf")
+        victim_id = None
+        for cid in self._hot:
+            freq = self._frequency.get(cid, 0)
+            if freq < min_freq:
+                min_freq = freq
+                victim_id = cid
+
+        if victim_id is None:
+            return
+
+        victim = self._hot[victim_id]
+        log.debug("Evicting chunk %s (freq=%d)", victim_id[:8], min_freq)
+
         # Clean up content index
-        if lru_chunk.content_hash in self._content_index:
-            if self._content_index[lru_chunk.content_hash] == lru_id:
-                del self._content_index[lru_chunk.content_hash]
+        if victim.content_hash in self._content_index:
+            if self._content_index[victim.content_hash] == victim_id:
+                del self._content_index[victim.content_hash]
         if self._disk_dir:
-            self._save_to_disk(lru_chunk)
-        del self._hot[lru_id]
+            self._save_to_disk(victim)
+        del self._hot[victim_id]
+        self._frequency.pop(victim_id, None)
 
     def _save_to_disk(self, chunk: CachedChunk) -> None:
         key = chunk.prefix_hash or chunk.chunk_id
