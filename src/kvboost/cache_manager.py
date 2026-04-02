@@ -20,17 +20,15 @@ Eviction policy: LRU by access_count + age.
 
 from __future__ import annotations
 
-import os
-import time
 import logging
 from collections import OrderedDict
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
 from .models import CachedChunk, PastKVType, content_hash_from_tokens, chained_hash
 from .kv_quantize import QuantizedKV, quantize_kv, dequantize_kv
+from .disk_tier import DiskTier
 
 log = logging.getLogger(__name__)
 
@@ -70,11 +68,13 @@ class KVCacheManager:
         # and are protected from eviction. One-off document chunks stay at 1.
         self._frequency: Dict[str, int] = {}
 
-        # Optional disk tier
-        self._disk_dir: Optional[Path] = None
+        # Optional disk tier (flat mmap block pool)
+        self._disk: Optional[DiskTier] = None
         if disk_dir:
-            self._disk_dir = Path(disk_dir)
-            self._disk_dir.mkdir(parents=True, exist_ok=True)
+            self._disk = DiskTier(
+                cache_dir=disk_dir,
+                max_chunks=max_chunks * 2,  # cold tier can hold more than hot
+            )
 
         # Stats
         self.hits = 0
@@ -138,12 +138,11 @@ class KVCacheManager:
             return chunk
 
         # Try disk tier
-        if self._disk_dir:
-            path = self._disk_dir / f"{chunk_id}.pt"
-            if path.exists():
-                self.hits += 1
-                chunk = self._load_from_disk(path)
-                self.store(chunk)
+        if self._disk and self._disk.contains(chunk_id):
+            self.hits += 1
+            chunk = self._disk.read(chunk_id, device=self.device)
+            if chunk is not None:
+                self.store(chunk)  # promote to hot
                 return self.get(chunk_id)  # re-enter to handle quantization
 
         self.misses += 1
@@ -275,14 +274,13 @@ class KVCacheManager:
                 del self._content_index[chunk.content_hash]
         self._quantized.pop(chunk_id, None)
         self._frequency.pop(chunk_id, None)
-        if self._disk_dir:
-            path = self._disk_dir / f"{chunk_id}.pt"
-            path.unlink(missing_ok=True)
+        if self._disk:
+            self._disk.remove(chunk_id)
 
     def stats(self) -> Dict:
         total = self.hits + self.misses + self.approximate_hits
         hot_mb = sum(c.memory_bytes() for c in self._hot.values()) / 1e6
-        return {
+        result = {
             "hot_chunks": len(self._hot),
             "hot_memory_mb": round(hot_mb, 2),
             "cache_hits": self.hits,
@@ -291,6 +289,9 @@ class KVCacheManager:
             "hit_rate": round((self.hits + self.approximate_hits) / max(total, 1), 3),
             "exact_hit_rate": round(self.hits / max(total, 1), 3),
         }
+        if self._disk:
+            result.update(self._disk.stats())
+        return result
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -356,32 +357,17 @@ class KVCacheManager:
         if victim.content_hash in self._content_index:
             if self._content_index[victim.content_hash] == victim_id:
                 del self._content_index[victim.content_hash]
-        if self._disk_dir:
-            self._save_to_disk(victim)
+
+        # Demote to disk tier if available
+        if self._disk:
+            # Dequantize first if stored quantized
+            if victim_id in self._quantized:
+                victim = self._dequantize_chunk(victim, victim_id)
+            self._disk.write(victim)
+
         del self._hot[victim_id]
         self._frequency.pop(victim_id, None)
         self._quantized.pop(victim_id, None)
-
-    def _save_to_disk(self, chunk: CachedChunk) -> None:
-        key = chunk.prefix_hash or chunk.chunk_id
-        path = self._disk_dir / f"{key}.pt"
-        payload = {
-            "chunk_id": chunk.chunk_id,
-            "text": chunk.text,
-            "token_ids": chunk.token_ids,
-            "past_key_values": chunk.past_key_values,
-            "position_start": chunk.position_start,
-            "position_end": chunk.position_end,
-            "prefix_hash": chunk.prefix_hash,
-            "content_hash": chunk.content_hash,
-            "created_at": chunk.created_at,
-            "access_count": chunk.access_count,
-        }
-        torch.save(payload, path)
-
-    def _load_from_disk(self, path: Path) -> CachedChunk:
-        payload = torch.load(path, map_location=self.device, weights_only=False)
-        return CachedChunk(**payload)
 
     @staticmethod
     def _move_kv(kv: PastKVType, device: str) -> PastKVType:
