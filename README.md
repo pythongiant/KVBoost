@@ -12,6 +12,7 @@
 <p align="center">
   <a href="https://pypi.org/project/kvboost/0.1.0/"><img src="https://img.shields.io/pypi/v/kvboost?color=blue&label=PyPI" alt="PyPI"></a>
   <a href="https://pypi.org/project/kvboost/0.1.0/"><img src="https://img.shields.io/pypi/pyversions/kvboost" alt="Python"></a>
+  <a href="https://kvboost.readthedocs.io/en/latest/"><img src="https://img.shields.io/readthedocs/kvboost" alt="Docs"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
   <a href="https://github.com/pythongiant/kvboost"><img src="https://img.shields.io/badge/platform-CUDA%20%7C%20MPS%20%7C%20CPU-orange" alt="Platform"></a>
   <a href="https://github.com/pythongiant/kvboost/stargazers"><img src="https://img.shields.io/github/stars/pythongiant/kvboost?style=social" alt="Stars"></a>
@@ -23,7 +24,8 @@
   <a href="#-installation">Installation</a> &bull;
   <a href="#-api-reference">API Reference</a> &bull;
   <a href="#-examples">Examples</a> &bull;
-  <a href="#-how-it-works">How It Works</a>
+  <a href="#how-it-works">How it works</a> &bull;
+  <a href="https://kvboost.readthedocs.io/en/latest/">Docs</a>
 </p>
 
 ---
@@ -488,101 +490,116 @@ python examples/run.py --list             # see all options
 
 ---
 
-## How It Works
+## How it works
 
-### Architecture
+Every time a language model generates text, it has to read your entire
+prompt first. That reading step (called "prefill") is the bottleneck. If
+your prompt is 1,000 tokens long, the model processes all 1,000 before
+producing a single word of output. Send the same prompt again with a
+different question at the end, and it re-reads all 1,000 tokens from scratch.
+
+KVBoost skips the re-reading.
+
+### The prompt gets split into chunks
+
+When you call `generate()`, the prompt's tokens get sliced into
+fixed-size blocks (default 128 tokens each) by `ChunkRegistry.split()`.
+Nothing fancy here. Just a `while` loop that walks through the token list
+and cuts it into pieces.
+
+### Each chunk gets two hashes
+
+This is where the vLLM-style keying comes in (`models.py`). Each chunk
+gets a `prefix_hash` and a `content_hash`:
 
 ```
-prompt_text
-    |
-    v
- tokenize
-    |
-    v
- ChunkRegistry.split()          -- split into fixed/semantic chunks
-    |
-    v
- KVCacheManager.find_matches()  -- SHA256 lookup per chunk
-    |
-    v
- PromptAssembler.assemble()     -- stitch cached KV + live tokens
-    |
-    v
- Recompute (selective OR cacheblend) -- fix stale KV from stitching
-    |
-    v
- model.forward(live_tokens, past_key_values=cached_kv)
-    |
-    v
- GenerationResult
+prefix_hash  = SHA256(previous_chunk's_hash + this_chunk's_tokens)
+content_hash = SHA256(this_chunk's_tokens)
 ```
 
-### Key Design Decisions
+The prefix hash captures position and context. The same paragraph
+appearing at the start of one conversation and the middle of another
+gets different prefix hashes, so their cached data stays separate. The
+content hash ignores position. It's the fallback for when the same text
+shows up in a new context.
 
-**Content-addressed chunks** -- Each chunk is keyed by `SHA256(token_bytes)`.
-Same tokens always produce the same key, regardless of surrounding context.
+### The cache manager checks what's already stored
 
-**RoPE-safe position handling** -- Cached chunks store KV at their original
-positions. Live tokens get `position_ids` starting at `cached_length`, so
-positional encodings remain monotonically correct.
+`KVCacheManager.find_matching_chunks()` walks through the prompt's
+chunks and tries the prefix hash first (exact match), then falls back
+to the content hash (approximate match). An approximate match still
+hits cache, but it gets flagged so the engine knows the stored data
+needs heavier correction later.
 
-**Two recompute strategies** -- When chunks are stitched together, their KV
-tensors are "stale" (computed without cross-chunk attention). KVBoost offers
-two ways to fix this:
+Internally the hot cache is an `OrderedDict` keyed by prefix hash, with
+a secondary `dict` mapping content hashes to prefix hashes. Eviction is
+frequency-based, not pure LRU. Chunks that appear in many requests (your
+system prompt) accumulate a high count and stay. One-off document chunks
+stay at 1 and get evicted first.
 
-*Selective recompute* (default) recomputes the last `R` tokens at each chunk
-seam. Simple and correct, but costs `O(R * num_seams)` — which can be up to
-79% of full prefill cost.
+### Cached and uncached tokens get separated
 
-*CacheBlend recompute* runs a cheap forward pass over the assembled KV, measures
-per-token cosine deviation between cached and full-context KV vectors, and
-recomputes only the ~15% of tokens that actually deviate. This is both faster
-(fewer tokens recomputed) and more accurate (fixes tokens *inside* chunks that
-depend on cross-chunk context, not just boundaries). Based on the CacheBlend
-paper (USENIX ATC '25).
+`PromptAssembler` splits the prompt into two parts: the tokens covered
+by cache hits (where stored KV data exists) and the "live" tokens at
+the end (the new question, the part that changes between requests).
+If the first 8 chunks all hit cache and only the last 30 tokens are
+new, then the model only has to process those 30 tokens instead of
+the full prompt.
 
-**Two-tier storage** -- Hot tier is an in-memory `OrderedDict` with LRU eviction.
-Optional cold tier serializes evicted chunks to disk via `torch.save()` and
-promotes them back on cache hit.
+### The stitching problem gets fixed
 
-<details>
-<summary><strong>Data structures</strong></summary>
+Here's the catch. Each cached chunk was originally processed in
+isolation. Token 129 in chunk 2 never "saw" token 1 in chunk 1 when
+its data was computed. When you stitch the chunks back together, some
+of that stored data is slightly wrong because it's missing cross-chunk
+context.
 
-```python
-CachedChunk:
-    chunk_id:        str          # SHA256(token_ids bytes)
-    token_ids:       List[int]    # tokenized content
-    past_key_values: Tuple[       # HF format: (key, value) per layer
-                       Tuple[Tensor, Tensor], ...
-                     ]
-    position_start:  int          # absolute position of first token
-    position_end:    int          # exclusive end position
+KVBoost has two ways to fix this:
 
-AssembledPrompt:
-    cached_past_kv:    PastKVType   # merged KV for all reused chunks
-    cached_length:     int          # tokens covered by cache
-    live_token_ids:    List[int]    # tokens needing fresh forward pass
-    live_position_ids: List[int]    # absolute positions for live tokens
-    chunk_boundaries:  List[Tuple]  # seam locations for recompute
-    cache_hit_ratio:   float
-```
+**Selective recompute** re-runs the model on the last 16 tokens at each
+chunk boundary with the full stitched context. It's the simpler option.
+The cost is proportional to the number of boundaries.
 
-</details>
+**CacheBlend** takes a different approach. It runs one pass over the
+full stitched data, measures how much each token's stored values
+actually deviate from what they should be, and only recomputes the ~15%
+that are most wrong. Tokens in the middle of a chunk that happen to
+depend on cross-chunk context get fixed too, not just the ones at the
+edges. Based on the CacheBlend paper (USENIX ATC '25).
 
-<details>
-<summary><strong>Memory layout</strong></summary>
+If the cache manager flagged an approximate match (same text, different
+position), CacheBlend runs automatically regardless of your configured
+strategy. Boundary-only repair isn't enough when the position encodings
+are wrong.
 
-Per-chunk KV memory (float16):
+### The model runs on just the live tokens
 
-| Model | Layers | Heads | head_dim | chunk_size=128 |
-|---|:---:|:---:|:---:|---:|
-| TinyLlama 1.1B | 22 | 32 | 64 | 22.9 MB |
-| GPT-2 Medium | 24 | 16 | 64 | 12.6 MB |
-| Qwen2.5-3B | 36 | 16 | 128 | 9.4 MB |
+The cached KV data and the live suffix tokens go into one
+`model.forward()` call. The model sees the cached data as if it had
+already processed those tokens, and only does real work on the new
+ones. This is where the speedup comes from. 30 tokens instead of 1,000.
 
-Formula: `2 * layers * heads * chunk_size * head_dim * 2 bytes`
+After generation finishes, the engine calls `_store_prompt_chunks()` to
+cache any chunks that weren't already stored. So the second time you
+send a similar prompt, more of it hits cache.
 
-</details>
+### Where the data lives
+
+The hot tier is an in-memory Python dict. Chunks sit there as CPU
+tensors and get moved to the GPU when needed.
+
+If you enable `kv_cache_bits=8`, the tensors get compressed to int8
+before storage using asymmetric quantization (keys per-channel, values
+per-token, following KIVI from ICML 2024). This halves RAM usage. int4
+is also available for 4x compression, but you should run
+`verify_correctness()` before trusting it.
+
+When the hot tier fills up, evicted chunks get written to a flat binary
+file on disk (one pre-allocated file, not per-chunk files). Promoted
+back on cache hit. The index is a JSON file that maps hashes to byte
+offsets.
+
+> Full API docs: [kvboost.readthedocs.io](https://kvboost.readthedocs.io/en/latest/)
 
 ---
 
