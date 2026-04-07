@@ -8,6 +8,12 @@ From PyPI
 
    pip install kvboost
 
+To install a specific version:
+
+.. code-block:: bash
+
+   pip install kvboost==0.2.0
+
 From Source
 -----------
 
@@ -17,6 +23,14 @@ From Source
    cd kvboost
    pip install -e .
 
+Verify Installation
+-------------------
+
+.. code-block:: python
+
+   import kvboost
+   print(kvboost.__version__)  # 0.2.0
+
 Requirements
 ------------
 
@@ -25,8 +39,11 @@ Requirements
 - Transformers >= 4.38
 - Accelerate >= 0.27
 
-Optional
---------
+These are installed automatically by pip. No C++ compilation or
+platform-specific builds required.
+
+Optional Dependencies
+---------------------
 
 For running benchmarks against vLLM-MLX:
 
@@ -34,9 +51,21 @@ For running benchmarks against vLLM-MLX:
 
    pip install vllm-mlx
 
+For running benchmarks against MLX LLM:
+
+.. code-block:: bash
+
+   pip install mlx-lm
+
+For running accuracy benchmarks (HellaSwag, ARC, MMLU, GSM8K, TruthfulQA):
+
+.. code-block:: bash
+
+   pip install datasets
+
 For documentation development:
 
 .. code-block:: bash
 
    pip install -e ".[docs]"
-   cd docs && make html
+   cd docs && sphinx-build -b html source build/html
