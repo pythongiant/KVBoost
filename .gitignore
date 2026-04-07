@@ -29,3 +29,6 @@ venv/
 
 # Disk cache tier
 cache_dir/
+
+# Sphinx docs build
+docs/build/

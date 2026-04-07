@@ -28,12 +28,19 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/srihariunnikrishnan/kvboost"
+Repository = "https://github.com/pythongiant/kvboost"
+Documentation = "https://kvboost.readthedocs.io"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
     "ruff>=0.1.0",
+]
+docs = [
+    "sphinx>=7.0",
+    "furo>=2024.0",
+    "sphinx-copybutton>=0.5",
+    "myst-parser>=3.0",
 ]
 
 [tool.setuptools.packages.find]
