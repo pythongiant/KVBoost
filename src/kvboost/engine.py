@@ -183,6 +183,180 @@ class InferenceEngine:
             return self._generate_chunk_reuse(prompt, token_ids, max_new_tokens, temperature, do_sample)
         raise ValueError(f"Unknown mode {mode}")
 
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 64,
+        temperature: float = 1.0,
+        do_sample: bool = False,
+    ) -> List[GenerationResult]:
+        """
+        Generate responses for multiple prompts sharing a common prefix.
+        Loads shared prefix KV once, runs batched prefill and decode.
+
+        Args:
+            prompts: List of prompts (should share a common prefix for best results).
+            max_new_tokens: Max tokens to generate per prompt.
+            temperature: Sampling temperature.
+            do_sample: Greedy (False) or sampling (True).
+
+        Returns:
+            List of GenerationResult, one per prompt.
+        """
+        from .batch import (
+            find_common_chunk_prefix, broadcast_kv, pad_and_mask, batched_decode,
+        )
+
+        if len(prompts) == 1:
+            return [self.generate(prompts[0], max_new_tokens, temperature=temperature, do_sample=do_sample)]
+
+        t0 = time.perf_counter()
+        batch_size = len(prompts)
+
+        # Tokenize all prompts
+        all_token_ids = [self._encode(p) for p in prompts]
+
+        # Find shared chunk-aligned prefix
+        common_len = find_common_chunk_prefix(all_token_ids, self.chunk_registry.chunk_size)
+
+        # Load shared prefix KV from cache
+        shared_kv = None
+        if common_len > 0:
+            assembled = self.assembler.assemble(all_token_ids[0][:common_len + 1])
+            shared_kv = assembled.cached_past_kv
+            common_len = assembled.cached_length
+
+        # Collect suffix token IDs (non-shared tail of each prompt)
+        suffix_ids_list = [ids[common_len:] for ids in all_token_ids]
+
+        # Pad suffixes and build attention masks
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        padded_suffixes, attn_masks = pad_and_mask(suffix_ids_list, pad_id)
+        max_suffix_len = max(len(s) for s in suffix_ids_list)
+
+        # Build batched input tensors
+        suffix_input = torch.tensor(padded_suffixes, dtype=torch.long, device=self.device)
+        pos_ids = torch.arange(
+            common_len, common_len + max_suffix_len,
+            dtype=torch.long, device=self.device,
+        ).unsqueeze(0).expand(batch_size, -1)
+
+        # Broadcast shared KV across batch (zero-copy expand)
+        batched_past = None
+        if shared_kv is not None:
+            shared_kv_device = tuple(
+                (k.to(self.device), v.to(self.device)) for k, v in shared_kv
+            )
+            batched_past = broadcast_kv(shared_kv_device, batch_size)
+
+        # Batched prefill
+        with torch.no_grad():
+            out = self.model(
+                input_ids=suffix_input,
+                past_key_values=self._as_cache(batched_past),
+                position_ids=pos_ids,
+                use_cache=True,
+            )
+
+        first_token_time = time.perf_counter()
+        past_kv = self._normalize_past_kv(out.past_key_values)
+
+        # Sample first token per sequence (using each sequence's last real token logits)
+        first_tokens = []
+        for b in range(batch_size):
+            real_len = len(suffix_ids_list[b])
+            logits_b = out.logits[b, real_len - 1, :].unsqueeze(0)
+            tok = self._sample(logits_b, temperature, do_sample)
+            first_tokens.append(tok)
+
+        first_tokens_t = torch.tensor(first_tokens, dtype=torch.long, device=self.device)
+
+        # Batched decode
+        generated_ids, _ = batched_decode(
+            model=self.model,
+            past_kv=past_kv,
+            first_tokens=first_tokens_t,
+            start_pos=common_len + max_suffix_len,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=self.tokenizer.eos_token_id,
+            temperature=temperature,
+            do_sample=do_sample,
+            device=self.device,
+        )
+
+        t1 = time.perf_counter()
+
+        # Store prompt chunks for future reuse
+        for ids in all_token_ids:
+            self._store_prompt_chunks(ids)
+
+        # Build results
+        results = []
+        ttft = (first_token_time - t0) * 1000
+        total_ms = (t1 - t0) * 1000
+        hit_ratio = common_len / max(max(len(ids) for ids in all_token_ids), 1)
+
+        for b in range(batch_size):
+            output_text = self.tokenizer.decode(generated_ids[b], skip_special_tokens=True)
+            results.append(GenerationResult(
+                mode="chunk_kv_reuse_batch",
+                prompt=prompts[b],
+                output_text=output_text,
+                generated_tokens=len(generated_ids[b]),
+                ttft_ms=ttft,
+                total_ms=total_ms,
+                tokens_per_sec=len(generated_ids[b]) / max(t1 - t0, 1e-6),
+                kv_reuse_ratio=hit_ratio,
+                prompt_tokens=len(all_token_ids[b]),
+                cached_tokens=common_len,
+            ))
+
+        return results
+
+    def generate_many(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 64,
+        temperature: float = 1.0,
+        do_sample: bool = False,
+    ) -> List[GenerationResult]:
+        """
+        Like generate_batch(), but auto-groups prompts by shared prefix.
+        Prompts without shared prefixes are processed individually.
+
+        Args:
+            prompts: List of prompts (may or may not share prefixes).
+            max_new_tokens: Max tokens to generate per prompt.
+
+        Returns:
+            List of GenerationResult in the same order as input prompts.
+        """
+        from .batch import group_by_prefix
+
+        all_token_ids = [self._encode(p) for p in prompts]
+        groups = group_by_prefix(
+            prompts, all_token_ids, self.chunk_registry.chunk_size,
+        )
+
+        results: List[Optional[GenerationResult]] = [None] * len(prompts)
+
+        for group_indices in groups.values():
+            group_prompts = [prompts[i] for i in group_indices]
+            if len(group_prompts) == 1:
+                group_results = [self.generate(
+                    group_prompts[0], max_new_tokens,
+                    temperature=temperature, do_sample=do_sample,
+                )]
+            else:
+                group_results = self.generate_batch(
+                    group_prompts, max_new_tokens,
+                    temperature=temperature, do_sample=do_sample,
+                )
+            for idx, result in zip(group_indices, group_results):
+                results[idx] = result
+
+        return results
+
     # ------------------------------------------------------------------
     # Cache population helper
     # ------------------------------------------------------------------
