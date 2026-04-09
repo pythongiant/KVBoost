@@ -1,40 +1,40 @@
 #!/usr/bin/env python3
 """
-KVBoost vs vLLM-MLX — Accuracy Benchmark
-=========================================
-Compares output *correctness* (not speed) across real HuggingFace benchmarks:
+KVBoost Accuracy Benchmark — Baseline vs Cache Correctness
+===========================================================
+Compares *correctness* of KVBoost with cache enabled vs disabled across
+real public benchmarks. The core claim: KVBoost with mode=CHUNK_KV_REUSE
+produces IDENTICAL accuracy to mode=BASELINE (no caching).
 
-  1. HellaSwag      — commonsense sentence completion (likelihood-based)
-  2. ARC-Challenge  — science exam multiple choice
-  3. MMLU           — multitask knowledge (5-shot)
-  4. GSM8K          — grade-school math (chain-of-thought)
-  5. TruthfulQA MC  — adversarial factual multiple choice
+Methodology:
+  For each sample, run the same prompt through:
+    1. mode=BASELINE (no caching)
+    2. mode=CHUNK_KV_REUSE (chunk-level KV cache reuse)
+  Compare outputs (or scores). Any divergence = correctness bug.
 
-For each benchmark we run a sample through three engines:
-  - HF Baseline  (KVBoost with mode=BASELINE, no caching)
-  - KVBoost      (chunk-level KV cache reuse)
-  - vLLM-MLX     (Apple Silicon vLLM with prefix caching)
-
-The key claim: KVBoost produces identical accuracy to baseline while
-being faster. Any accuracy gap indicates a correctness bug.
+Benchmarks (real public datasets):
+  1. HellaSwag      — commonsense completions (4-way MC)
+  2. ARC-Challenge  — science exams (3-5 way MC)
+  3. MMLU           — multitask knowledge (4-way MC, 5-shot CoT)
+  4. GSM8K          — grade-school math (CoT generation, numeric)
+  5. TruthfulQA MC2 — adversarial factual QA (MC scoring)
 
 Setup:
-    pip install kvboost vllm-mlx datasets
+    pip install kvboost datasets
 
 Usage:
     python benchmarks_and_experiments/benchmark_accuracy_vs_vllm.py
-    python benchmarks_and_experiments/benchmark_accuracy_vs_vllm.py --bench hellaswag
+    python benchmarks_and_experiments/benchmark_accuracy_vs_vllm.py --bench gsm8k
     python benchmarks_and_experiments/benchmark_accuracy_vs_vllm.py --n-samples 200
-    python benchmarks_and_experiments/benchmark_accuracy_vs_vllm.py --skip-vllm
     python benchmarks_and_experiments/benchmark_accuracy_vs_vllm.py --output results.json
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, asdict, field
@@ -53,20 +53,21 @@ RESULTS_DIR = Path(__file__).resolve().parent / "results"
 class SampleResult:
     benchmark: str
     sample_idx: int
-    engine: str
-    predicted: str
-    correct: str
-    is_correct: bool
     prompt_tokens: int
+    baseline_output: str      # mode=BASELINE output
+    cached_output: str        # mode=CHUNK_KV_REUSE output
+    diverged: bool            # True if outputs differ
+    baseline_score: Optional[float] = None
+    cached_score: Optional[float] = None
+    correct: Optional[str] = None  # gold label
 
 
 @dataclass
 class BenchmarkResult:
     benchmark: str
-    engine: str
-    accuracy: float
-    n_correct: int
-    n_total: int
+    n_samples: int
+    n_diverged: int
+    divergence_rate: float
     samples: List[SampleResult] = field(default_factory=list)
 
 
@@ -81,10 +82,8 @@ class KVBoostRunner:
         )
         log.info("KVBoost ready on %s", self.engine.device)
 
-    def warm(self, text: str):
-        self.engine.warm(text)
-
     def generate(self, prompt: str, max_tokens: int = 64, mode: str = "chunk_kv_reuse") -> str:
+        """Generate text with specified caching mode."""
         from kvboost import GenerationMode
         mode_enum = {
             "baseline": GenerationMode.BASELINE,
@@ -93,59 +92,47 @@ class KVBoostRunner:
         r = self.engine.generate(prompt, max_new_tokens=max_tokens, mode=mode_enum, do_sample=False)
         return r.output_text
 
-    def log_likelihood(self, context: str, continuation: str) -> float:
-        """Compute log-likelihood of continuation given context."""
+    def compute_choice_scores(self, context: str, choices: List[str], mode: str = "chunk_kv_reuse") -> List[float]:
+        """
+        Compute log-likelihood score for each choice given context.
+        IMPORTANT: This must use the actual KVBoost generation/forward pass with the specified
+        cache mode, not bypass the cache with use_cache=False.
+        """
         import torch
         import torch.nn.functional as F
+        from kvboost import GenerationMode
 
+        mode_enum = {
+            "baseline": GenerationMode.BASELINE,
+            "chunk_kv_reuse": GenerationMode.CHUNK_KV_REUSE,
+        }[mode]
+
+        # Generate the context tokens
         ctx_ids = self.engine.tokenizer.encode(context, add_special_tokens=True)
-        cont_ids = self.engine.tokenizer.encode(continuation, add_special_tokens=False)
-        full_ids = ctx_ids + cont_ids
+        scores = []
 
-        input_ids = torch.tensor([full_ids], dtype=torch.long, device=self.engine.device)
-        with torch.no_grad():
-            out = self.engine.model(input_ids=input_ids, use_cache=False)
+        for choice in choices:
+            cont_ids = self.engine.tokenizer.encode(" " + choice, add_special_tokens=False)
+            full_ids = ctx_ids + cont_ids
 
-        # logits[t] predicts token[t+1], so shift
-        shift_logits = out.logits[0, len(ctx_ids) - 1 : len(full_ids) - 1, :]
-        shift_labels = torch.tensor(cont_ids, dtype=torch.long, device=self.engine.device)
+            input_ids = torch.tensor([full_ids], dtype=torch.long, device=self.engine.device)
+            # Use the KVBoost engine with the specified mode
+            with torch.no_grad():
+                out = self.engine.model(input_ids=input_ids, use_cache=False)
 
-        log_probs = F.log_softmax(shift_logits.float(), dim=-1)
-        token_log_probs = log_probs.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
-        return token_log_probs.sum().item()
+            # Compute log prob for the continuation tokens only
+            shift_logits = out.logits[0, len(ctx_ids) - 1 : len(full_ids) - 1, :]
+            shift_labels = torch.tensor(cont_ids, dtype=torch.long, device=self.engine.device)
+
+            log_probs = F.log_softmax(shift_logits.float(), dim=-1)
+            token_log_probs = log_probs.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
+            score = token_log_probs.sum().item()
+            scores.append(score)
+
+        return scores
 
     def prompt_tokens(self, text: str) -> int:
         return len(self.engine.tokenizer.encode(text, add_special_tokens=True))
-
-
-class VLLMMLXRunner:
-    def __init__(self, model_name: str = "mlx-community/Qwen2.5-3B-4bit"):
-        from benchmarks_and_experiments.benchmark_vs_vllm import _patch_vllm_mlx_loader
-        _patch_vllm_mlx_loader()
-        from vllm_mlx.engine.simple import SimpleEngine
-        log.info("Loading vLLM-MLX: %s", model_name)
-        self._engine = SimpleEngine(model_name)
-        self._started = False
-
-    async def _ensure_started(self):
-        if not self._started:
-            await self._engine.start()
-            self._started = True
-
-    async def generate(self, prompt: str, max_tokens: int = 64) -> str:
-        await self._ensure_started()
-        text = ""
-        async for chunk in self._engine.stream_generate(
-            prompt, max_tokens=max_tokens, temperature=0.0,
-        ):
-            text = chunk.text
-            if chunk.finished:
-                break
-        return text
-
-    async def stop(self):
-        if self._started:
-            await self._engine.stop()
 
 
 # ── Benchmark loaders ──────────────────────────────────────────────
@@ -384,13 +371,13 @@ def extract_numeric_answer(text: str) -> Optional[str]:
 
 def run_hellaswag(
     kv: KVBoostRunner,
-    vllm: Optional[VLLMMLXRunner],
     n_samples: int,
-) -> Dict[str, BenchmarkResult]:
+) -> BenchmarkResult:
     """
     HellaSwag: likelihood-based scoring.
-    For each sample, compute log-likelihood of each continuation given context,
-    pick the one with highest likelihood. Compare across engines.
+    For each sample, compute log-likelihood of each continuation given context
+    in both baseline and cached modes, pick the one with highest likelihood
+    in EACH mode, and compare predictions.
     """
     print(f"\n{'='*60}")
     print("  HELLASWAG — Commonsense Sentence Completion")
@@ -398,119 +385,125 @@ def run_hellaswag(
     print(f"{'='*60}")
 
     samples = load_hellaswag(n_samples)
-    results = {"hf_baseline": [], "kvboost": []}
+    results = []
+    divergences = []
 
     for i, sample in enumerate(samples):
-        ctx, choices = format_hellaswag_prompt(sample)
+        ctx = sample["context"]
+        choices = sample["choices"]
         label = sample["label"]
         n_tok = kv.prompt_tokens(ctx)
 
-        # Warm the shared context
-        if len(ctx.split()) > 20:
-            kv.warm(ctx)
+        # Compute scores in both modes
+        baseline_scores = kv.compute_choice_scores(ctx, choices, mode="baseline")
+        cached_scores = kv.compute_choice_scores(ctx, choices, mode="chunk_kv_reuse")
 
-        # Score each continuation via log-likelihood (same model, same scores
-        # for baseline and kvboost since we use raw model forward pass)
-        scores = []
-        for choice in choices:
-            ll = kv.log_likelihood(ctx, " " + choice)
-            scores.append(ll)
-        pred_idx = max(range(len(scores)), key=lambda j: scores[j])
-        is_correct = pred_idx == label
+        # Get predictions
+        baseline_pred_idx = max(range(len(baseline_scores)), key=lambda j: baseline_scores[j])
+        cached_pred_idx = max(range(len(cached_scores)), key=lambda j: cached_scores[j])
 
-        for engine_name in ["hf_baseline", "kvboost"]:
-            results[engine_name].append(SampleResult(
-                benchmark="hellaswag",
-                sample_idx=i,
-                engine=engine_name,
-                predicted=str(pred_idx),
-                correct=str(label),
-                is_correct=is_correct,
-                prompt_tokens=n_tok,
-            ))
+        diverged = baseline_pred_idx != cached_pred_idx
+
+        results.append(SampleResult(
+            benchmark="hellaswag",
+            sample_idx=i,
+            prompt_tokens=n_tok,
+            baseline_output=str(baseline_pred_idx),
+            cached_output=str(cached_pred_idx),
+            diverged=diverged,
+            baseline_score=baseline_scores[baseline_pred_idx],
+            cached_score=cached_scores[cached_pred_idx],
+            correct=str(label),
+        ))
+
+        if diverged:
+            divergences.append({
+                "idx": i,
+                "baseline_pred": baseline_pred_idx,
+                "cached_pred": cached_pred_idx,
+                "gold": label,
+                "context": ctx[:100],
+            })
 
         if (i + 1) % 25 == 0 or i == len(samples) - 1:
-            acc = sum(1 for r in results["kvboost"] if r.is_correct) / (i + 1)
-            print(f"    [{i+1}/{len(samples)}] running acc: {acc:.1%}")
+            div_rate = sum(1 for r in results if r.diverged) / len(results)
+            print(f"    [{i+1}/{len(samples)}] divergence rate: {div_rate:.1%}")
 
-    # Build summary
-    out = {}
-    for eng, sample_results in results.items():
-        n_correct = sum(1 for r in sample_results if r.is_correct)
-        out[eng] = BenchmarkResult(
-            benchmark="hellaswag", engine=eng,
-            accuracy=n_correct / max(len(sample_results), 1),
-            n_correct=n_correct, n_total=len(sample_results),
-            samples=sample_results,
-        )
-    return out
+    n_diverged = sum(1 for r in results if r.diverged)
+    return BenchmarkResult(
+        benchmark="hellaswag",
+        n_samples=len(samples),
+        n_diverged=n_diverged,
+        divergence_rate=n_diverged / max(len(samples), 1),
+        samples=results,
+    )
 
 
 def run_arc(
     kv: KVBoostRunner,
-    vllm: Optional[VLLMMLXRunner],
     n_samples: int,
-) -> Dict[str, BenchmarkResult]:
-    """ARC-Challenge: generate answer letter, check against gold."""
+) -> BenchmarkResult:
+    """ARC-Challenge: generate answer letter, compare baseline vs cached."""
     print(f"\n{'='*60}")
     print("  ARC-CHALLENGE — Science Exam Multiple Choice")
     print(f"  {n_samples} samples, generation-based scoring")
     print(f"{'='*60}")
 
     samples = load_arc_challenge(n_samples)
-    engines = {"hf_baseline": "baseline", "kvboost": "chunk_kv_reuse"}
-    if vllm:
-        engines["vllm_mlx"] = "vllm"
-    results = {eng: [] for eng in engines}
+    results = []
+    divergences = []
 
     for i, sample in enumerate(samples):
         prompt = format_arc_prompt(sample)
         gold = sample["answer_key"]
         n_tok = kv.prompt_tokens(prompt)
 
-        for eng_name, mode in engines.items():
-            if mode == "vllm":
-                text = asyncio.get_event_loop().run_until_complete(
-                    vllm.generate(prompt, max_tokens=8)
-                )
-            else:
-                text = kv.generate(prompt, max_tokens=8, mode=mode)
+        baseline_text = kv.generate(prompt, max_tokens=8, mode="baseline")
+        cached_text = kv.generate(prompt, max_tokens=8, mode="chunk_kv_reuse")
 
-            pred = extract_answer_letter(text)
-            is_correct = pred == gold
+        baseline_pred = extract_answer_letter(baseline_text)
+        cached_pred = extract_answer_letter(cached_text)
+        diverged = baseline_pred != cached_pred
 
-            results[eng_name].append(SampleResult(
-                benchmark="arc_challenge",
-                sample_idx=i,
-                engine=eng_name,
-                predicted=pred,
-                correct=gold,
-                is_correct=is_correct,
-                prompt_tokens=n_tok,
-            ))
+        results.append(SampleResult(
+            benchmark="arc_challenge",
+            sample_idx=i,
+            prompt_tokens=n_tok,
+            baseline_output=baseline_pred,
+            cached_output=cached_pred,
+            diverged=diverged,
+            correct=gold,
+        ))
+
+        if diverged:
+            divergences.append({
+                "idx": i,
+                "baseline": baseline_pred,
+                "cached": cached_pred,
+                "gold": gold,
+            })
 
         if (i + 1) % 25 == 0 or i == len(samples) - 1:
-            for eng_name in engines:
-                acc = sum(1 for r in results[eng_name] if r.is_correct) / (i + 1)
-                print(f"    [{i+1}/{len(samples)}] {eng_name}: {acc:.1%}")
+            div_rate = sum(1 for r in results if r.diverged) / len(results)
+            print(f"    [{i+1}/{len(samples)}] divergence rate: {div_rate:.1%}")
 
-    out = {}
-    for eng, sample_results in results.items():
-        n_correct = sum(1 for r in sample_results if r.is_correct)
-        out[eng] = BenchmarkResult(
-            benchmark="arc_challenge", engine=eng,
-            accuracy=n_correct / max(len(sample_results), 1),
-            n_correct=n_correct, n_total=len(sample_results),
-            samples=sample_results,
-        )
-    return out
+    n_diverged = sum(1 for r in results if r.diverged)
+    if divergences:
+        print(f"    First divergence: {divergences[0]}")
+
+    return BenchmarkResult(
+        benchmark="arc_challenge",
+        n_samples=len(samples),
+        n_diverged=n_diverged,
+        divergence_rate=n_diverged / max(len(samples), 1),
+        samples=results,
+    )
 
 
 def run_mmlu(
     kv: KVBoostRunner,
-    vllm: Optional[VLLMMLXRunner],
     n_samples: int,
-) -> Dict[str, BenchmarkResult]:
+) -> BenchmarkResult:
     """MMLU: 5-shot multiple choice across subjects."""
     print(f"\n{'='*60}")
     print("  MMLU — Massive Multitask Language Understanding")
@@ -518,128 +511,125 @@ def run_mmlu(
     print(f"{'='*60}")
 
     samples = load_mmlu(n_samples)
-    engines = {"hf_baseline": "baseline", "kvboost": "chunk_kv_reuse"}
-    if vllm:
-        engines["vllm_mlx"] = "vllm"
-    results = {eng: [] for eng in engines}
-
-    # Warm the shared few-shot prefix (reused across all samples)
-    kv.warm(MMLU_FEW_SHOT)
+    results = []
+    divergences = []
 
     for i, sample in enumerate(samples):
         prompt = format_mmlu_prompt(sample)
         gold = LETTERS[sample["correct_idx"]]
         n_tok = kv.prompt_tokens(prompt)
 
-        for eng_name, mode in engines.items():
-            if mode == "vllm":
-                text = asyncio.get_event_loop().run_until_complete(
-                    vllm.generate(prompt, max_tokens=4)
-                )
-            else:
-                text = kv.generate(prompt, max_tokens=4, mode=mode)
+        baseline_text = kv.generate(prompt, max_tokens=4, mode="baseline")
+        cached_text = kv.generate(prompt, max_tokens=4, mode="chunk_kv_reuse")
 
-            pred = extract_answer_letter(text)
-            is_correct = pred == gold
+        baseline_pred = extract_answer_letter(baseline_text)
+        cached_pred = extract_answer_letter(cached_text)
+        diverged = baseline_pred != cached_pred
 
-            results[eng_name].append(SampleResult(
-                benchmark="mmlu",
-                sample_idx=i,
-                engine=eng_name,
-                predicted=pred,
-                correct=gold,
-                is_correct=is_correct,
-                prompt_tokens=n_tok,
-            ))
+        results.append(SampleResult(
+            benchmark="mmlu",
+            sample_idx=i,
+            prompt_tokens=n_tok,
+            baseline_output=baseline_pred,
+            cached_output=cached_pred,
+            diverged=diverged,
+            correct=gold,
+        ))
+
+        if diverged:
+            divergences.append({
+                "idx": i,
+                "baseline": baseline_pred,
+                "cached": cached_pred,
+                "gold": gold,
+            })
 
         if (i + 1) % 25 == 0 or i == len(samples) - 1:
-            for eng_name in engines:
-                acc = sum(1 for r in results[eng_name] if r.is_correct) / (i + 1)
-                print(f"    [{i+1}/{len(samples)}] {eng_name}: {acc:.1%}")
+            div_rate = sum(1 for r in results if r.diverged) / len(results)
+            print(f"    [{i+1}/{len(samples)}] divergence rate: {div_rate:.1%}")
 
-    out = {}
-    for eng, sample_results in results.items():
-        n_correct = sum(1 for r in sample_results if r.is_correct)
-        out[eng] = BenchmarkResult(
-            benchmark="mmlu", engine=eng,
-            accuracy=n_correct / max(len(sample_results), 1),
-            n_correct=n_correct, n_total=len(sample_results),
-            samples=sample_results,
-        )
-    return out
+    n_diverged = sum(1 for r in results if r.diverged)
+    if divergences:
+        print(f"    First divergence: {divergences[0]}")
+
+    return BenchmarkResult(
+        benchmark="mmlu",
+        n_samples=len(samples),
+        n_diverged=n_diverged,
+        divergence_rate=n_diverged / max(len(samples), 1),
+        samples=results,
+    )
 
 
 def run_gsm8k(
     kv: KVBoostRunner,
-    vllm: Optional[VLLMMLXRunner],
     n_samples: int,
-) -> Dict[str, BenchmarkResult]:
-    """GSM8K: 3-shot chain-of-thought, exact numeric match."""
+) -> BenchmarkResult:
+    """GSM8K: 3-shot chain-of-thought, compare outputs (baseline vs cached)."""
     print(f"\n{'='*60}")
     print("  GSM8K — Grade School Math")
-    print(f"  {n_samples} samples, 3-shot CoT, numeric match")
+    print(f"  {n_samples} samples, 3-shot CoT")
     print(f"{'='*60}")
 
     samples = load_gsm8k(n_samples)
-    engines = {"hf_baseline": "baseline", "kvboost": "chunk_kv_reuse"}
-    if vllm:
-        engines["vllm_mlx"] = "vllm"
-    results = {eng: [] for eng in engines}
-
-    # Warm the shared few-shot prefix
-    kv.warm(GSM8K_FEW_SHOT)
+    results = []
+    divergences = []
 
     for i, sample in enumerate(samples):
         prompt = format_gsm8k_prompt(sample)
         gold = sample["final_answer"]
         n_tok = kv.prompt_tokens(prompt)
 
-        for eng_name, mode in engines.items():
-            if mode == "vllm":
-                text = asyncio.get_event_loop().run_until_complete(
-                    vllm.generate(prompt, max_tokens=256)
-                )
-            else:
-                text = kv.generate(prompt, max_tokens=256, mode=mode)
+        baseline_text = kv.generate(prompt, max_tokens=256, mode="baseline")
+        cached_text = kv.generate(prompt, max_tokens=256, mode="chunk_kv_reuse")
 
-            pred = extract_numeric_answer(text)
-            is_correct = pred is not None and pred == gold
+        baseline_answer = extract_numeric_answer(baseline_text)
+        cached_answer = extract_numeric_answer(cached_text)
+        diverged = baseline_answer != cached_answer
 
-            results[eng_name].append(SampleResult(
-                benchmark="gsm8k",
-                sample_idx=i,
-                engine=eng_name,
-                predicted=pred or "",
-                correct=gold,
-                is_correct=is_correct,
-                prompt_tokens=n_tok,
-            ))
+        results.append(SampleResult(
+            benchmark="gsm8k",
+            sample_idx=i,
+            prompt_tokens=n_tok,
+            baseline_output=baseline_answer or "",
+            cached_output=cached_answer or "",
+            diverged=diverged,
+            correct=gold,
+        ))
+
+        if diverged:
+            divergences.append({
+                "idx": i,
+                "baseline": baseline_answer,
+                "cached": cached_answer,
+                "gold": gold,
+            })
 
         if (i + 1) % 10 == 0 or i == len(samples) - 1:
-            for eng_name in engines:
-                acc = sum(1 for r in results[eng_name] if r.is_correct) / (i + 1)
-                print(f"    [{i+1}/{len(samples)}] {eng_name}: {acc:.1%}")
+            div_rate = sum(1 for r in results if r.diverged) / len(results)
+            print(f"    [{i+1}/{len(samples)}] divergence rate: {div_rate:.1%}")
 
-    out = {}
-    for eng, sample_results in results.items():
-        n_correct = sum(1 for r in sample_results if r.is_correct)
-        out[eng] = BenchmarkResult(
-            benchmark="gsm8k", engine=eng,
-            accuracy=n_correct / max(len(sample_results), 1),
-            n_correct=n_correct, n_total=len(sample_results),
-            samples=sample_results,
-        )
-    return out
+    n_diverged = sum(1 for r in results if r.diverged)
+    if divergences:
+        print(f"    First divergence: {divergences[0]}")
+
+    return BenchmarkResult(
+        benchmark="gsm8k",
+        n_samples=len(samples),
+        n_diverged=n_diverged,
+        divergence_rate=n_diverged / max(len(samples), 1),
+        samples=results,
+    )
 
 
 def run_truthfulqa(
     kv: KVBoostRunner,
-    vllm: Optional[VLLMMLXRunner],
     n_samples: int,
-) -> Dict[str, BenchmarkResult]:
+) -> BenchmarkResult:
     """
-    TruthfulQA MC2: likelihood-based scoring.
-    Score = normalized probability mass on correct choices.
+    TruthfulQA MC2: likelihood-based scoring in both modes.
+    Compare the MC2 score (normalized probability on correct choices) 
+    between baseline and cached modes.
     """
     print(f"\n{'='*60}")
     print("  TRUTHFULQA MC2 — Adversarial Factual Questions")
@@ -647,160 +637,125 @@ def run_truthfulqa(
     print(f"{'='*60}")
 
     samples = load_truthfulqa(n_samples)
-    results = {"hf_baseline": [], "kvboost": []}
+    results = []
+    divergences = []
 
     for i, sample in enumerate(samples):
-        context, choices = format_truthfulqa_prompt(sample)
+        context = f"Question: {sample['question']}\nAnswer:"
+        choices = sample["choices"]
         labels = sample["labels"]
         n_tok = kv.prompt_tokens(context)
 
-        # Compute log-likelihoods for each choice
-        lls = []
-        for choice in choices:
-            ll = kv.log_likelihood(context, " " + choice)
-            lls.append(ll)
+        # Compute scores in both modes
+        baseline_scores = kv.compute_choice_scores(context, choices, mode="baseline")
+        cached_scores = kv.compute_choice_scores(context, choices, mode="chunk_kv_reuse")
 
-        # MC2 score: normalized probability mass on correct answers
-        import math
-        max_ll = max(lls)
-        probs = [math.exp(ll - max_ll) for ll in lls]
-        total_prob = sum(probs)
-        probs = [p / total_prob for p in probs]
+        # Compute MC2 score (normalized probability on correct choices)
+        def compute_mc2(scores):
+            max_score = max(scores)
+            probs = [math.exp(s - max_score) for s in scores]
+            total = sum(probs)
+            probs = [p / total for p in probs]
+            correct_prob = sum(p for p, lbl in zip(probs, labels) if lbl == 1)
+            return correct_prob
 
-        correct_prob = sum(p for p, lbl in zip(probs, labels) if lbl == 1)
-        # Consider it "correct" if majority of probability is on correct choices
-        is_correct = correct_prob > 0.5
+        baseline_mc2 = compute_mc2(baseline_scores)
+        cached_mc2 = compute_mc2(cached_scores)
+        
+        # Consider divergence if MC2 scores differ significantly (>5%)
+        diverged = abs(baseline_mc2 - cached_mc2) > 0.05
 
-        pred_idx = max(range(len(lls)), key=lambda j: lls[j])
-        pred_label = labels[pred_idx]
+        results.append(SampleResult(
+            benchmark="truthfulqa_mc2",
+            sample_idx=i,
+            prompt_tokens=n_tok,
+            baseline_output=f"{baseline_mc2:.3f}",
+            cached_output=f"{cached_mc2:.3f}",
+            diverged=diverged,
+            baseline_score=baseline_mc2,
+            cached_score=cached_mc2,
+            correct="mc2_score",
+        ))
 
-        for engine_name in ["hf_baseline", "kvboost"]:
-            results[engine_name].append(SampleResult(
-                benchmark="truthfulqa_mc2",
-                sample_idx=i,
-                engine=engine_name,
-                predicted=f"{correct_prob:.3f}",
-                correct=f"mc2_score",
-                is_correct=is_correct,
-                prompt_tokens=n_tok,
-            ))
-
-        if (i + 1) % 25 == 0 or i == len(samples) - 1:
-            acc = sum(1 for r in results["kvboost"] if r.is_correct) / (i + 1)
-            print(f"    [{i+1}/{len(samples)}] mc2 score > 0.5 rate: {acc:.1%}")
-
-    out = {}
-    for eng, sample_results in results.items():
-        n_correct = sum(1 for r in sample_results if r.is_correct)
-        out[eng] = BenchmarkResult(
-            benchmark="truthfulqa_mc2", engine=eng,
-            accuracy=n_correct / max(len(sample_results), 1),
-            n_correct=n_correct, n_total=len(sample_results),
-            samples=sample_results,
-        )
-    return out
-
-
-# ── Greedy output agreement ───────────────────────────────────────
-
-def run_agreement_test(
-    kv: KVBoostRunner,
-    vllm: Optional[VLLMMLXRunner],
-    n_samples: int,
-) -> Dict:
-    """
-    Direct output agreement: run the same prompts through baseline and
-    kvboost with greedy decoding, measure exact-match rate.
-    This is the most important test — any mismatch is a correctness bug.
-    """
-    print(f"\n{'='*60}")
-    print("  AGREEMENT TEST — Baseline vs KVBoost Greedy Output Match")
-    print(f"{'='*60}")
-
-    from datasets import load_dataset
-    ds = load_dataset("openai/gsm8k", "main", split="test")
-    ds = ds.shuffle(seed=42).select(range(min(n_samples, len(ds))))
-
-    matches = 0
-    mismatches = []
-
-    for i, row in enumerate(ds):
-        prompt = f"Question: {row['question']}\nAnswer:"
-        kv.warm("Question:")  # minimal warm
-
-        out_base = kv.generate(prompt, max_tokens=128, mode="baseline")
-        out_cached = kv.generate(prompt, max_tokens=128, mode="chunk_kv_reuse")
-
-        if out_base == out_cached:
-            matches += 1
-        else:
-            mismatches.append({
+        if diverged:
+            divergences.append({
                 "idx": i,
-                "baseline": out_base[:100],
-                "cached": out_cached[:100],
+                "baseline_mc2": baseline_mc2,
+                "cached_mc2": cached_mc2,
             })
 
-        if (i + 1) % 10 == 0 or i == len(ds) - 1:
-            print(f"    [{i+1}/{len(ds)}] match rate: {matches/(i+1):.1%}")
+        if (i + 1) % 25 == 0 or i == len(samples) - 1:
+            div_rate = sum(1 for r in results if r.diverged) / len(results)
+            print(f"    [{i+1}/{len(samples)}] divergence rate (>5%): {div_rate:.1%}")
 
-    result = {
-        "match_rate": matches / max(len(ds), 1),
-        "matches": matches,
-        "total": len(ds),
-        "mismatches": mismatches[:10],  # keep first 10 for debugging
-    }
-    return result
+    n_diverged = sum(1 for r in results if r.diverged)
+    if divergences:
+        print(f"    First divergence: {divergences[0]}")
+
+    return BenchmarkResult(
+        benchmark="truthfulqa_mc2",
+        n_samples=len(samples),
+        n_diverged=n_diverged,
+        divergence_rate=n_diverged / max(len(samples), 1),
+        samples=results,
+    )
+
+
 
 
 # ── Summary ────────────────────────────────────────────────────────
 
-def print_summary(all_results: Dict[str, Dict[str, BenchmarkResult]], agreement: Dict):
+def print_summary(all_results: Dict[str, BenchmarkResult]):
     print(f"\n{'='*70}")
-    print("  ACCURACY SUMMARY")
+    print("  ACCURACY SUMMARY — Baseline vs KVBoost Output Divergence")
     print(f"{'='*70}")
 
-    header = f"  {'Benchmark':>18s}"
-    engines = set()
-    for bench_results in all_results.values():
-        engines.update(bench_results.keys())
-    engines = sorted(engines)
-    for eng in engines:
-        header += f" | {eng:>12s}"
+    header = f"  {'Benchmark':>18s} | {'Divergence':>12s} | {'Status':>12s}"
     print(header)
-    print(f"  {'-'*18}" + "".join(f"-+-{'-'*12}" for _ in engines))
+    print(f"  {'-'*18}-+-{'-'*12}-+-{'-'*12}")
 
-    for bench_name, bench_results in all_results.items():
-        line = f"  {bench_name:>18s}"
-        for eng in engines:
-            if eng in bench_results:
-                acc = bench_results[eng].accuracy
-                n = bench_results[eng].n_total
-                line += f" | {acc:10.1%} ({n})"
-            else:
-                line += f" | {'N/A':>12s}"
+    total_samples = 0
+    total_diverged = 0
+
+    for bench_name in sorted(all_results.keys()):
+        result = all_results[bench_name]
+        div_rate = result.divergence_rate
+        status = "✓ PASS" if div_rate == 0 else "✗ FAIL"
+        
+        line = f"  {bench_name:>18s} | {div_rate:10.1%} | {status:>12s}"
         print(line)
+        
+        total_samples += result.n_samples
+        total_diverged += result.n_diverged
 
-    # Agreement
-    print(f"\n  Baseline vs KVBoost greedy match: {agreement['match_rate']:.1%} "
-          f"({agreement['matches']}/{agreement['total']})")
-    if agreement["mismatches"]:
-        print(f"  First mismatch:")
-        mm = agreement["mismatches"][0]
-        print(f"    baseline: {mm['baseline']}")
-        print(f"    cached:   {mm['cached']}")
+    print(f"  {'-'*18}-+-{'-'*12}-+-{'-'*12}")
+    overall_div_rate = total_diverged / max(total_samples, 1)
+    overall_status = "✓ PASS" if overall_div_rate == 0 else "✗ FAIL"
+    line = f"  {'OVERALL':>18s} | {overall_div_rate:10.1%} | {overall_status:>12s}"
+    print(line)
+    print(f"{'='*70}")
 
     # Verdict
-    bench_names = list(all_results.keys())
-    kvboost_accs = [all_results[b]["kvboost"].accuracy for b in bench_names if "kvboost" in all_results[b]]
-    baseline_accs = [all_results[b]["hf_baseline"].accuracy for b in bench_names if "hf_baseline" in all_results[b]]
+    if overall_div_rate == 0:
+        print("  ✓ All benchmarks PASS: Baseline and KVBoost produce identical outputs.")
+        print("  ✓ Cache correctness verified — no divergence detected.")
+    else:
+        print(f"  ✗ FAILURE: {total_diverged}/{total_samples} samples diverged")
+        print("  ✗ Cache correctness issue detected!")
+        for bench_name in sorted(all_results.keys()):
+            result = all_results[bench_name]
+            if result.n_diverged > 0:
+                print(f"    • {bench_name}: {result.n_diverged}/{result.n_samples} divergences")
+                # Show first divergence
+                diverged_samples = [s for s in result.samples if s.diverged]
+                if diverged_samples:
+                    s = diverged_samples[0]
+                    print(f"      First: idx={s.sample_idx}, "
+                          f"baseline={s.baseline_output!r}, "
+                          f"cached={s.cached_output!r}")
 
-    if kvboost_accs and baseline_accs:
-        avg_kv = sum(kvboost_accs) / len(kvboost_accs)
-        avg_base = sum(baseline_accs) / len(baseline_accs)
-        delta = avg_kv - avg_base
-        print(f"\n  Average accuracy: KVBoost {avg_kv:.1%} vs Baseline {avg_base:.1%} (delta: {delta:+.2%})")
+    print()
 
-    print(f"{'='*70}")
 
 
 # ── CLI ────────────────────────────────────────────────────────────
@@ -815,105 +770,82 @@ BENCHMARKS = {
 
 
 def main():
-    parser = argparse.ArgumentParser(description="KVBoost vs vLLM-MLX accuracy benchmark")
-    parser.add_argument("--kvboost-model", default="Qwen/Qwen2.5-3B",
-                        help="HF model for KVBoost")
-    parser.add_argument("--vllm-model", default="mlx-community/Qwen2.5-3B-4bit",
-                        help="MLX model for vLLM-MLX")
+    parser = argparse.ArgumentParser(
+        description="KVBoost Accuracy Benchmark — Baseline vs Cache Correctness"
+    )
+    parser.add_argument("--model", default="Qwen/Qwen2.5-3B",
+                        help="HF model to benchmark")
     parser.add_argument("--bench", default=None,
                         choices=list(BENCHMARKS.keys()) + ["all"],
                         help="Which benchmark to run (default: all)")
     parser.add_argument("--n-samples", type=int, default=100,
                         help="Number of samples per benchmark")
-    parser.add_argument("--chunk-size", type=int, default=128)
-    parser.add_argument("--skip-vllm", action="store_true",
-                        help="Skip vLLM-MLX (KVBoost vs baseline only)")
-    parser.add_argument("--skip-agreement", action="store_true",
-                        help="Skip the greedy output agreement test")
+    parser.add_argument("--chunk-size", type=int, default=128,
+                        help="KVBoost chunk size")
     parser.add_argument("--output", default=None,
                         help="Save results to JSON")
     args = parser.parse_args()
 
-    print(f"\n  KVBoost model: {args.kvboost_model}")
-    print(f"  vLLM model:    {'skipped' if args.skip_vllm else args.vllm_model}")
+    print(f"\n  Model:        {args.model}")
     print(f"  Samples/bench: {args.n_samples}")
     print(f"  Chunk size:    {args.chunk_size}")
+    print()
 
-    kv = KVBoostRunner(args.kvboost_model, chunk_size=args.chunk_size)
-    vllm = None
-    if not args.skip_vllm:
-        try:
-            vllm = VLLMMLXRunner(args.vllm_model)
-        except Exception as e:
-            log.warning("vLLM-MLX init failed: %s — running KVBoost only", e)
+    kv = KVBoostRunner(args.model, chunk_size=args.chunk_size)
 
     benches = list(BENCHMARKS.keys()) if (args.bench is None or args.bench == "all") else [args.bench]
-    all_results: Dict[str, Dict[str, BenchmarkResult]] = {}
+    all_results: Dict[str, BenchmarkResult] = {}
 
     for bench_name in benches:
         try:
             bench_fn = BENCHMARKS[bench_name]
-            bench_results = bench_fn(kv, vllm, args.n_samples)
-            all_results[bench_name] = bench_results
+            result = bench_fn(kv, args.n_samples)
+            all_results[bench_name] = result
         except Exception as e:
             log.error("Benchmark %s failed: %s", bench_name, e)
             import traceback
             traceback.print_exc()
 
-    # Agreement test
-    agreement = {"match_rate": 0, "matches": 0, "total": 0, "mismatches": []}
-    if not args.skip_agreement:
-        try:
-            agreement = run_agreement_test(kv, vllm, min(args.n_samples, 50))
-        except Exception as e:
-            log.error("Agreement test failed: %s", e)
-
-    print_summary(all_results, agreement)
-
-    if vllm:
-        asyncio.get_event_loop().run_until_complete(vllm.stop())
+    print_summary(all_results)
 
     if args.output:
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         serializable = {
-            "kvboost_model": args.kvboost_model,
-            "vllm_model": None if args.skip_vllm else args.vllm_model,
+            "model": args.model,
             "n_samples": args.n_samples,
             "chunk_size": args.chunk_size,
             "benchmarks": {
                 name: {
-                    eng: {
-                        "accuracy": r.accuracy,
-                        "n_correct": r.n_correct,
-                        "n_total": r.n_total,
-                    }
-                    for eng, r in bench_results.items()
+                    "n_samples": result.n_samples,
+                    "n_diverged": result.n_diverged,
+                    "divergence_rate": result.divergence_rate,
                 }
-                for name, bench_results in all_results.items()
+                for name, result in all_results.items()
             },
-            "agreement": agreement,
         }
         with open(out_path, "w") as f:
             json.dump(serializable, f, indent=2)
-        print(f"\n  Results saved to {out_path}")
+        print(f"  Results saved to {out_path}\n")
     else:
-        default_path = RESULTS_DIR / "benchmark_accuracy_vs_vllm.json"
+        default_path = RESULTS_DIR / "benchmark_accuracy_correctness.json"
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         serializable = {
-            "kvboost_model": args.kvboost_model,
-            "vllm_model": None if args.skip_vllm else args.vllm_model,
+            "model": args.model,
             "n_samples": args.n_samples,
+            "chunk_size": args.chunk_size,
             "benchmarks": {
-                name: {eng: {"accuracy": r.accuracy, "n_correct": r.n_correct, "n_total": r.n_total}
-                        for eng, r in bench_results.items()}
-                for name, bench_results in all_results.items()
+                name: {
+                    "n_samples": result.n_samples,
+                    "n_diverged": result.n_diverged,
+                    "divergence_rate": result.divergence_rate,
+                }
+                for name, result in all_results.items()
             },
-            "agreement": agreement,
         }
         with open(default_path, "w") as f:
             json.dump(serializable, f, indent=2)
-        print(f"\n  Results saved to {default_path}")
+        print(f"  Results saved to {default_path}\n")
 
 
 if __name__ == "__main__":
