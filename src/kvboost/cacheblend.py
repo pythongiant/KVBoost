@@ -76,7 +76,7 @@ class CacheBlendRecompute:
         """
         if assembled.cached_past_kv is None:
             return assembled
-
+ 
         if assembled.cached_length == 0:
             return assembled
 

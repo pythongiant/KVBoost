@@ -70,6 +70,7 @@ class GenerationResult:
     kv_reuse_ratio: float   # fraction of prompt tokens served from cache
     prompt_tokens: int
     cached_tokens: int
+    first_token_logits: Optional["np.ndarray"] = None  # logits for first generated token
 
 
 class InferenceEngine:
@@ -152,7 +153,7 @@ class InferenceEngine:
 
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             low_cpu_mem_usage=True,
         )
         model.eval()
@@ -445,6 +446,7 @@ class InferenceEngine:
         t0 = time.perf_counter()
         first_token_time = None
         generated = []
+        first_token_logits = None
 
         with torch.no_grad():
             past = None
@@ -453,6 +455,10 @@ class InferenceEngine:
                 out = self.model(input_ids=cur_ids, past_key_values=self._as_cache(past), use_cache=True)
                 if first_token_time is None:
                     first_token_time = time.perf_counter()
+                # Capture first-token logits for comparison with cached versions
+                if step == 0 and first_token_logits is None:
+                    import numpy as np
+                    first_token_logits = out.logits[0, -1, :].cpu().float().numpy()
                 # Normalize: newer transformers returns DynamicCache, not plain tuple
                 past = self._normalize_past_kv(out.past_key_values)
                 next_token = self._sample(out.logits[:, -1, :], temperature, do_sample)
@@ -478,6 +484,7 @@ class InferenceEngine:
             kv_reuse_ratio=0.0,
             prompt_tokens=len(token_ids),
             cached_tokens=0,
+            first_token_logits=first_token_logits,
         )
 
     def _generate_prefix_cache(
@@ -553,6 +560,7 @@ class InferenceEngine:
         t0 = time.perf_counter()
         first_token_time = None
         generated = []
+        first_token_logits = None
 
         # Move past_kv to model device
         if past_kv is not None:
@@ -576,6 +584,9 @@ class InferenceEngine:
                     use_cache=True,
                 )
             first_token_time = time.perf_counter()
+            # Capture first-token logits for comparison with baseline
+            import numpy as np
+            first_token_logits = out.logits[0, -1, :].cpu().float().numpy()
             past_kv = self._normalize_past_kv(out.past_key_values)
             next_token = self._sample(out.logits[:, -1, :], temperature, do_sample)
             generated.append(next_token)
@@ -602,6 +613,9 @@ class InferenceEngine:
                     use_cache=True,
                 )
             first_token_time = time.perf_counter()
+            # Capture first-token logits for comparison with baseline
+            import numpy as np
+            first_token_logits = out.logits[0, -1, :].cpu().float().numpy()
             past_kv = self._normalize_past_kv(out.past_key_values)
             next_token = self._sample(out.logits[:, -1, :], temperature, do_sample)
             generated.append(next_token)
@@ -647,6 +661,7 @@ class InferenceEngine:
             kv_reuse_ratio=actual_hit,
             prompt_tokens=len(full_token_ids),
             cached_tokens=cached_len,
+            first_token_logits=first_token_logits,
         )
 
     # ------------------------------------------------------------------

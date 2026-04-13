@@ -59,6 +59,12 @@ Major feature release.
 - 100% greedy output agreement on 50 GSM8K prompts
 - Optional head-to-head comparison with vLLM-MLX
 
+**New: Correctness claim experiments** (``12_correctness_claims.py``)
+
+- Claim 1: Boundary KV convergence curves across R=[0,4,8,16,32,64] on 50 Wikipedia passages
+- Claim 2: KL divergence vs CacheBlend recompute ratio (monotonicity proof)
+- Claim 2: Multi-hop QA (HotpotQA) F1 comparison: baseline vs exact vs approximate cache
+
 **Documentation:**
 
 - ReadTheDocs site at kvboost.readthedocs.io
