@@ -418,14 +418,11 @@ class LongBenchRunner:
         self._last_generation_result = None
 
     def _reset_cache(self):
-        """Clear KV cache between samples for fair comparison."""
-        if hasattr(self.engine, "_cache_manager"):
-            self.engine._cache_manager.hits = 0
-            self.engine._cache_manager.misses = 0
-            self.engine._cache_manager.approximate_hits = 0
-            self.engine._cache_manager.kv_cache.clear()
-        if hasattr(self.engine, "kv_cache"):
-            self.engine.kv_cache.clear()
+        """
+        Reset cache between samples for fair cold/warm distinction.
+        Uses the public reset_cache() API on InferenceEngine.
+        """
+        self.engine.reset_cache()
 
     def count_tokens(self, text: str) -> int:
         return len(self.engine.tokenizer.encode(text, add_special_tokens=True))

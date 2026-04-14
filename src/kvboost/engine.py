@@ -166,6 +166,26 @@ class InferenceEngine:
     # Public generate API
     # ------------------------------------------------------------------
 
+    def reset_cache(self) -> None:
+        """
+        Clear all KV cache state and statistics.
+        
+        Resets:
+          - In-memory cache (_hot)
+          - Quantized KV storage (_quantized)
+          - Content/prefix hash indices
+          - Frequency counters
+          - Hit/miss statistics
+        
+        Use this between independent benchmark runs or evaluation groups
+        to ensure a clean cache state and accurate measurements of cold-start
+        performance. 
+        
+        This is the PUBLIC API for cache reset — benchmarks should call this
+        instead of reaching into internals.
+        """
+        self.cache_manager.clear()
+
     def generate(
         self,
         prompt: str,

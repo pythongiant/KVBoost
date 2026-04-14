@@ -95,6 +95,7 @@ class CacheBlendRecompute:
             live_position_ids=assembled.live_position_ids,
             chunk_boundaries=assembled.chunk_boundaries,
             cache_hit_ratio=assembled.cache_hit_ratio,
+            has_approximate=assembled.has_approximate,
         )
 
     def _deviation_recompute(

@@ -277,6 +277,29 @@ class KVCacheManager:
         if self._disk:
             self._disk.remove(chunk_id)
 
+    def clear(self) -> None:
+        """
+        Fully clear the cache: reset all internal storage and stat counters.
+        
+        Clears:
+          - _hot: in-memory hot cache
+          - _quantized: quantized KV storage
+          - _content_index: content hash → prefix hash index
+          - _frequency: access frequency tracking
+          - Stats counters: hits, misses, approximate_hits
+        
+        Does NOT clear disk tier (cold storage is preserved for recovery).
+        
+        Use this between benchmark iterations to ensure clean cache state.
+        """
+        self._hot.clear()
+        self._quantized.clear()
+        self._content_index.clear()
+        self._frequency.clear()
+        self.hits = 0
+        self.misses = 0
+        self.approximate_hits = 0
+
     def stats(self) -> Dict:
         total = self.hits + self.misses + self.approximate_hits
         hot_mb = sum(c.memory_bytes() for c in self._hot.values()) / 1e6
