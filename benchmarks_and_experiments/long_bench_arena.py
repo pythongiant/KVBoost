@@ -477,9 +477,15 @@ class LongBenchRunner:
         return None
 
     def run_baseline(self, prompt: str, max_tokens: int = 16) -> dict:
-        """Run in BASELINE mode (standard HF generate, no caching)."""
-        self._reset_cache()
+        """
+        Run in BASELINE mode (standard HF generate, no caching).
 
+        Does NOT reset the cache: the engine's BASELINE path is cache-neutral
+        (it allocates a local past_kv and never touches self.cache_manager),
+        so clearing here would destroy the warm state q1 populated for q2.
+        The only reset that should fire is the q1-boundary reset in the main
+        loop, which gives a clean cold cache per pair group.
+        """
         start = time.perf_counter()
         result = self.engine.generate(
             prompt,
