@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from .models import PastKVType, content_hash_from_tokens
+from .compat import default_device
 
 log = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ def batched_decode(
     eos_token_id: int,
     temperature: float = 1.0,
     do_sample: bool = False,
-    device: str = "cpu",
+    device: Optional[str] = None,
 ) -> Tuple[List[List[int]], PastKVType]:
     """
     Batched autoregressive decode loop.
@@ -133,6 +134,9 @@ def batched_decode(
         list for batch element i.
     """
     from .engine import InferenceEngine  # avoid circular import
+
+    if device is None:
+        device = default_device()
 
     batch_size = first_tokens.shape[0]
     generated = [[t.item()] for t in first_tokens]

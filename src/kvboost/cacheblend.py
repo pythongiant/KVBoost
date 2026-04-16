@@ -50,6 +50,7 @@ import torch.nn.functional as F
 
 from .models import PastKVType, AssembledPrompt
 from .cache_manager import KVCacheManager
+from .compat import default_device
 
 log = logging.getLogger(__name__)
 
@@ -59,11 +60,11 @@ class CacheBlendRecompute:
         self,
         recompute_ratio: float = 0.15,
         min_deviation: float = 0.01,
-        device: str = "cpu",
+        device: Optional[str] = None,
     ):
         self.recompute_ratio = recompute_ratio
         self.min_deviation = min_deviation
-        self.device = device
+        self.device = device if device is not None else default_device()
 
     def apply(
         self,

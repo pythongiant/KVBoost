@@ -23,7 +23,18 @@ import logging
 import warnings
 from typing import Optional
 
+import torch
+
 log = logging.getLogger(__name__)
+
+
+def default_device() -> str:
+    """Return the best available device: cuda > mps > cpu."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 # Architectures verified to work correctly with KV cache stitching
 SUPPORTED_ARCHITECTURES = {

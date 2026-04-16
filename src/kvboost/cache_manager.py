@@ -29,6 +29,7 @@ import torch
 from .models import CachedChunk, PastKVType, content_hash_from_tokens, chained_hash
 from .kv_quantize import QuantizedKV, quantize_kv, dequantize_kv
 from .disk_tier import DiskTier
+from .compat import default_device
 
 log = logging.getLogger(__name__)
 
@@ -47,11 +48,11 @@ class KVCacheManager:
         self,
         max_chunks: int = 64,
         disk_dir: Optional[str] = None,
-        device: str = "cpu",
+        device: Optional[str] = None,
         kv_cache_bits: int = 16,
     ):
         self.max_chunks = max_chunks
-        self.device = device
+        self.device = device if device is not None else default_device()
         self.kv_cache_bits = kv_cache_bits  # 16 = no quantization, 8 = int8, 4 = int4
 
         # Primary store keyed by prefix_hash (exact match)

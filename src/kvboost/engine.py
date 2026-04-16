@@ -41,7 +41,7 @@ from .chunk_registry import ChunkRegistry, ChunkStrategy
 from .prompt_assembler import AssemblyMode, PromptAssembler
 from .selective_recompute import SelectiveRecompute
 from .cacheblend import CacheBlendRecompute
-from .compat import check_model_compatibility, SUPPORTED_ARCHITECTURES
+from .compat import check_model_compatibility, default_device, SUPPORTED_ARCHITECTURES
 
 log = logging.getLogger(__name__)
 
@@ -88,12 +88,7 @@ class InferenceEngine:
         device: Optional[str] = None,
     ):
         if device is None:
-            if torch.backends.mps.is_available():
-                device = "mps"
-            elif torch.cuda.is_available():
-                device = "cuda"
-            else:
-                device = "cpu"
+            device = default_device()
 
         self.model = model.to(device)
         self.tokenizer = tokenizer

@@ -39,6 +39,7 @@ import torch
 
 from .models import PastKVType, AssembledPrompt
 from .cache_manager import KVCacheManager
+from .compat import default_device
 
 log = logging.getLogger(__name__)
 
@@ -48,11 +49,11 @@ class SelectiveRecompute:
         self,
         recompute_overlap: int = 16,
         skip_if_no_seams: bool = True,
-        device: str = "cpu",
+        device: Optional[str] = None,
     ):
         self.overlap = recompute_overlap
         self.skip_if_no_seams = skip_if_no_seams
-        self.device = device
+        self.device = device if device is not None else default_device()
 
     def apply(
         self,
