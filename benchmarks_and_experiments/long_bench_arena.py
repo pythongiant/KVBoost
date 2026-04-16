@@ -257,8 +257,47 @@ def load_bug_localization(
     all_files_list = sorted(all_files)
 
     rng = np.random.RandomState(42)
-    rng.shuffle(raw_samples)
-    raw_samples = raw_samples[:min(n_samples, len(raw_samples))]
+
+    # Stratified sampling: equal samples per token-length bucket.
+    # Buckets: 0-512, 512-1K, 1K-2K, 2K-4K, 4K+
+    def _bucket_key(ctx_tokens: int) -> str:
+        if ctx_tokens < 512: return "0-512"
+        elif ctx_tokens < 1024: return "512-1K"
+        elif ctx_tokens < 2048: return "1K-2K"
+        elif ctx_tokens < 4096: return "2K-4K"
+        else: return "4K+"
+
+    bucket_pools: Dict[str, list] = defaultdict(list)
+    for s in raw_samples:
+        bucket_pools[_bucket_key(s["ctx_tokens"])].append(s)
+
+    # Shuffle within each bucket
+    for bk in bucket_pools:
+        rng.shuffle(bucket_pools[bk])
+
+    n_buckets = len(bucket_pools)
+    per_bucket = n_samples // n_buckets if n_buckets > 0 else n_samples
+
+    selected = []
+    overflow = []
+    for bk in ["0-512", "512-1K", "1K-2K", "2K-4K", "4K+"]:
+        pool = bucket_pools.get(bk, [])
+        take = min(per_bucket, len(pool))
+        selected.extend(pool[:take])
+        overflow.extend(pool[take:])
+        if take < per_bucket:
+            log.info(f"  Bucket {bk}: only {take}/{per_bucket} available")
+
+    # Fill remaining quota from overflow (round-robin across buckets)
+    remaining = n_samples - len(selected)
+    if remaining > 0 and overflow:
+        rng.shuffle(overflow)
+        selected.extend(overflow[:remaining])
+
+    log.info(f"  Stratified sampling: {len(selected)} samples across {n_buckets} buckets "
+             f"(target {per_bucket}/bucket)")
+
+    raw_samples = selected
 
     samples = []
     for idx, raw in enumerate(raw_samples):
@@ -434,16 +473,17 @@ class LongBenchRunner:
     Single model load, switches between generation modes.
     """
 
-    def __init__(self, model_name: str, chunk_size: int = 128):
+    def __init__(self, model_name: str, chunk_size: int = 128, recompute_strategy: str = "selective"):
         from kvboost import KVBoost, GenerationMode
 
         self.GenerationMode = GenerationMode
 
-        log.info(f"Loading model: {model_name}")
+        log.info(f"Loading model: {model_name} (recompute_strategy={recompute_strategy})")
         self.engine = KVBoost.from_pretrained(
             model_name,
             chunk_size=chunk_size,
-            recompute_overlap=8,
+            recompute_overlap=16,
+            recompute_strategy=recompute_strategy,
         )
         log.info(f"  Ready on {self.engine.device}")
         
@@ -609,6 +649,8 @@ def run_benchmark(
     chunk_size: int = 128,
     max_context_tokens: int = 8192,
     no_checkpoint: bool = False,
+    recompute_strategy: str = "selective",
+    skip_baseline_logits: bool = False,
 ) -> Dict[str, BucketResult]:
     """
     Run the bug localization benchmark.
@@ -622,6 +664,8 @@ def run_benchmark(
     print(f"  Samples:            {n_samples}")
     print(f"  Chunk size:         {chunk_size}")
     print(f"  Max context tokens: {max_context_tokens}")
+    print(f"  Recompute strategy: {recompute_strategy}")
+    print(f"  Baseline logits:    {'skip' if skip_baseline_logits else 'capture'}")
     print(f"{'=' * 75}\n")
 
     samples = load_bug_localization(n_samples, max_context_tokens, model_name)
@@ -629,7 +673,7 @@ def run_benchmark(
         log.error("No samples loaded. Check --max-context-tokens.")
         return {}
 
-    runner = LongBenchRunner(model_name, chunk_size=chunk_size)
+    runner = LongBenchRunner(model_name, chunk_size=chunk_size, recompute_strategy=recompute_strategy)
     choice_token_ids = runner.get_choice_token_ids()
 
     results_by_bucket: Dict[str, List[SampleResult]] = defaultdict(list)
@@ -684,8 +728,8 @@ def run_benchmark(
     print()
 
     # ── Checkpointing: load previous progress if available ────────
-    checkpoint_path = get_checkpoint_path(model_name, n_samples, max_context_tokens)
-    
+    checkpoint_path = get_checkpoint_path(model_name, n_samples, max_context_tokens, recompute_strategy)
+
     # Fallback: if hash-based checkpoint doesn't exist, look for any checkpoint
     if not checkpoint_path.exists():
         possible_checkpoints = sorted(CHECKPOINT_DIR.glob("checkpoint_*.json"))
@@ -757,7 +801,8 @@ def run_benchmark(
             # (reset above for q1, or still populated from q1 for q2 —
             # but get_baseline_logits() bypasses the cache via engine.model
             # directly, so q2 baseline logits are still clean).
-            baseline_logits = runner.get_baseline_logits(prompt)
+            # Skip when --skip-baseline-logits is set (saves ~33% runtime).
+            baseline_logits = None if skip_baseline_logits else runner.get_baseline_logits(prompt)
 
             # Step 2: run baseline generation (also calls _reset_cache internally
             # so the logit capture above is unaffected for q1; for q2 the
@@ -1327,11 +1372,11 @@ def print_summary(bucket_results: Dict[str, BucketResult], verbose: bool = False
 
 # ── Save results ──────────────────────────────────────────────────
 
-def get_checkpoint_path(model_name: str, n_samples: int, max_context_tokens: int) -> Path:
+def get_checkpoint_path(model_name: str, n_samples: int, max_context_tokens: int, recompute_strategy: str = "selective") -> Path:
     """Generate a unique checkpoint path for this benchmark run."""
     import hashlib
     config_hash = hashlib.md5(
-        f"{model_name}_{n_samples}_{max_context_tokens}".encode()
+        f"{model_name}_{n_samples}_{max_context_tokens}_{recompute_strategy}".encode()
     ).hexdigest()[:8]
     return CHECKPOINT_DIR / f"checkpoint_{config_hash}.json"
 
@@ -1684,6 +1729,7 @@ def save_results(
         "n_samples": args.n_samples,
         "chunk_size": args.chunk_size,
         "max_context_tokens": args.max_context_tokens,
+        "recompute_strategy": args.recompute_strategy,
         "buckets": {},
     }
 
@@ -1777,6 +1823,11 @@ def main():
                         help="Enable debug logging")
     parser.add_argument("--no-checkpoint", action="store_true",
                         help="Ignore checkpoint and start fresh")
+    parser.add_argument("--recompute-strategy", default="selective",
+                        choices=["selective", "cacheblend", "none"],
+                        help="Recompute strategy for KVBoost (default: selective)")
+    parser.add_argument("--skip-baseline-logits", action="store_true",
+                        help="Skip baseline logit capture (~33%% faster, no cosine deviation)")
 
     args = parser.parse_args()
 
@@ -1800,6 +1851,8 @@ def main():
         chunk_size=args.chunk_size,
         max_context_tokens=args.max_context_tokens,
         no_checkpoint=args.no_checkpoint,
+        recompute_strategy=args.recompute_strategy,
+        skip_baseline_logits=args.skip_baseline_logits,
     )
 
     if not bucket_results:
@@ -1808,12 +1861,13 @@ def main():
 
     print_summary(bucket_results, verbose=args.verbose)
 
-    out_path = Path(args.output) if args.output else RESULTS_DIR / "bug_localization.json"
+    strategy_suffix = f"_{args.recompute_strategy}" if args.recompute_strategy != "selective" else ""
+    out_path = Path(args.output) if args.output else RESULTS_DIR / f"bug_localization{strategy_suffix}.json"
     save_results(bucket_results, args, out_path)
 
     # Clean up checkpoint on successful completion
     checkpoint_path = get_checkpoint_path(
-        args.model, args.n_samples, args.max_context_tokens
+        args.model, args.n_samples, args.max_context_tokens, args.recompute_strategy
     )
     if checkpoint_path.exists():
         checkpoint_path.unlink()
