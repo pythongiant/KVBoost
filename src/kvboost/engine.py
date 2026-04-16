@@ -193,7 +193,14 @@ class InferenceEngine:
         mode: GenerationMode = GenerationMode.CHUNK_KV_REUSE,
         temperature: float = 1.0,
         do_sample: bool = False,
+        cacheable_prefix_len: Optional[int] = None,
     ) -> GenerationResult:
+        """
+        cacheable_prefix_len: if set, only the first N prompt tokens are
+        eligible for chunk caching on store. The suffix still goes through
+        fresh prefill each call, so per-query tails (question/choices)
+        cannot leak KV state into future queries that share the prefix.
+        """
         token_ids = self._encode(prompt)
 
         if mode == GenerationMode.BASELINE:
@@ -201,7 +208,10 @@ class InferenceEngine:
         elif mode == GenerationMode.PREFIX_CACHE:
             return self._generate_prefix_cache(prompt, token_ids, max_new_tokens, temperature, do_sample)
         elif mode == GenerationMode.CHUNK_KV_REUSE:
-            return self._generate_chunk_reuse(prompt, token_ids, max_new_tokens, temperature, do_sample)
+            return self._generate_chunk_reuse(
+                prompt, token_ids, max_new_tokens, temperature, do_sample,
+                cacheable_prefix_len=cacheable_prefix_len,
+            )
         raise ValueError(f"Unknown mode {mode}")
 
     def generate_batch(
@@ -532,6 +542,7 @@ class InferenceEngine:
         max_new_tokens: int,
         temperature: float,
         do_sample: bool,
+        cacheable_prefix_len: Optional[int] = None,
     ) -> GenerationResult:
         """Full chunk-level KV reuse + recompute (strategy-dependent)."""
         assembled = self.assembler.assemble(token_ids)
@@ -558,6 +569,7 @@ class InferenceEngine:
             max_new_tokens, temperature, do_sample,
             mode_name="chunk_kv_reuse",
             hit_ratio=assembled.cache_hit_ratio,
+            cacheable_prefix_len=cacheable_prefix_len,
         )
 
     # ------------------------------------------------------------------
@@ -576,6 +588,7 @@ class InferenceEngine:
         do_sample: bool,
         mode_name: str,
         hit_ratio: Optional[float] = None,
+        cacheable_prefix_len: Optional[int] = None,
     ) -> GenerationResult:
         t0 = time.perf_counter()
         first_token_time = None
@@ -662,7 +675,7 @@ class InferenceEngine:
         t1 = time.perf_counter()
 
         # ----- store newly computed chunks into cache -------------------
-        self._store_prompt_chunks(full_token_ids)
+        self._store_prompt_chunks(full_token_ids, cacheable_prefix_len=cacheable_prefix_len)
 
         output_text = self.tokenizer.decode(generated, skip_special_tokens=True)
         ttft = (first_token_time - t0) * 1000 if first_token_time else 0
@@ -747,14 +760,27 @@ class InferenceEngine:
             return tuple((k.cpu(), v.cpu()) for k, v in zip(kv.key_cache, kv.value_cache))
         return tuple((layer[0].cpu(), layer[1].cpu()) for layer in kv)
 
-    def _store_prompt_chunks(self, token_ids: List[int]) -> None:
-        """Cache all un-cached fixed-size chunks from this prompt."""
+    def _store_prompt_chunks(
+        self, token_ids: List[int], cacheable_prefix_len: Optional[int] = None,
+    ) -> None:
+        """
+        Cache un-cached fixed-size chunks from this prompt.
+
+        If cacheable_prefix_len is set, only chunks that lie fully within
+        token_ids[:cacheable_prefix_len] are stored. This lets callers mark
+        a trailing region (e.g. a per-query suffix) as non-cacheable so its
+        KV state can't bleed into future queries that share the prefix.
+        """
         pos = 0
         parent_hash = None
         for start, end, slice_ids in self.chunk_registry.split(token_ids):
             p_hash = chained_hash(slice_ids, parent_hash)
             c_hash = content_hash_from_tokens(slice_ids)
-            if self.cache_manager.get(p_hash) is None:
+            chunk_end = pos + len(slice_ids)
+            within_cacheable = (
+                cacheable_prefix_len is None or chunk_end <= cacheable_prefix_len
+            )
+            if within_cacheable and self.cache_manager.get(p_hash) is None:
                 kv = self._encode_to_kv(slice_ids, position_offset=pos)
                 chunk = CachedChunk(
                     chunk_id=p_hash,
@@ -762,7 +788,7 @@ class InferenceEngine:
                     token_ids=slice_ids,
                     past_key_values=kv,
                     position_start=pos,
-                    position_end=pos + len(slice_ids),
+                    position_end=chunk_end,
                     prefix_hash=p_hash,
                     content_hash=c_hash,
                 )

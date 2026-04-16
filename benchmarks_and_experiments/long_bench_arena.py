@@ -65,6 +65,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 from scipy import stats as scipy_stats
+from scipy.stats import binomtest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,6 +78,28 @@ RESULTS_DIR = Path(__file__).resolve().parent / "results"
 LETTERS = "ABCD"
 CHECKPOINT_DIR = Path(__file__).resolve().parent / ".checkpoints"
 CHECKPOINT_INTERVAL = 4  # Save checkpoint every N samples
+# Threshold for switching from exact binomial to chi-square McNemar
+MCNEMAR_EXACT_THRESHOLD = 25
+
+
+def mcnemar_pvalue(baseline_only: int, kvboost_only: int) -> Optional[float]:
+    """
+    Compute McNemar's test p-value for paired correctness.
+
+    Uses the exact binomial test when discordant pairs < MCNEMAR_EXACT_THRESHOLD
+    (the chi-square approximation is unreliable with small counts).
+    Falls back to the chi-square approximation for larger samples.
+
+    Returns None when there are no discordant pairs.
+    """
+    n = baseline_only + kvboost_only
+    if n == 0:
+        return None
+    if n < MCNEMAR_EXACT_THRESHOLD:
+        return float(binomtest(min(baseline_only, kvboost_only), n=n, p=0.5).pvalue)
+    # Chi-square with continuity correction
+    stat = (abs(baseline_only - kvboost_only) - 1) ** 2 / n
+    return float(1 - scipy_stats.chi2.cdf(stat, df=1))
 
 
 # ── Result containers ─────────────────────────────────────────────
@@ -319,22 +342,32 @@ def load_bug_localization(
 
 # ── Prompt formatting ─────────────────────────────────────────────
 
-def format_prompt(context: str, question: str, choices: List[str]) -> str:
+def format_prompt_prefix(context: str) -> str:
     """
-    Format a sample into a prompt.
-    The context (code diff) goes first — this is the long part that benefits
-    from caching — followed by the question and file choices.
+    Cacheable prefix: instruction + diff only. Identical across q1/q2 of a
+    pair, so KVBoost can reuse the cached KV here.
     """
-    prompt_parts = [
-        "Read the following code diff and answer the question.\n",
-        f"--- BEGIN DIFF ---\n{context}\n--- END DIFF ---\n",
-        f"{question}\n",
-    ]
-    for i, choice in enumerate(choices):
-        prompt_parts.append(f"{LETTERS[i]}. {choice}")
-    prompt_parts.append("\nAnswer with just the letter (A, B, C, or D):")
+    return (
+        "Read the following code diff and answer the question.\n\n"
+        f"--- BEGIN DIFF ---\n{context}\n--- END DIFF ---\n\n"
+    )
 
-    return "\n".join(prompt_parts)
+
+def format_prompt_suffix(question: str, choices: List[str]) -> str:
+    """
+    Non-cacheable suffix: question + A/B/C/D choices. Must always go
+    through fresh prefill — otherwise q1's choice KV bleeds into q2 and
+    biases the model toward whichever slot came first in q1.
+    """
+    parts = [f"{question}\n"]
+    for i, choice in enumerate(choices):
+        parts.append(f"{LETTERS[i]}. {choice}")
+    parts.append("\nAnswer with just the letter (A, B, C, or D):")
+    return "\n".join(parts)
+
+
+def format_prompt(context: str, question: str, choices: List[str]) -> str:
+    return format_prompt_prefix(context) + format_prompt_suffix(question, choices)
 
 
 # ── Answer extraction ─────────────────────────────────────────────
@@ -502,11 +535,18 @@ class LongBenchRunner:
             "total_ms": total_ms,
         }
 
-    def run_kvboost_cold(self, prompt: str, max_tokens: int = 16) -> dict:
+    def cacheable_prefix_len(self, prefix: str) -> int:
+        """Token count of the cacheable prefix — passed to engine.generate
+        so the suffix (question + choices) is never cached."""
+        return len(self.engine.tokenizer.encode(prefix, add_special_tokens=True))
+
+    def run_kvboost_cold(
+        self, prompt: str, max_tokens: int = 16, cacheable_prefix_len: Optional[int] = None,
+    ) -> dict:
         """
         Cold-start KVBoost: no prior cache, generate with CHUNK_KV_REUSE.
-        The first call populates the cache for subsequent warm calls on the
-        same context.
+        Only the first cacheable_prefix_len tokens are stored so q2 can
+        reuse the diff KV but not q1's choice KV.
         """
         gen_start = time.perf_counter()
         result = self.engine.generate(
@@ -515,10 +555,10 @@ class LongBenchRunner:
             mode=self.GenerationMode.CHUNK_KV_REUSE,
             do_sample=False,
             temperature=1.0,
+            cacheable_prefix_len=cacheable_prefix_len,
         )
         total_ms = (time.perf_counter() - gen_start) * 1000
-        
-        # Store the full GenerationResult for logit extraction
+
         self._last_generation_result = result
 
         return {
@@ -530,11 +570,13 @@ class LongBenchRunner:
             "cached_tokens": getattr(result, "cached_tokens", 0),
         }
 
-    def run_kvboost_warm(self, prompt: str, max_tokens: int = 16) -> dict:
+    def run_kvboost_warm(
+        self, prompt: str, max_tokens: int = 16, cacheable_prefix_len: Optional[int] = None,
+    ) -> dict:
         """
-        Warm KVBoost: cache already populated from q1.  Chunks from the
-        shared prompt prefix (instruction + diff) are reused; only the
-        unique suffix (question + choices) needs fresh prefill.
+        Warm KVBoost: prefix cache populated from q1. Suffix (question +
+        choices) always fresh-prefilled; cacheable_prefix_len keeps q2's
+        suffix out of the cache too.
         """
         gen_start = time.perf_counter()
         result = self.engine.generate(
@@ -543,10 +585,10 @@ class LongBenchRunner:
             mode=self.GenerationMode.CHUNK_KV_REUSE,
             do_sample=False,
             temperature=1.0,
+            cacheable_prefix_len=cacheable_prefix_len,
         )
         total_ms = (time.perf_counter() - gen_start) * 1000
-        
-        # Store the full GenerationResult for logit extraction
+
         self._last_generation_result = result
 
         return {
@@ -590,18 +632,6 @@ def run_benchmark(
     runner = LongBenchRunner(model_name, chunk_size=chunk_size)
     choice_token_ids = runner.get_choice_token_ids()
 
-    def get_bucket(n_tokens: int) -> str:
-        if n_tokens < 512:
-            return "0-512"
-        elif n_tokens < 1024:
-            return "512-1K"
-        elif n_tokens < 2048:
-            return "1K-2K"
-        elif n_tokens < 4096:
-            return "2K-4K"
-        else:
-            return "4K+"
-
     results_by_bucket: Dict[str, List[SampleResult]] = defaultdict(list)
     all_results: List[SampleResult] = []
 
@@ -614,14 +644,69 @@ def run_benchmark(
     print(f"  Query 1 populates cache, Query 2 reuses cached chunks")
     print(f"  q2 answer positions debiased (guaranteed ≠ q1 slot)\n")
 
+    # ── Print dataset bucket distribution ────────────────────────
+    def get_bucket(n_tokens: int) -> str:
+        if n_tokens < 512:
+            return "0-512"
+        elif n_tokens < 1024:
+            return "512-1K"
+        elif n_tokens < 2048:
+            return "1K-2K"
+        elif n_tokens < 4096:
+            return "2K-4K"
+        else:
+            return "4K+"
+
+    bucket_samples: Dict[str, List[dict]] = defaultdict(list)
+    for sample in samples:
+        bucket_samples[get_bucket(sample["context_tokens"])].append(sample)
+
+    print(f"  Dataset Bucket Distribution:")
+    print(f"  {'Bucket':<10} {'Samples':>8} {'%':>6} {'Min':>6} {'Max':>6} {'Median':>7} {'Mean':>7}")
+    print(f"  {'-'*10} {'-'*8} {'-'*6} {'-'*6} {'-'*6} {'-'*7} {'-'*7}")
+
+    total_samples = len(samples)
+    for bucket_name in ["0-512", "512-1K", "1K-2K", "2K-4K", "4K+"]:
+        bucket_data = bucket_samples[bucket_name]
+        if not bucket_data:
+            continue
+        token_counts = [s["context_tokens"] for s in bucket_data]
+        n = len(bucket_data)
+        pct = 100.0 * n / total_samples
+        min_tok = min(token_counts)
+        max_tok = max(token_counts)
+        median_tok = int(np.median(token_counts))
+        mean_tok = int(np.mean(token_counts))
+        print(
+            f"  {bucket_name:<10} {n:>8} {pct:>5.1f}% {min_tok:>6} {max_tok:>6} "
+            f"{median_tok:>7} {mean_tok:>7}"
+        )
+    print()
+
     # ── Checkpointing: load previous progress if available ────────
     checkpoint_path = get_checkpoint_path(model_name, n_samples, max_context_tokens)
-    all_results, processed_indices = ([], []) if no_checkpoint else load_checkpoint(checkpoint_path)
+    
+    # Fallback: if hash-based checkpoint doesn't exist, look for any checkpoint
+    if not checkpoint_path.exists():
+        possible_checkpoints = sorted(CHECKPOINT_DIR.glob("checkpoint_*.json"))
+        if possible_checkpoints:
+            # Use the most recent checkpoint
+            checkpoint_path = possible_checkpoints[-1]
+            log.info(f"Hash-based checkpoint not found; trying recent checkpoint: {checkpoint_path.name}")
+    
+    # Try to load by sample ID first (allows cross-sample-set reuse)
+    if not no_checkpoint:
+        all_results, processed_indices = load_checkpoint_by_sample_id(checkpoint_path, samples)
+    else:
+        all_results, processed_indices = [], []
+    
     processed_set = set(processed_indices)
 
     if processed_set:
         print(f"  Checkpoint found: resuming from {len(processed_indices)} processed samples")
-        print(f"  Use --no-checkpoint to start fresh\n")
+        print(f"  Use --no-checkpoint to start fresh")
+        # Display formatted checkpoint state in summary format
+        print_checkpoint_state(all_results)
     # ────────────────────────────────────────────────────────────────
 
     total_start = time.perf_counter()
@@ -634,9 +719,17 @@ def run_benchmark(
     for group_id in sorted(pair_groups.keys()):
         ordered_indices.extend(pair_groups[group_id])
 
+    n_to_process = len([i for i in ordered_indices if i not in processed_set])
+    samples_processed_this_run = 0
+
     for progress_idx, i in enumerate(ordered_indices):
         # Skip already-processed samples from checkpoint
         if i in processed_set:
+            continue
+
+        # Safety check: ensure index is valid (prevents crashes from stale checkpoints)
+        if i < 0 or i >= len(samples):
+            log.warning(f"  Skipping invalid sample index {i} from checkpoint (out of range)")
             continue
 
         sample = samples[i]
@@ -647,9 +740,15 @@ def run_benchmark(
         if is_first_in_pair:
             runner._reset_cache()
 
-        prompt = format_prompt(context, sample["question"], sample["choices"])
+        prefix_text = format_prompt_prefix(context)
+        suffix_text = format_prompt_suffix(sample["question"], sample["choices"])
+        prompt = prefix_text + suffix_text
+        prefix_len = runner.cacheable_prefix_len(prefix_text)
         prompt_tokens = runner.count_tokens(prompt)
         bucket = get_bucket(context_tokens)
+        
+        # Now that we know we'll process this sample, increment counter
+        samples_processed_this_run += 1
 
         try:
             # ── FIX 1: correct logit capture order ────────────────────────
@@ -669,10 +768,17 @@ def run_benchmark(
             baseline_correct = baseline_pred == sample["answer"]
 
             # Step 3: run KVBoost — this populates / reuses the cache.
+            # cacheable_prefix_len caps caching to the diff prefix so the
+            # per-query suffix (question + choices) never enters the cache,
+            # eliminating q1→q2 choice-position bleed.
             if is_first_in_pair:
-                kvboost = runner.run_kvboost_cold(prompt, max_tokens=16)
+                kvboost = runner.run_kvboost_cold(
+                    prompt, max_tokens=16, cacheable_prefix_len=prefix_len,
+                )
             else:
-                kvboost = runner.run_kvboost_warm(prompt, max_tokens=16)
+                kvboost = runner.run_kvboost_warm(
+                    prompt, max_tokens=16, cacheable_prefix_len=prefix_len,
+                )
 
             kvboost_pred = extract_letter_answer(kvboost["output"])
             kvboost_correct = kvboost_pred == sample["answer"]
@@ -764,17 +870,27 @@ def run_benchmark(
 
         # ── Periodic checkpoint save ────────
         if len(all_results) % CHECKPOINT_INTERVAL == 0:
-            save_checkpoint(all_results, checkpoint_path, samples, processed_indices)
+            try:
+                save_checkpoint(
+                    all_results, 
+                    checkpoint_path, 
+                    samples, 
+                    processed_indices,
+                    model_name=model_name,
+                    max_context_tokens=max_context_tokens,
+                )
+            except Exception as e:
+                log.error(f"Failed to save checkpoint: {e}. Continuing without checkpoint.")
         # ────────────────────────────────────
 
-        if (progress_idx + 1) % 4 == 0 or (progress_idx + 1) == len(samples):
+        if samples_processed_this_run % 4 == 0 or samples_processed_this_run == n_to_process:
             completed = len(all_results)
             running_base_acc = sum(s.baseline_correct for s in all_results) / completed
             running_kv_acc = sum(s.kvboost_correct for s in all_results) / completed
             running_avg_cos = np.mean([s.logit_cosine_similarity for s in all_results])
             running_avg_reuse = np.mean([s.kv_reuse_ratio for s in all_results])
             print(
-                f"  [{progress_idx+1}/{len(samples)}] [{query_type}] ctx={context_tokens:>5}tok "
+                f"  [{len(all_results)}/{len(samples)}] [{query_type}] ctx={context_tokens:>5}tok "
                 f"TTFT {baseline_runner_result['ttft_ms']:>7.0f}→{kvboost['ttft_ms']:>7.0f}ms ({speedup:.1f}x) "
                 f"reuse={kvboost.get('kv_reuse_ratio', 0):.0%} {cos_str} "
                 f"avg_reuse={running_avg_reuse:.0%} "
@@ -784,6 +900,22 @@ def run_benchmark(
 
     total_time = time.perf_counter() - total_start
     log.info(f"Benchmark completed in {total_time:.1f}s")
+
+    # ── Final checkpoint save ──────
+    # Save final state in case only a few samples were processed since last checkpoint
+    if len(all_results) > 0 and len(all_results) % CHECKPOINT_INTERVAL != 0:
+        try:
+            save_checkpoint(
+                all_results,
+                checkpoint_path,
+                samples,
+                processed_indices,
+                model_name=model_name,
+                max_context_tokens=max_context_tokens,
+            )
+        except Exception as e:
+            log.error(f"Failed to save final checkpoint: {e}")
+    # ────────────────────────────────
 
     # ── Compute bucket-level results ──
     bucket_results: Dict[str, BucketResult] = {}
@@ -810,10 +942,7 @@ def run_benchmark(
 
         baseline_only = sum(s.baseline_correct and not s.kvboost_correct for s in bucket_samples)
         kvboost_only = sum(not s.baseline_correct and s.kvboost_correct for s in bucket_samples)
-        mcnemar_p = None
-        if baseline_only + kvboost_only > 0:
-            stat = (abs(baseline_only - kvboost_only) - 1) ** 2 / (baseline_only + kvboost_only)
-            mcnemar_p = 1 - scipy_stats.chi2.cdf(stat, df=1)
+        mcnemar_p = mcnemar_pvalue(baseline_only, kvboost_only)
 
         bucket_results[bucket_name] = BucketResult(
             bucket_name=bucket_name,
@@ -832,6 +961,128 @@ def run_benchmark(
         )
 
     return bucket_results
+
+
+# ── Summary report ────────────────────────────────────────────────
+
+def print_checkpoint_state(all_results: List[SampleResult]):
+    """Display checkpoint results with bucketwise distribution."""
+    if not all_results:
+        return
+    
+    def get_bucket(n_tokens: int) -> str:
+        if n_tokens < 512:
+            return "0-512"
+        elif n_tokens < 1024:
+            return "512-1K"
+        elif n_tokens < 2048:
+            return "1K-2K"
+        elif n_tokens < 4096:
+            return "2K-4K"
+        else:
+            return "4K+"
+    
+    # Organize results by bucket
+    bucket_results: Dict[str, List[SampleResult]] = defaultdict(list)
+    for result in all_results:
+        bucket_name = get_bucket(result.context_tokens)
+        bucket_results[bucket_name].append(result)
+    
+    n_total = len(all_results)
+    
+    print(f"\n{'='*85}")
+    print("  CHECKPOINT STATE — Current Progress Summary")
+    print(f"{'='*85}\n")
+    print(f"  Checkpoint: {n_total} samples processed\n")
+    
+    # Accuracy table with buckets
+    print(f"  {'Bucket':<10} {'N':>5} {'Base Acc':>9} {'KV Acc':>9} {'Delta':>8} {'p-value':>9} {'Result':>8}")
+    print(f"  {'-'*10} {'-'*5} {'-'*9} {'-'*9} {'-'*8} {'-'*9} {'-'*8}")
+    
+    # Display each bucket
+    for bucket_name in ["0-512", "512-1K", "1K-2K", "2K-4K", "4K+"]:
+        bucket_data = bucket_results.get(bucket_name, [])
+        if not bucket_data:
+            continue
+        
+        n = len(bucket_data)
+        base_acc = sum(s.baseline_correct for s in bucket_data) / n
+        kv_acc = sum(s.kvboost_correct for s in bucket_data) / n
+        delta = kv_acc - base_acc
+        
+        baseline_only = sum(s.baseline_correct and not s.kvboost_correct for s in bucket_data)
+        kvboost_only = sum(not s.baseline_correct and s.kvboost_correct for s in bucket_data)
+
+        mcnemar_p = mcnemar_pvalue(baseline_only, kvboost_only)
+
+        p_str = f"{mcnemar_p:.3f}" if mcnemar_p is not None else "N/A"
+        verdict = "PASS" if (mcnemar_p is None or mcnemar_p > 0.05) else "FAIL"
+
+        print(
+            f"  {bucket_name:<10} {n:>5} {base_acc:>8.1%} "
+            f"{kv_acc:>8.1%} {delta:>+7.1%} {p_str:>9} {verdict:>8}"
+        )
+
+    # ALL aggregate
+    base_acc = sum(s.baseline_correct for s in all_results) / n_total
+    kv_acc = sum(s.kvboost_correct for s in all_results) / n_total
+    delta = kv_acc - base_acc
+
+    baseline_only = sum(s.baseline_correct and not s.kvboost_correct for s in all_results)
+    kvboost_only = sum(not s.baseline_correct and s.kvboost_correct for s in all_results)
+
+    mcnemar_p = mcnemar_pvalue(baseline_only, kvboost_only)
+    
+    p_str = f"{mcnemar_p:.3f}" if mcnemar_p is not None else "N/A"
+    verdict = "PASS" if (mcnemar_p is None or mcnemar_p > 0.05) else "FAIL"
+    
+    print(
+        f"  {'ALL':<10} {n_total:>5} {base_acc:>8.1%} "
+        f"{kv_acc:>8.1%} {delta:>+7.1%} {p_str:>9} {verdict:>8} <<<"
+    )
+    
+    # Performance table
+    print(f"\n  {'Bucket':<10} {'N':>5} {'Avg Ctx':>8} {'Base TTFT':>10} {'KV TTFT':>10} "
+          f"{'Speedup':>8} {'KV Reuse':>9}")
+    print(f"  {'-'*10} {'-'*5} {'-'*8} {'-'*10} {'-'*10} {'-'*8} {'-'*9}")
+    
+    # Display performance by bucket
+    for bucket_name in ["0-512", "512-1K", "1K-2K", "2K-4K", "4K+"]:
+        bucket_data = bucket_results.get(bucket_name, [])
+        if not bucket_data:
+            continue
+        
+        n = len(bucket_data)
+        avg_ctx = np.mean([s.context_tokens for s in bucket_data])
+        avg_base_ttft = np.mean([s.baseline_ttft_ms for s in bucket_data])
+        avg_kv_ttft = np.mean([s.kvboost_ttft_ms for s in bucket_data])
+        avg_speedup = np.mean(
+            [s.baseline_ttft_ms / s.kvboost_ttft_ms for s in bucket_data if s.kvboost_ttft_ms > 0]
+        ) if any(s.kvboost_ttft_ms > 0 for s in bucket_data) else 0.0
+        avg_reuse = np.mean([s.kv_reuse_ratio for s in bucket_data])
+        
+        print(
+            f"  {bucket_name:<10} {n:>5} {avg_ctx:>7.0f} "
+            f"{avg_base_ttft:>9.0f}ms {avg_kv_ttft:>9.0f}ms "
+            f"{avg_speedup:>7.1f}x {avg_reuse:>8.0%}"
+        )
+    
+    # ALL aggregate performance
+    avg_ctx = np.mean([s.context_tokens for s in all_results])
+    avg_base_ttft = np.mean([s.baseline_ttft_ms for s in all_results])
+    avg_kv_ttft = np.mean([s.kvboost_ttft_ms for s in all_results])
+    avg_speedup = np.mean(
+        [s.baseline_ttft_ms / s.kvboost_ttft_ms for s in all_results if s.kvboost_ttft_ms > 0]
+    ) if any(s.kvboost_ttft_ms > 0 for s in all_results) else 0.0
+    avg_reuse = np.mean([s.kv_reuse_ratio for s in all_results])
+    
+    print(
+        f"  {'ALL':<10} {n_total:>5} {avg_ctx:>7.0f} "
+        f"{avg_base_ttft:>9.0f}ms {avg_kv_ttft:>9.0f}ms "
+        f"{avg_speedup:>7.1f}x {avg_reuse:>8.0%} <<<"
+    )
+    
+    print(f"\n{'='*85}\n")
 
 
 # ── Summary report ────────────────────────────────────────────────
@@ -900,32 +1151,7 @@ def print_summary(bucket_results: Dict[str, BucketResult], verbose: bool = False
                 ) if any(s.kvboost_ttft_ms > 0 for s in ds) else 0.0
                 print(f"  {domain:<25} {n:>5} {base_acc:>8.1%} {kv_acc:>8.1%} {speedup:>7.1f}x")
 
-    # Cosine deviation table
-    print(f"\n  {'Bucket':<10} {'N':>5} {'Avg Cos Sim':>12} {'Min Cos':>9} {'Top1 Changed':>13} {'Avg A Dev':>10} {'Avg B Dev':>10}")
-    print(f"  {'-'*10} {'-'*5} {'-'*12} {'-'*9} {'-'*13} {'-'*10} {'-'*10}")
 
-    for name in ["0-512", "512-1K", "1K-2K", "2K-4K", "4K+", "ALL"]:
-        if name not in bucket_results:
-            continue
-        r = bucket_results[name]
-        cos_sims = [s.logit_cosine_similarity for s in r.samples]
-        avg_cos = np.mean(cos_sims)
-        min_cos = np.min(cos_sims)
-        n_top1_changed = sum(s.top1_token_changed for s in r.samples)
-
-        choice_devs_all = [s.choice_logit_deviations for s in r.samples if s.choice_logit_deviations]
-        avg_a_dev = np.mean([d.get("A", 0) for d in choice_devs_all]) if choice_devs_all else 0.0
-        avg_b_dev = np.mean([d.get("B", 0) for d in choice_devs_all]) if choice_devs_all else 0.0
-        marker = "" if name != "ALL" else " <<<"
-
-        # Warn if cosine deviation is still suspiciously perfect
-        if avg_cos == 1.0 and min_cos == 1.0 and name == "ALL":
-            marker += "  ⚠ all cos=1.0 — KVBoost logit capture may be broken"
-
-        print(
-            f"  {name:<10} {r.n_samples:>5} {avg_cos:>11.6f} {min_cos:>8.6f} "
-            f"{n_top1_changed:>8}/{r.n_samples:<4} {avg_a_dev:>9.6f} {avg_b_dev:>9.6f}{marker}"
-        )
 
     # KV reuse distribution
     if "ALL" in bucket_results:
@@ -942,6 +1168,39 @@ def print_summary(bucket_results: Dict[str, BucketResult], verbose: bool = False
         high_reuse = [s for s in all_samples if s.kv_reuse_ratio >= 0.8]
         if high_reuse:
             print(f"    High reuse (>=80%): {len(high_reuse)}/{len(all_samples)} samples")
+
+    # Conditional accuracy — shows KVBoost performance in its intended regime
+    if "ALL" in bucket_results:
+        all_samples = bucket_results["ALL"].samples
+        print(f"\n  Conditional Accuracy (KVBoost in intended operating regime):")
+        print(f"  {'Condition':<30} {'N':>5} {'Base Acc':>9} {'KV Acc':>9} {'Delta':>8} {'p-value':>9}")
+        print(f"  {'-'*30} {'-'*5} {'-'*9} {'-'*9} {'-'*8} {'-'*9}")
+
+        conditions = [
+            ("reuse > 0%",   [s for s in all_samples if s.kv_reuse_ratio > 0]),
+            ("reuse >= 50%", [s for s in all_samples if s.kv_reuse_ratio >= 0.5]),
+            ("reuse >= 80%", [s for s in all_samples if s.kv_reuse_ratio >= 0.8]),
+            ("ctx >= 512 tok",  [s for s in all_samples if s.context_tokens >= 512]),
+            ("ctx >= 1K tok",   [s for s in all_samples if s.context_tokens >= 1024]),
+            ("warm (q2) only",  [s for s in all_samples if "_q2" in s.sample_id]),
+            ("cold (q1) only",  [s for s in all_samples if "_q1" in s.sample_id]),
+        ]
+
+        for label, subset in conditions:
+            n_sub = len(subset)
+            if n_sub == 0:
+                continue
+            b_acc = sum(s.baseline_correct for s in subset) / n_sub
+            k_acc = sum(s.kvboost_correct for s in subset) / n_sub
+            delta = k_acc - b_acc
+            b_only = sum(s.baseline_correct and not s.kvboost_correct for s in subset)
+            k_only = sum(not s.baseline_correct and s.kvboost_correct for s in subset)
+            p = mcnemar_pvalue(b_only, k_only)
+            p_str = f"{p:.3f}" if p is not None else "N/A"
+            print(
+                f"  {label:<30} {n_sub:>5} {b_acc:>8.1%} "
+                f"{k_acc:>8.1%} {delta:>+7.1%} {p_str:>9}"
+            )
 
     # Divergence analysis
     if "ALL" in bucket_results:
@@ -960,12 +1219,7 @@ def print_summary(bucket_results: Dict[str, BucketResult], verbose: bool = False
         print(f"    Baseline-only correct:   {n_base_only}/{n_total} ({n_base_only/n_total:.1%})")
         print(f"    KVBoost-only correct:    {n_kv_only}/{n_total} ({n_kv_only/n_total:.1%})")
 
-        diverged_cos = [s.logit_cosine_similarity for s in all_samples if s.outputs_diverged]
-        matched_cos = [s.logit_cosine_similarity for s in all_samples if not s.outputs_diverged]
-        if diverged_cos and matched_cos:
-            print(f"\n  Cosine Similarity by Divergence:")
-            print(f"    Matching outputs:  avg={np.mean(matched_cos):.6f} (n={len(matched_cos)})")
-            print(f"    Divergent outputs: avg={np.mean(diverged_cos):.6f} (n={len(diverged_cos)})")
+
 
     # FIX 4a: Error-by-predicted-letter breakdown.
     # Surfaces A-bias (or any other letter bias) in KVBoost errors.
@@ -1036,8 +1290,6 @@ def print_summary(bucket_results: Dict[str, BucketResult], verbose: bool = False
         r = bucket_results["ALL"]
         delta = r.kvboost_accuracy - r.baseline_accuracy
         acc_pass = r.mcnemar_pvalue is None or r.mcnemar_pvalue > 0.05
-        cos_sims = [s.logit_cosine_similarity for s in r.samples]
-        avg_cos = np.mean(cos_sims)
 
         if acc_pass and r.avg_ttft_speedup >= 1.0:
             print(f"  RESULT: KVBoost matches baseline accuracy (delta={delta:+.1%}) "
@@ -1048,14 +1300,6 @@ def print_summary(bucket_results: Dict[str, BucketResult], verbose: bool = False
         else:
             print(f"  RESULT: Accuracy difference detected (delta={delta:+.1%}, "
                   f"p={r.mcnemar_pvalue:.3f})")
-        print(f"  Logit cosine similarity: avg={avg_cos:.6f} "
-              f"(1.0=identical, <0.99=notable deviation)")
-
-        # Warn if cosine deviation never moved from 1.0
-        if avg_cos == 1.0 and min(s.logit_cosine_similarity for s in r.samples) == 1.0:
-            print(f"  ⚠ WARNING: cosine similarity is uniformly 1.0 — "
-                  f"first_token_logits may not be captured. "
-                  f"Check that GenerationResult.first_token_logits is populated.")
     print(f"{'=' * 85}\n")
 
     # Verbose: per-sample divergence + cosine details
@@ -1073,26 +1317,12 @@ def print_summary(bucket_results: Dict[str, BucketResult], verbose: bool = False
                     f"    {s.sample_id}: ctx={s.context_tokens}tok "
                     f"base={s.baseline_output} kv={s.kvboost_output} gold={s.gold_answer} "
                     f"gold_pos={s.answer_position}({LETTERS[s.answer_position]}) "
-                    f"cos={s.logit_cosine_similarity:.6f}{dev_str} "
                     f"domain={s.domain}"
                 )
             if len(diverged) > 10:
                 print(f"    ... and {len(diverged) - 10} more")
 
-        sorted_by_cos = sorted(bucket_results["ALL"].samples, key=lambda s: s.logit_cosine_similarity)
-        print(f"\n  Lowest cosine similarity samples (most deviated logits):")
-        for s in sorted_by_cos[:5]:
-            dev_str = ""
-            if s.choice_logit_deviations:
-                dev_str = " devs={" + ", ".join(
-                    f"{k}:{v:.4f}" for k, v in sorted(s.choice_logit_deviations.items())
-                ) + "}"
-            match = "MATCH" if not s.outputs_diverged else "DIVERGE"
-            print(
-                f"    {s.sample_id}: cos={s.logit_cosine_similarity:.6f} "
-                f"ctx={s.context_tokens}tok base={s.baseline_output} kv={s.kvboost_output} "
-                f"gold={s.gold_answer} gold_pos={s.answer_position} [{match}]{dev_str}"
-            )
+
 
 
 # ── Save results ──────────────────────────────────────────────────
@@ -1106,17 +1336,65 @@ def get_checkpoint_path(model_name: str, n_samples: int, max_context_tokens: int
     return CHECKPOINT_DIR / f"checkpoint_{config_hash}.json"
 
 
+def validate_checkpoint(checkpoint_path: Path) -> bool:
+    """Validate checkpoint file structure and consistency.
+    
+    Returns True if checkpoint is valid, False if corrupted.
+    """
+    if not checkpoint_path.exists():
+        return False
+    
+    try:
+        with open(checkpoint_path, "r") as f:
+            data = json.load(f)
+        
+        # Check required fields
+        required_fields = ["processed_indices", "results", "n_total_samples", "n_processed"]
+        for field in required_fields:
+            if field not in data:
+                log.warning(f"Checkpoint missing field: {field}")
+                return False
+        
+        # Check consistency
+        n_indices = len(data["processed_indices"])
+        n_results = len(data["results"])
+        if n_indices != n_results:
+            log.warning(
+                f"Checkpoint inconsistent: {n_indices} indices but {n_results} results"
+            )
+            return False
+        
+        return True
+    except Exception as e:
+        log.warning(f"Checkpoint validation failed: {e}")
+        return False
+
+
+def clean_checkpoint(checkpoint_path: Path):
+    """Safely remove checkpoint file."""
+    if checkpoint_path.exists():
+        try:
+            checkpoint_path.unlink()
+            log.info(f"Removed checkpoint: {checkpoint_path}")
+        except Exception as e:
+            log.warning(f"Failed to remove checkpoint: {e}")
+
+
 def save_checkpoint(
     all_results: List[SampleResult],
     checkpoint_path: Path,
     samples: List[dict],
     processed_indices: List[int],
+    model_name: str = "",
+    max_context_tokens: int = 0,
 ):
-    """Save checkpoint with current progress."""
+    """Save checkpoint with current progress using atomic write pattern."""
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
     checkpoint = {
         "timestamp": time.time(),
+        "model_name": model_name,
+        "max_context_tokens": max_context_tokens,
         "n_total_samples": len(samples),
         "n_processed": len(processed_indices),
         "processed_indices": processed_indices,
@@ -1151,14 +1429,37 @@ def save_checkpoint(
         ],
     }
 
-    with open(checkpoint_path, "w") as f:
-        json.dump(checkpoint, f, indent=2, default=str)
+    # Atomic write pattern (write to temp file, then rename)
+    temp_path = checkpoint_path.with_suffix(".tmp")
+    try:
+        with open(temp_path, "w") as f:
+            json.dump(checkpoint, f, indent=2, default=str)
+        # Atomic rename prevents partial/corrupted checkpoint
+        temp_path.replace(checkpoint_path)
+        log.info(f"Checkpoint saved: {len(processed_indices)}/{len(samples)} samples")
+    except Exception as e:
+        log.error(f"Failed to save checkpoint: {e}")
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
 
-    log.info(f"Checkpoint saved: {len(processed_indices)}/{len(samples)} samples")
 
-
-def load_checkpoint(checkpoint_path: Path) -> tuple[List[SampleResult], List[int]]:
-    """Load checkpoint and reconstruct results."""
+def load_checkpoint_by_sample_id(
+    checkpoint_path: Path,
+    current_samples: List[dict],
+) -> tuple[List[SampleResult], List[int]]:
+    """Load checkpoint and match results by sample_id instead of index.
+    
+    This enables reusing checkpoints across different --n-samples values
+    as long as the same samples are included (e.g., first 50 of 8576).
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+        current_samples: Current list of samples being processed
+    
+    Returns:
+        Tuple of (results list, processed indices list). Returns ([], []) on failure.
+    """
     if not checkpoint_path.exists():
         return [], []
 
@@ -1166,44 +1467,207 @@ def load_checkpoint(checkpoint_path: Path) -> tuple[List[SampleResult], List[int
         with open(checkpoint_path, "r") as f:
             checkpoint = json.load(f)
 
+        results_data = checkpoint.get("results", [])
+        if not results_data:
+            return [], []
+
+        # Build mapping from sample_id to result data
+        id_to_result = {}
+        for result_data in results_data:
+            sample_id = result_data.get("sample_id")
+            if sample_id:
+                id_to_result[sample_id] = result_data
+
+        # Find which samples in current set have results in checkpoint
+        matched_results = []
+        matched_indices = []
+
+        for idx, sample in enumerate(current_samples):
+            sample_id = sample.get("id")
+            if sample_id in id_to_result:
+                # This sample was processed before - reuse the result
+                result_data = id_to_result[sample_id]
+                try:
+                    sr = SampleResult(
+                        sample_id=result_data["sample_id"],
+                        domain=result_data["domain"],
+                        sub_domain=result_data["sub_domain"],
+                        difficulty=result_data["difficulty"],
+                        length_category=result_data["length_category"],
+                        context_tokens=result_data["context_tokens"],
+                        prompt_tokens=result_data["prompt_tokens"],
+                        baseline_output=result_data["baseline_output"],
+                        kvboost_output=result_data["kvboost_output"],
+                        gold_answer=result_data["gold_answer"],
+                        baseline_correct=result_data["baseline_correct"],
+                        kvboost_correct=result_data["kvboost_correct"],
+                        outputs_diverged=result_data["outputs_diverged"],
+                        baseline_ttft_ms=result_data["baseline_ttft_ms"],
+                        baseline_total_ms=result_data["baseline_total_ms"],
+                        kvboost_ttft_ms=result_data["kvboost_ttft_ms"],
+                        kvboost_total_ms=result_data["kvboost_total_ms"],
+                        kv_reuse_ratio=result_data["kv_reuse_ratio"],
+                        cached_tokens=result_data["cached_tokens"],
+                        warm_time_ms=result_data["warm_time_ms"],
+                        logit_cosine_similarity=result_data["logit_cosine_similarity"],
+                        choice_logit_deviations=result_data.get("choice_logit_deviations"),
+                        top1_token_changed=result_data["top1_token_changed"],
+                        answer_position=result_data.get("answer_position", 0),
+                    )
+                    matched_results.append(sr)
+                    matched_indices.append(idx)
+                except KeyError as ke:
+                    log.warning(f"Skipping result for {sample_id} (missing key {ke})")
+                    continue
+
+        if matched_results:
+            log.info(
+                f"Checkpoint loaded: {len(matched_results)}/{len(current_samples)} samples "
+                f"matched by ID from checkpoint with {len(id_to_result)} total results"
+            )
+            return matched_results, matched_indices
+        else:
+            log.warning("No samples in checkpoint matched current sample set. Starting fresh.")
+            return [], []
+
+    except json.JSONDecodeError as e:
+        log.warning(f"Checkpoint file corrupted (JSON parse error): {e}. Starting fresh.")
+        return [], []
+    except Exception as e:
+        log.warning(f"Failed to load checkpoint: {e}. Starting fresh.")
+        return [], []
+
+
+def load_checkpoint(
+    checkpoint_path: Path,
+    expected_n_samples: int = 0,
+    expected_model: str = "",
+    expected_max_ctx: int = 0,
+) -> tuple[List[SampleResult], List[int]]:
+    """Load checkpoint and reconstruct results with validation.
+    
+    Intelligently handles parameter mismatches:
+    - If model/max_ctx stored but differs, warn and discard (safety concern)
+    - If sample count differs, keep valid indices within current range
+    - Old checkpoints (no metadata) are loaded with only bounds checking
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+        expected_n_samples: Expected total sample count (for bounds validation)
+        expected_model: Expected model name (for conflict detection)
+        expected_max_ctx: Expected max context tokens (for conflict detection)
+    
+    Returns:
+        Tuple of (results list, processed indices list). Returns ([], []) on failure.
+    """
+    if not checkpoint_path.exists():
+        return [], []
+
+    try:
+        with open(checkpoint_path, "r") as f:
+            checkpoint = json.load(f)
+
+        stored_model = checkpoint.get("model_name", "")
+        stored_max_ctx = checkpoint.get("max_context_tokens", 0)
+        stored_n_total = checkpoint.get("n_total_samples", 0)
+        
+        # Check for critical mismatches only if metadata is stored AND differs
+        if stored_model and expected_model and stored_model != expected_model:
+            log.warning(
+                f"Checkpoint model mismatch: stored='{stored_model}' vs expected='{expected_model}'. "
+                "Discarding to avoid running different model against old cache state."
+            )
+            return [], []
+        
+        if stored_max_ctx and expected_max_ctx and stored_max_ctx != expected_max_ctx:
+            log.warning(
+                f"Checkpoint context bounds mismatch: stored={stored_max_ctx} vs "
+                f"expected={expected_max_ctx}. Discarding checkpoint."
+            )
+            return [], []
+
         processed_indices = checkpoint.get("processed_indices", [])
         results_data = checkpoint.get("results", [])
-
-        results = []
-        for data in results_data:
-            sr = SampleResult(
-                sample_id=data["sample_id"],
-                domain=data["domain"],
-                sub_domain=data["sub_domain"],
-                difficulty=data["difficulty"],
-                length_category=data["length_category"],
-                context_tokens=data["context_tokens"],
-                prompt_tokens=data["prompt_tokens"],
-                baseline_output=data["baseline_output"],
-                kvboost_output=data["kvboost_output"],
-                gold_answer=data["gold_answer"],
-                baseline_correct=data["baseline_correct"],
-                kvboost_correct=data["kvboost_correct"],
-                outputs_diverged=data["outputs_diverged"],
-                baseline_ttft_ms=data["baseline_ttft_ms"],
-                baseline_total_ms=data["baseline_total_ms"],
-                kvboost_ttft_ms=data["kvboost_ttft_ms"],
-                kvboost_total_ms=data["kvboost_total_ms"],
-                kv_reuse_ratio=data["kv_reuse_ratio"],
-                cached_tokens=data["cached_tokens"],
-                warm_time_ms=data["warm_time_ms"],
-                logit_cosine_similarity=data["logit_cosine_similarity"],
-                choice_logit_deviations=data.get("choice_logit_deviations"),
-                top1_token_changed=data["top1_token_changed"],
-                answer_position=data.get("answer_position", 0),
+        
+        # Validate array lengths match
+        if len(results_data) != len(processed_indices):
+            log.warning(
+                f"Checkpoint integrity check failed: {len(results_data)} results but "
+                f"{len(processed_indices)} indices. Discarding checkpoint."
             )
-            results.append(sr)
+            return [], []
 
-        log.info(f"Checkpoint loaded: {len(processed_indices)} samples recovered")
-        return results, processed_indices
+        # Filter indices to only those valid in current sample list
+        # This allows reusing checkpoints across different --n-samples values
+        valid_indices = []
+        valid_results = []
+        invalid_count = 0
+        
+        for idx, result_data in zip(processed_indices, results_data):
+            if 0 <= idx < expected_n_samples:
+                valid_indices.append(idx)
+                valid_results.append(result_data)
+            else:
+                invalid_count += 1
+        
+        if invalid_count > 0:
+            log.info(
+                f"Checkpoint sample count differs (stored={stored_n_total} vs "
+                f"current={expected_n_samples}): kept {len(valid_indices)} valid indices, "
+                f"dropped {invalid_count} out-of-range indices"
+            )
+        
+        if not valid_indices:
+            log.warning("Checkpoint has no valid indices for current sample set. Starting fresh.")
+            return [], []
 
+        # Reconstruct results from valid data
+        results = []
+        for data in valid_results:
+            try:
+                sr = SampleResult(
+                    sample_id=data["sample_id"],
+                    domain=data["domain"],
+                    sub_domain=data["sub_domain"],
+                    difficulty=data["difficulty"],
+                    length_category=data["length_category"],
+                    context_tokens=data["context_tokens"],
+                    prompt_tokens=data["prompt_tokens"],
+                    baseline_output=data["baseline_output"],
+                    kvboost_output=data["kvboost_output"],
+                    gold_answer=data["gold_answer"],
+                    baseline_correct=data["baseline_correct"],
+                    kvboost_correct=data["kvboost_correct"],
+                    outputs_diverged=data["outputs_diverged"],
+                    baseline_ttft_ms=data["baseline_ttft_ms"],
+                    baseline_total_ms=data["baseline_total_ms"],
+                    kvboost_ttft_ms=data["kvboost_ttft_ms"],
+                    kvboost_total_ms=data["kvboost_total_ms"],
+                    kv_reuse_ratio=data["kv_reuse_ratio"],
+                    cached_tokens=data["cached_tokens"],
+                    warm_time_ms=data["warm_time_ms"],
+                    logit_cosine_similarity=data["logit_cosine_similarity"],
+                    choice_logit_deviations=data.get("choice_logit_deviations"),
+                    top1_token_changed=data["top1_token_changed"],
+                    answer_position=data.get("answer_position", 0),
+                )
+                results.append(sr)
+            except KeyError as ke:
+                log.warning(f"Skipping corrupted result record (missing key {ke})")
+                continue
+
+        if not results:
+            log.warning("Checkpoint has no valid results after reconstruction. Starting fresh.")
+            return [], []
+
+        log.info(f"Checkpoint loaded: {len(valid_indices)} samples recovered")
+        return results, valid_indices
+
+    except json.JSONDecodeError as e:
+        log.warning(f"Checkpoint file corrupted (JSON parse error): {e}. Starting fresh.")
+        return [], []
     except Exception as e:
-        log.warning(f"Failed to load checkpoint: {e}")
+        log.warning(f"Failed to load checkpoint: {e}. Starting fresh.")
         return [], []
 
 def save_results(
