@@ -15,7 +15,7 @@ from __future__ import annotations
 import enum
 import logging
 import re
-from typing import List, Tuple
+from typing import List, Optional, Set, Tuple
 
 from .models import chunk_id_from_tokens
 
@@ -41,28 +41,45 @@ class ChunkRegistry:
         chunk_size: int = 128,
         strategy: ChunkStrategy = ChunkStrategy.FIXED,
         min_chunk_tokens: int = 32,
+        boundary_window: int = 0,
     ):
         self.chunk_size = chunk_size
         self.strategy = strategy
         self.min_chunk_tokens = min_chunk_tokens
+        # Clamp: window can't be larger than half the chunk size
+        self.boundary_window = min(boundary_window, chunk_size // 2)
 
     # ------------------------------------------------------------------
     # Primary API
     # ------------------------------------------------------------------
 
     def split(
-        self, token_ids: List[int], text: str = ""
+        self,
+        token_ids: List[int],
+        text: str = "",
+        boundary_tokens: Optional[Set[int]] = None,
     ) -> List[Tuple[int, int, List[int]]]:
         """
         Split token_ids into cacheable slices.
 
         Returns list of (start, end, slice_token_ids).
         end is exclusive.
+
+        If boundary_window > 0 and boundary_tokens is provided,
+        split points are nudged to sentence/clause boundaries.
         """
+        use_adaptive = (
+            self.boundary_window > 0
+            and boundary_tokens
+            and self.strategy in (ChunkStrategy.FIXED, ChunkStrategy.SEMANTIC)
+        )
+
         if self.strategy == ChunkStrategy.FIXED:
+            if use_adaptive:
+                return self._adaptive_split(token_ids, boundary_tokens)
             return self._fixed_split(token_ids)
         elif self.strategy == ChunkStrategy.SEMANTIC:
-            return self._semantic_split(token_ids, text)
+            return self._semantic_split(token_ids, text, boundary_tokens)
         elif self.strategy == ChunkStrategy.DOCUMENT:
             return [(0, len(token_ids), token_ids)]
         raise ValueError(f"Unknown strategy {self.strategy}")
@@ -92,22 +109,66 @@ class ChunkRegistry:
             pos = end
         return chunks
 
+    def _adaptive_split(
+        self, token_ids: List[int], boundary_tokens: Set[int]
+    ) -> List[Tuple[int, int, List[int]]]:
+        """
+        Like _fixed_split, but nudges each split point to the nearest
+        sentence/clause boundary within ±boundary_window of the target.
+
+        Prefers the boundary token closest to the target split point.
+        Falls back to the fixed position if no boundary is found.
+        """
+        chunks = []
+        pos = 0
+        n = len(token_ids)
+        w = self.boundary_window
+
+        while pos < n:
+            target = pos + self.chunk_size
+            if target >= n:
+                # Last chunk — take whatever remains
+                slice_ids = token_ids[pos:]
+                if len(slice_ids) >= self.min_chunk_tokens:
+                    chunks.append((pos, n, slice_ids))
+                break
+
+            # Search [target - w, target + w] for a boundary token
+            lo = max(pos + self.min_chunk_tokens, target - w)
+            hi = min(n, target + w)
+
+            best = target  # fallback: exact fixed position
+            best_dist = w + 1
+
+            for i in range(lo, hi):
+                if token_ids[i] in boundary_tokens:
+                    # Split *after* the boundary token (i+1)
+                    dist = abs((i + 1) - target)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best = i + 1
+
+            end = min(best, n)
+            slice_ids = token_ids[pos:end]
+            if len(slice_ids) >= self.min_chunk_tokens:
+                chunks.append((pos, end, slice_ids))
+            pos = end
+
+        return chunks
+
     def _semantic_split(
-        self, token_ids: List[int], text: str
+        self,
+        token_ids: List[int],
+        text: str,
+        boundary_tokens: Optional[Set[int]] = None,
     ) -> List[Tuple[int, int, List[int]]]:
         """
         Use paragraph / double-newline boundaries as split points,
-        then fall back to fixed chunking if segments are too large.
-        Works purely on token positions by finding sentence-boundary
-        tokens (very approximate without a proper aligner).
-        For a prototype, we use fixed chunking at paragraph-size
-        aligned boundaries.
+        then fall back to fixed/adaptive chunking if segments are too large.
         """
-        # Without a true token→char aligner we approximate:
-        # find newline tokens in the sequence by guessing they appear
-        # roughly proportional to char positions.  Then enforce chunk_size
-        # as the max.
         if not text:
+            if self.boundary_window > 0 and boundary_tokens:
+                return self._adaptive_split(token_ids, boundary_tokens)
             return self._fixed_split(token_ids)
 
         # Split text on double newlines → get character offsets
@@ -124,15 +185,23 @@ class ChunkRegistry:
             )
         )
 
+        # Choose sub-split strategy for oversized segments
+        use_adaptive = self.boundary_window > 0 and boundary_tokens
+
+        def _subsplit(sub: List[int]) -> List[Tuple[int, int, List[int]]]:
+            if use_adaptive:
+                return self._adaptive_split(sub, boundary_tokens)
+            return self._fixed_split(sub)
+
         # Merge with chunk_size constraint
         boundaries = [0] + token_splits + [n_tokens]
         chunks = []
         for i in range(len(boundaries) - 1):
             start, end = boundaries[i], boundaries[i + 1]
             sub = token_ids[start:end]
-            # If sub-segment is too large, further split fixed
+            # If sub-segment is too large, further split
             if len(sub) > self.chunk_size:
-                for s, e, sl in self._fixed_split(sub):
+                for s, e, sl in _subsplit(sub):
                     chunks.append((start + s, start + e, sl))
             elif len(sub) >= self.min_chunk_tokens:
                 chunks.append((start, end, sub))

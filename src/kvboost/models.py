@@ -48,6 +48,8 @@ class CachedChunk:
     position_end: int           # absolute position of last token + 1
     prefix_hash: str = ""       # hash(parent_hash, tokens) — positional + contextual
     content_hash: str = ""      # hash(tokens) — content-only, position-independent
+    overlap_prefix_len: int = 0 # overlap tokens prepended during encoding (stripped before store)
+    sink_prefix_len: int = 0    # sink tokens prepended during encoding (stripped before store)
     created_at: float = field(default_factory=time.time)
     access_count: int = 0
     recomputed: bool = False    # True if boundary recompute was applied

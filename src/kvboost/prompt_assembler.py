@@ -52,18 +52,26 @@ class PromptAssembler:
     # Main entry point
     # ------------------------------------------------------------------
 
-    def assemble(self, token_ids: List[int]) -> AssembledPrompt:
+    def assemble(
+        self,
+        token_ids: List[int],
+        chunk_splits: Optional[List[Tuple[int, int, List[int]]]] = None,
+    ) -> AssembledPrompt:
         if self.mode == AssemblyMode.PREFIX_ONLY:
-            return self._prefix_only(token_ids)
-        return self._chunk_reuse(token_ids)
+            return self._prefix_only(token_ids, chunk_splits=chunk_splits)
+        return self._chunk_reuse(token_ids, chunk_splits=chunk_splits)
 
     # ------------------------------------------------------------------
     # Mode: prefix only (exact leading match)
     # ------------------------------------------------------------------
 
-    def _prefix_only(self, token_ids: List[int]) -> AssembledPrompt:
+    def _prefix_only(
+        self,
+        token_ids: List[int],
+        chunk_splits: Optional[List[Tuple[int, int, List[int]]]] = None,
+    ) -> AssembledPrompt:
         merged_kv, covered = self.cache.build_prefix_kv(
-            token_ids, self.registry.chunk_size
+            token_ids, self.registry.chunk_size, chunk_splits=chunk_splits,
         )
         live_ids = token_ids[covered:]
         live_pos = list(range(covered, len(token_ids)))
@@ -88,9 +96,15 @@ class PromptAssembler:
     # Mode: chunk reuse (any matching chunk, two-tier keying)
     # ------------------------------------------------------------------
 
-    def _chunk_reuse(self, token_ids: List[int]) -> AssembledPrompt:
+    def _chunk_reuse(
+        self,
+        token_ids: List[int],
+        chunk_splits: Optional[List[Tuple[int, int, List[int]]]] = None,
+    ) -> AssembledPrompt:
         chunk_size = self.registry.chunk_size
-        matching = self.cache.find_matching_chunks(token_ids, chunk_size)
+        matching = self.cache.find_matching_chunks(
+            token_ids, chunk_size, chunk_splits=chunk_splits,
+        )
 
         if not matching:
             return AssembledPrompt(

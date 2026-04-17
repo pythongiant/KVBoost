@@ -29,7 +29,7 @@ import enum
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -86,6 +86,12 @@ class InferenceEngine:
         kv_cache_bits: int = 16,
         disk_cache_dir: Optional[str] = None,
         device: Optional[str] = None,
+        # Adaptive boundary splitting
+        chunk_boundary_window: int = 0,
+        # Overlapping chunk encoding
+        overlap_k: int = 0,
+        # Attention sink (global memory prefix)
+        sink_tokens: int = 0,
     ):
         if device is None:
             device = default_device()
@@ -94,6 +100,13 @@ class InferenceEngine:
         self.tokenizer = tokenizer
         self.device = device
         self.recompute_strategy = RecomputeStrategy(recompute_strategy)
+        self.overlap_k = overlap_k
+        self.sink_tokens = sink_tokens
+
+        # Pre-compute boundary token IDs for adaptive splitting
+        self._boundary_tokens: Set[int] = (
+            self._compute_boundary_tokens() if chunk_boundary_window > 0 else set()
+        )
 
         # Sub-systems (CPU storage for cache tensors, move to device on use)
         self.cache_manager = KVCacheManager(
@@ -105,6 +118,7 @@ class InferenceEngine:
         self.chunk_registry = ChunkRegistry(
             chunk_size=chunk_size,
             strategy=ChunkStrategy.FIXED,
+            boundary_window=chunk_boundary_window,
         )
         self.assembler = PromptAssembler(
             cache_manager=self.cache_manager,
@@ -248,7 +262,9 @@ class InferenceEngine:
         # Load shared prefix KV from cache
         shared_kv = None
         if common_len > 0:
-            assembled = self.assembler.assemble(all_token_ids[0][:common_len + 1])
+            prefix_ids = all_token_ids[0][:common_len + 1]
+            splits = self._split_tokens(prefix_ids)
+            assembled = self.assembler.assemble(prefix_ids, chunk_splits=splits)
             shared_kv = assembled.cached_past_kv
             common_len = assembled.cached_length
 
@@ -401,17 +417,42 @@ class InferenceEngine:
         chunks_added = 0
         pos = position_offset
         parent_hash = None
+        prev_slice_ids: Optional[List[int]] = None
 
-        for start, end, slice_ids in self.chunk_registry.split(token_ids, text):
+        # Sink prefix: first S tokens of the full prompt
+        sink_prefix = token_ids[:self.sink_tokens] if self.sink_tokens > 0 else []
+
+        for start, end, slice_ids in self._split_tokens(token_ids, text):
             p_hash = chained_hash(slice_ids, parent_hash)
             c_hash = content_hash_from_tokens(slice_ids)
 
             if self.cache_manager.get(p_hash) is not None:
                 parent_hash = p_hash
+                prev_slice_ids = slice_ids
                 pos += len(slice_ids)
                 continue
 
-            kv = self._encode_to_kv(slice_ids, position_offset=pos)
+            # Build overlap prefix from previous chunk's tail
+            overlap_prefix: Optional[List[int]] = None
+            if self.overlap_k > 0 and prev_slice_ids is not None:
+                overlap_prefix = prev_slice_ids[-min(self.overlap_k, len(prev_slice_ids)):]
+
+            # Sink prefix: skip for chunk 0 (it already contains the sink tokens)
+            chunk_sink: Optional[List[int]] = None
+            if sink_prefix and pos > position_offset:
+                chunk_sink = sink_prefix
+
+            # Encode with prefix context; KV is already stripped to chunk's own tokens
+            if overlap_prefix or chunk_sink:
+                kv, overlap_len, sink_len = self._encode_to_kv_with_prefix(
+                    slice_ids, position_offset=pos,
+                    overlap_prefix=overlap_prefix,
+                    sink_prefix=chunk_sink,
+                )
+            else:
+                kv = self._encode_to_kv(slice_ids, position_offset=pos)
+                overlap_len, sink_len = 0, 0
+
             chunk = CachedChunk(
                 chunk_id=p_hash,
                 text=self.tokenizer.decode(slice_ids),
@@ -421,9 +462,12 @@ class InferenceEngine:
                 position_end=pos + len(slice_ids),
                 prefix_hash=p_hash,
                 content_hash=c_hash,
+                overlap_prefix_len=overlap_len,
+                sink_prefix_len=sink_len,
             )
             self.cache_manager.store(chunk)
             parent_hash = p_hash
+            prev_slice_ids = slice_ids
             pos += len(slice_ids)
             chunks_added += 1
 
@@ -521,8 +565,9 @@ class InferenceEngine:
         do_sample: bool,
     ) -> GenerationResult:
         """Standard prefix caching: reuse contiguous leading chunks."""
+        splits = self._split_tokens(token_ids)
         merged_kv, covered = self.cache_manager.build_prefix_kv(
-            token_ids, self.chunk_registry.chunk_size
+            token_ids, self.chunk_registry.chunk_size, chunk_splits=splits,
         )
         live_ids = token_ids[covered:]
         return self._decode_with_kv(
@@ -540,7 +585,8 @@ class InferenceEngine:
         cacheable_prefix_len: Optional[int] = None,
     ) -> GenerationResult:
         """Full chunk-level KV reuse + recompute (strategy-dependent)."""
-        assembled = self.assembler.assemble(token_ids)
+        splits = self._split_tokens(token_ids)
+        assembled = self.assembler.assemble(token_ids, chunk_splits=splits)
 
         # Apply recompute strategy when multiple chunks are stitched
         if len(assembled.chunk_boundaries) > 1:
@@ -696,6 +742,22 @@ class InferenceEngine:
     # Helpers
     # ------------------------------------------------------------------
 
+    def _compute_boundary_tokens(self) -> Set[int]:
+        """Find token IDs that correspond to sentence/clause boundary characters."""
+        result: Set[int] = set()
+        for char in ['.', '\n', ';', '?', '!', '\n\n']:
+            ids = self.tokenizer.encode(char, add_special_tokens=False)
+            result.update(ids)
+        return result
+
+    def _split_tokens(
+        self, token_ids: List[int], text: str = ""
+    ) -> List[Tuple[int, int, List[int]]]:
+        """Split token_ids using the registry, passing boundary tokens if available."""
+        return self.chunk_registry.split(
+            token_ids, text=text, boundary_tokens=self._boundary_tokens or None,
+        )
+
     def _encode(self, text: str) -> List[int]:
         return self.tokenizer.encode(text, add_special_tokens=True)
 
@@ -755,6 +817,73 @@ class InferenceEngine:
             return tuple((k.cpu(), v.cpu()) for k, v in zip(kv.key_cache, kv.value_cache))
         return tuple((layer[0].cpu(), layer[1].cpu()) for layer in kv)
 
+    def _encode_to_kv_with_prefix(
+        self,
+        token_ids: List[int],
+        position_offset: int = 0,
+        overlap_prefix: Optional[List[int]] = None,
+        sink_prefix: Optional[List[int]] = None,
+    ) -> Tuple[PastKVType, int, int]:
+        """
+        Encode token_ids with optional overlap and/or sink prefix context.
+
+        The prefix tokens are encoded alongside the chunk so seam tokens
+        see cross-chunk context (overlap) and global anchors (sink).
+        The prefix KV is then stripped — only the chunk's own KV is returned.
+
+        Position IDs:
+          sink tokens   → [0 .. sink_len-1]           (original positions)
+          overlap tokens→ [pos_offset-overlap_len .. pos_offset-1]
+          chunk tokens  → [pos_offset .. pos_offset+len(token_ids)-1]
+
+        Returns: (stripped_kv, overlap_len, sink_len)
+        """
+        overlap = overlap_prefix or []
+        sink = sink_prefix or []
+        prefix = sink + overlap
+        prefix_len = len(prefix)
+
+        if prefix_len == 0:
+            return self._encode_to_kv(token_ids, position_offset), 0, 0
+
+        full_ids = prefix + token_ids
+
+        # Build non-contiguous position IDs
+        sink_len = len(sink)
+        overlap_len = len(overlap)
+
+        sink_positions = list(range(0, sink_len))
+        overlap_start = max(0, position_offset - overlap_len)
+        overlap_positions = list(range(overlap_start, overlap_start + overlap_len))
+        chunk_positions = list(range(
+            position_offset, position_offset + len(token_ids)
+        ))
+        all_positions = sink_positions + overlap_positions + chunk_positions
+
+        input_ids = torch.tensor([full_ids], dtype=torch.long, device=self.device)
+        pos_ids = torch.tensor([all_positions], dtype=torch.long, device=self.device)
+
+        with torch.no_grad():
+            out = self.model(
+                input_ids=input_ids,
+                position_ids=pos_ids,
+                use_cache=True,
+            )
+
+        # Extract full KV to CPU
+        kv = out.past_key_values
+        if hasattr(kv, "layers"):
+            full_kv = tuple((l.keys.cpu(), l.values.cpu()) for l in kv.layers)
+        elif hasattr(kv, "key_cache") and hasattr(kv, "value_cache"):
+            full_kv = tuple((k.cpu(), v.cpu()) for k, v in zip(kv.key_cache, kv.value_cache))
+        else:
+            full_kv = tuple((layer[0].cpu(), layer[1].cpu()) for layer in kv)
+
+        # Strip prefix — keep only the chunk's own KV entries
+        stripped_kv = KVCacheManager.slice_kv(full_kv, prefix_len, prefix_len + len(token_ids))
+
+        return stripped_kv, overlap_len, sink_len
+
     def _store_prompt_chunks(
         self, token_ids: List[int], cacheable_prefix_len: Optional[int] = None,
     ) -> None:
@@ -768,7 +897,10 @@ class InferenceEngine:
         """
         pos = 0
         parent_hash = None
-        for start, end, slice_ids in self.chunk_registry.split(token_ids):
+        prev_slice_ids: Optional[List[int]] = None
+        sink_prefix = token_ids[:self.sink_tokens] if self.sink_tokens > 0 else []
+
+        for start, end, slice_ids in self._split_tokens(token_ids):
             p_hash = chained_hash(slice_ids, parent_hash)
             c_hash = content_hash_from_tokens(slice_ids)
             chunk_end = pos + len(slice_ids)
@@ -776,7 +908,26 @@ class InferenceEngine:
                 cacheable_prefix_len is None or chunk_end <= cacheable_prefix_len
             )
             if within_cacheable and self.cache_manager.get(p_hash) is None:
-                kv = self._encode_to_kv(slice_ids, position_offset=pos)
+                # Build overlap prefix from previous chunk's tail
+                overlap_prefix: Optional[List[int]] = None
+                if self.overlap_k > 0 and prev_slice_ids is not None:
+                    overlap_prefix = prev_slice_ids[-min(self.overlap_k, len(prev_slice_ids)):]
+
+                # Sink prefix: skip for chunk 0
+                chunk_sink: Optional[List[int]] = None
+                if sink_prefix and pos > 0:
+                    chunk_sink = sink_prefix
+
+                if overlap_prefix or chunk_sink:
+                    kv, overlap_len, sink_len = self._encode_to_kv_with_prefix(
+                        slice_ids, position_offset=pos,
+                        overlap_prefix=overlap_prefix,
+                        sink_prefix=chunk_sink,
+                    )
+                else:
+                    kv = self._encode_to_kv(slice_ids, position_offset=pos)
+                    overlap_len, sink_len = 0, 0
+
                 chunk = CachedChunk(
                     chunk_id=p_hash,
                     text=self.tokenizer.decode(slice_ids),
@@ -786,9 +937,12 @@ class InferenceEngine:
                     position_end=chunk_end,
                     prefix_hash=p_hash,
                     content_hash=c_hash,
+                    overlap_prefix_len=overlap_len,
+                    sink_prefix_len=sink_len,
                 )
                 self.cache_manager.store(chunk)
             parent_hash = p_hash
+            prev_slice_ids = slice_ids
             pos += len(slice_ids)
 
     @staticmethod

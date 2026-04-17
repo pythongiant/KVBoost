@@ -34,7 +34,7 @@ from .disk_tier import DiskTier
 from .batch import find_common_chunk_prefix, broadcast_kv, group_by_prefix
 from .compat import SUPPORTED_ARCHITECTURES, UNSUPPORTED_ARCHITECTURES, check_model_compatibility, default_device
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "KVBoost",

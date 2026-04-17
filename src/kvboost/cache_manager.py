@@ -218,53 +218,82 @@ class KVCacheManager:
         return None
 
     def build_prefix_kv(
-        self, token_ids: List[int], chunk_size: int
+        self,
+        token_ids: List[int],
+        chunk_size: int,
+        chunk_splits: Optional[List[Tuple[int, int, List[int]]]] = None,
     ) -> Tuple[Optional[PastKVType], int]:
         """
         Greedily assemble the longest cached prefix using chained hashes.
         Only exact matches are used (no approximate fallback for prefix mode).
+
+        If chunk_splits is provided (from adaptive/variable splitting),
+        uses those boundaries instead of fixed chunk_size stride.
         """
         chunks: List[CachedChunk] = []
-        pos = 0
         parent_hash = None
 
-        while pos + chunk_size <= len(token_ids):
-            slice_ids = token_ids[pos : pos + chunk_size]
-            p_hash = chained_hash(slice_ids, parent_hash)
-            chunk = self.get(p_hash)
-            if chunk is None:
-                break
-            chunks.append(chunk)
-            parent_hash = p_hash
-            pos += chunk_size
+        if chunk_splits is not None:
+            for start, end, slice_ids in chunk_splits:
+                p_hash = chained_hash(slice_ids, parent_hash)
+                chunk = self.get(p_hash)
+                if chunk is None:
+                    break
+                chunks.append(chunk)
+                parent_hash = p_hash
+        else:
+            pos = 0
+            while pos + chunk_size <= len(token_ids):
+                slice_ids = token_ids[pos : pos + chunk_size]
+                p_hash = chained_hash(slice_ids, parent_hash)
+                chunk = self.get(p_hash)
+                if chunk is None:
+                    break
+                chunks.append(chunk)
+                parent_hash = p_hash
+                pos += chunk_size
 
         if not chunks:
             return None, 0
 
+        covered = sum(c.length for c in chunks)
         merged = self.merge_kv_list([c.past_key_values for c in chunks])
-        return merged, pos
+        return merged, covered
 
     def find_matching_chunks(
-        self, token_ids: List[int], chunk_size: int
+        self,
+        token_ids: List[int],
+        chunk_size: int,
+        chunk_splits: Optional[List[Tuple[int, int, List[int]]]] = None,
     ) -> List[Tuple[int, ChunkMatch]]:
         """
         Scan for all matching chunks using two-tier lookup.
         Returns list of (start_pos, ChunkMatch) pairs in order.
         Each ChunkMatch carries approximate=True/False.
+
+        If chunk_splits is provided (from adaptive/variable splitting),
+        uses those boundaries instead of fixed chunk_size stride.
         """
         results = []
         parent_hash = None
 
-        for start in range(0, len(token_ids) - chunk_size + 1, chunk_size):
-            slice_ids = token_ids[start : start + chunk_size]
-            match = self.lookup(slice_ids, parent_hash)
-            if match is not None:
-                results.append((start, match))
-                # Chain the hash for the next chunk (use the exact prefix hash)
-                parent_hash = chained_hash(slice_ids, parent_hash)
-            else:
-                # Chain is broken — subsequent chunks can't be exact matches
-                parent_hash = None
+        if chunk_splits is not None:
+            for start, end, slice_ids in chunk_splits:
+                match = self.lookup(slice_ids, parent_hash)
+                if match is not None:
+                    results.append((start, match))
+                    parent_hash = chained_hash(slice_ids, parent_hash)
+                else:
+                    parent_hash = None
+        else:
+            for start in range(0, len(token_ids) - chunk_size + 1, chunk_size):
+                slice_ids = token_ids[start : start + chunk_size]
+                match = self.lookup(slice_ids, parent_hash)
+                if match is not None:
+                    results.append((start, match))
+                    parent_hash = chained_hash(slice_ids, parent_hash)
+                else:
+                    parent_hash = None
 
         return results
 
