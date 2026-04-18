@@ -8,6 +8,9 @@ dist/
 build/
 *.whl
 
+.claude/
+
+
 # Virtual environments
 env/
 venv/

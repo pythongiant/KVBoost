@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Chunk-level KV cache reuse for HuggingFace inference.</strong><br>
-  5-48x TTFT reduction on 3B+ models with repeated long context. 3 lines to integrate.
+  Reuse KV tensors across requests that share long prefixes. Drop-in on any HF causal LM.
 </p>
 
 <p align="center">
@@ -15,207 +15,153 @@
   <a href="https://kvboost.readthedocs.io/en/latest/"><img src="https://img.shields.io/readthedocs/kvboost" alt="Docs"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
   <a href="https://github.com/pythongiant/kvboost"><img src="https://img.shields.io/badge/platform-CUDA%20%7C%20MPS%20%7C%20CPU-orange" alt="Platform"></a>
-  <a href="https://github.com/pythongiant/kvboost/stargazers"><img src="https://img.shields.io/github/stars/pythongiant/kvboost?style=social" alt="Stars"></a>
 </p>
 
 <p align="center">
-  <a href="#-quick-start">Quick Start</a> &bull;
-  <a href="#-benchmarks">Benchmarks</a> &bull;
-  <a href="#-installation">Installation</a> &bull;
-  <a href="#-api-reference">API Reference</a> &bull;
-  <a href="#-examples">Examples</a> &bull;
+  <a href="#quick-start">Quick Start</a> &bull;
+  <a href="#benchmarks">Benchmarks</a> &bull;
   <a href="#how-it-works">How it works</a> &bull;
+  <a href="#when-kvboost-helps-and-when-it-doesnt">When it helps</a> &bull;
+  <a href="#api-reference">API</a> &bull;
   <a href="https://kvboost.readthedocs.io/en/latest/">Docs</a>
 </p>
 
 ---
 
-### When KVBoost Helps
+## TL;DR
 
-| Condition | Expected TTFT Speedup |
-|---|---|
-| Multi-turn conversation, 8+ turns, 3B+ model | **10-48x** |
-| Code context / document reuse, 800+ tokens | **15-21x** |
-| RAG document reuse, ~500 tokens | 1-2x |
-| System prompt reuse, ~250 tokens | 0.3-0.5x (overhead > savings) |
-| Any workload, 0.5B model | < 1x (overhead exceeds prefill) |
+- **What it is**: a library that caches the per-chunk KV tensors of your HF
+  model and reuses them across requests that share prefixes.
+- **What it gives you**: lower TTFT on repeated long context. Exact
+  magnitude depends on reuse ratio, context length, and model size.
+- **What it costs you**: a small accuracy tax on long-context reasoning
+  tasks, and extra RAM for the cache. Quantified below.
+- **What it is not**: a free speedup. Short prompts, small models, and
+  prompts with zero overlap will get slower, not faster.
 
-> **Rule of thumb:** Benefits appear on **3B+ models** with **500+ token shared
-> context**. Below this, caching overhead exceeds prefill savings. The peak 47.9x
-> is at 1350 tokens on Qwen2.5-3B — see [benchmarks](#benchmarks) for full data.
 ---
 
-## How it works
+## Headline results
 
-### What normally happens inside an LLM
+All numbers come from [`benchmarks_and_experiments/`](benchmarks_and_experiments/)
+and are reproducible from the scripts in that directory. We report what we
+actually measured, including the cases where KVBoost lost.
 
-When you send a prompt to a language model, the model reads every token
-before it can write anything back. Internally, each layer of the model
-computes two tensors for every token: a **key** and a **value** (K and V).
-These K/V tensors are what the model uses to "remember" earlier parts of
-the text when deciding what comes next. The full set of them is called the
-KV cache.
+### Bug-localization arena (Qwen2.5-3B, 720 samples, selective recompute + all continuity features)
 
-For a 3B-parameter model reading 1,000 tokens, that first read (called
-prefill) takes roughly 1-3 seconds on a MacBook. The K/V tensors are
-computed, used to generate the first output token, and then kept around so
-the model doesn't have to re-read the prompt for subsequent tokens. Each
-new output token just adds one more K/V pair to the cache. That part is
-fast.
+Dataset: `JetBrains-Research/lca-bug-localization`, 4-way multiple choice
+over code diffs (100–3K tokens).
 
-The problem is what happens on the *next request*. You send the same system
-prompt plus a different question. The model throws away everything from last
-time and reads the entire prompt again from scratch. Another 1-3 seconds of
-prefill, even though 90% of the prompt is identical. Multiply that by
-hundreds of requests and you're spending most of your GPU time re-reading
-text the model has already seen.
+| Metric                   | Baseline HF | KVBoost | Delta |
+|--------------------------|-------------|---------|-------|
+| Accuracy                 | 99.58%      | 97.36%  | **−2.22 pp** |
+| TTFT (mean)              | 8331 ms     | 4209 ms | **1.98× faster** |
+| Total latency (mean)     | 13476 ms    | 14445 ms| **0.93× (7% slower)** |
+| Logit cosine (min / mean)| —           | 1.000 / 1.000 | identical under greedy |
 
-### What KVBoost changes
+McNemar: 0 samples where baseline was wrong and KVBoost was right;
+16 samples where baseline was right and KVBoost was wrong. The accuracy
+cost is real and one-sided.
 
-KVBoost saves those K/V tensors after each request and reuses them on the
-next one. The mechanics of how it does that have a few moving parts, because
-"just save and reload" has correctness problems that will silently produce
-wrong outputs if you're not careful.
+**What this means.** Prefill gets meaningfully faster (2× TTFT). Total
+wall-clock gets slightly worse here because this benchmark generates short
+MC answers, so the decode phase dominates and KVBoost's extra stitching
+work shows up. For workloads that generate longer answers, TTFT savings
+translate directly into total speedup.
 
-### Step 1: Split the prompt into chunks
+### Accuracy vs. KV reuse (same run)
 
-`ChunkRegistry.split()` in [chunk_registry.py](src/kvboost/chunk_registry.py)
-walks through the token list and cuts it into fixed-size blocks (default 128
-tokens). A 1,000-token prompt becomes 7 full chunks plus a 104-token tail.
+Accuracy is close to baseline at low reuse and degrades as reuse climbs.
+This is the honest picture: the more of the prompt you serve from cached
+chunks, the more likely a downstream token depends on context the seam
+repair didn't fully reconstruct.
 
-### Step 2: Hash each chunk (two hashes, not one)
+| Reuse bucket | N   | Accuracy | TTFT speedup |
+|--------------|-----|----------|--------------|
+| ~0.0         | 360 | 99.44%   | 1.24×        |
+| ~0.2         | 16  | 100.00%  | 0.90×        |
+| ~0.3         | 15  | 100.00%  | 1.62×        |
+| ~0.4         | 26  | 100.00%  | 3.25×        |
+| ~0.5         | 34  | 100.00%  | 2.61×        |
+| ~0.6         | 46  | 100.00%  | 3.08×        |
+| ~0.7         | 66  | 95.45%   | 3.56×        |
+| ~0.8         | 81  | 91.36%   | 4.04×        |
+| ~0.9         | 73  | 90.41%   | 7.57×        |
+| ~1.0         | 3   | 100.00%  | 29.23×       |
 
-Each chunk gets two identifiers, computed in [models.py](src/kvboost/models.py):
+### Context-length scaling (earlier 820-sample checkpoint, same workload)
 
-```
-prefix_hash  = SHA256(previous_chunk's_hash + this_chunk's_token_bytes)
-content_hash = SHA256(this_chunk's_token_bytes)
-```
+Speedup and reuse both grow with context length; the short-context bucket
+is essentially free of accuracy loss, and the hit concentrates in the
+1K–4K bucket where reuse is highest.
 
-Why two? Suppose the sentence "The transformer architecture uses
-self-attention" appears as chunk 3 in conversation A and chunk 1 in
-conversation B. The tokens are identical, so the content hash is the same.
-But the prefix hash is different because conversation A's hash includes
-chunks 1 and 2 chained before it.
+| Context   | N   | Base acc | KV acc | Δ acc  | Base TTFT | KV TTFT  | Speedup | Reuse |
+|-----------|-----|----------|--------|--------|-----------|----------|---------|-------|
+| 0–512     | 200 | 100.0%   | 100.0% | +0.0%  | 387 ms    | 243 ms   | 2.3×    | 21%   |
+| 512–1K    | 200 | 99.5%    | 98.0%  | −1.5%  | 4521 ms   | 2309 ms  | 3.5×    | 33%   |
+| 1K–2K     | 200 | 99.0%    | 96.0%  | −3.0%  | 9134 ms   | 5255 ms  | 4.1×    | 40%   |
+| 2K–4K     | 200 | 98.5%    | 92.0%  | −6.5%  | 26 075 ms | 10 909 ms| 11.2×   | 44%   |
+| 4K+       | 20  | 100.0%   | 90.0%  | −10.0% | 73 791 ms | 39 428 ms| 29.0×   | 42%   |
+| **All**   | 820 | 99.3%    | 96.3%  | −2.9%  | 11 584 ms | 5527 ms  | 5.8×    | 35%   |
 
-This matters because the K/V tensors for that sentence in conversation A
-were computed with the model having already read conversation A's earlier
-text. Those tensors encode "what these tokens mean, given everything before
-them." Loading them into conversation B, where the preceding text is
-completely different, would be wrong.
+Takeaway: you buy 2–29× TTFT with 0–10 points of task accuracy, and the
+trade sharpens with context length. If you are latency-bound on long
+prompts, this is usually a good deal; if you are accuracy-bound on long
+reasoning, it is not.
 
-The prefix hash is the primary lookup key. It only matches when the tokens
-*and* all preceding chunks are identical. The content hash is a fallback.
-It matches on the tokens alone but flags the result as "approximate" so the
-engine knows the stored data needs full correction, not just light touch-up.
+---
 
-### Step 3: Look up what's already cached
+## When KVBoost helps (and when it doesn't)
 
-`KVCacheManager.find_matching_chunks()` in
-[cache_manager.py](src/kvboost/cache_manager.py) tries the prefix hash
-first. If that misses, it checks the content hash via a secondary index.
-The result comes back wrapped in a `ChunkMatch` object that carries an
-`approximate` flag (True if it was a content-hash fallback).
+| Workload                                                  | Expect             |
+|-----------------------------------------------------------|--------------------|
+| Multi-turn conversation, 3B+ model, repeated system prompt| **~2× TTFT**       |
+| Code/doc Q&A with repeated code context, 1K–4K tokens     | **3–11× TTFT**     |
+| Very long shared context (4K+)                            | **up to ~29× TTFT**|
+| RAG with mostly-unique documents (~500 tok, low reuse)    | roughly break-even |
+| Short prompts (<500 tok) or <1B models                    | **slower** than baseline |
+| One-shot prompts with no shared prefix                    | slower (pure overhead) |
 
-The cache itself is a Python `OrderedDict`. When it fills up, eviction is
-frequency-based: chunks that appeared in many requests (your system prompt)
-have a high count and stay put. Chunks that appeared once (a one-off
-document) stay at count 1 and get evicted first.
+Rules of thumb:
 
-### Step 4: Separate cached tokens from live tokens
+1. **You need reuse.** If successive prompts share nothing, KVBoost adds
+   hashing and bookkeeping for no gain. `% zero reuse: 50%` in the bug
+   run above is why the mean total latency was a wash.
+2. **Prefill has to be expensive enough to amortize the overhead.** On a
+   0.5B model or a 200-token prompt, prefill is already cheap. KVBoost
+   cannot beat "just run it."
+3. **Accuracy-critical long-context work needs testing.** Run
+   `verify_correctness()` on your own prompts before shipping; don't
+   assume the bug-localization numbers transfer.
 
-`PromptAssembler` in [prompt_assembler.py](src/kvboost/prompt_assembler.py)
-takes the cache lookup results and splits the prompt into two regions: the
-prefix covered by cache hits (stored K/V data exists) and the "live" tail
-(new tokens that the model hasn't seen before).
+---
 
-If chunks 1-7 all hit cache and only the last 104 tokens are new, those 104
-tokens are the only ones the model needs to process. The cached K/V tensors
-for the first 896 tokens get loaded from memory instead of recomputed.
-
-### Step 5: Fix the stitching errors
-
-This is the part that makes the difference between "works" and "produces
-subtly wrong text."
-
-Each cached chunk was processed independently when it was first created.
-Token 129 (first token of chunk 2) never attended to token 1 (first token of
-chunk 1) during that original computation. Its K/V values reflect a model
-that only saw tokens 1-128, not the full prompt. When you stitch chunks 1
-and 2 together and hand them to the model as if they were one continuous
-sequence, those values at the boundaries are slightly off.
-
-KVBoost has two ways to correct this, configured via `recompute_strategy`:
-
-**`"selective"`** (the default) re-runs the model on the last 16 tokens at
-each chunk boundary, this time with all preceding chunks visible. The
-corrected K/V values replace the stale ones. Simple, but it only fixes
-boundary tokens. A token in the middle of chunk 3 that happens to depend
-on something in chunk 1 won't get corrected.
-
-**`"cacheblend"`** takes a different approach. It runs one forward pass
-through the entire stitched K/V, computes the cosine distance between each
-token's stored values and what the values would be with full context, and
-recomputes only the ~15% of tokens with the highest deviation. This catches
-problems inside chunks, not just at edges. The implementation is in
-[cacheblend.py](src/kvboost/cacheblend.py).
-
-If any chunk was an approximate match (content hash hit, not prefix hash),
-CacheBlend runs automatically regardless of your configured strategy. When
-the position encodings are wrong, boundary-only repair isn't enough.
-
-### Step 6: Run the model on the live tokens only
-
-The corrected cached K/V and the live suffix tokens go into a single
-`model.forward()` call in [engine.py](src/kvboost/engine.py). HuggingFace
-models accept a `past_key_values` argument that tells them "pretend you
-already processed this many tokens." The model reads the live tokens,
-attends to the cached K/V as context, and produces the first z∑output token.
-From there, autoregressive decoding continues token by token as normal.
-
-After generation finishes, `_store_prompt_chunks()` saves any chunks that
-weren't already in cache. So the next request with overlapping text will
-hit cache without needing an explicit `warm()` call.
-
-### Why it produces identical outputs
-
-Under greedy decoding (temperature=0, always pick the highest-probability
-token), the K/V tensors from a cached-and-corrected path are mathematically
-equivalent to the K/V tensors from a full re-read. The argmax token at
-every step is the same. The benchmarks verify this by running both paths
-on the same prompts and comparing outputs token by token.
-
-Under sampling (temperature > 0), the outputs aren't identical because
-sampling is inherently random. But the probability distributions are the
-same, which you can verify by measuring KL divergence between the two
-paths' logit distributions.
-
-### Where the data lives
-
-Cached K/V tensors sit in a Python dict in CPU RAM by default. When the
-model needs them, they're moved to the GPU.
-
-If you set `kv_cache_bits=8`, the tensors get compressed to int8 before
-storage. Keys are quantized per-channel, values per-token (the asymmetry
-from the KIVI paper, ICML 2024). This halves RAM usage with near-zero
-accuracy loss. `kv_cache_bits=4` is available for 4x compression but
-should be validated with `verify_correctness()` first.
-
-When the in-memory cache fills up, evicted chunks are written to a single
-pre-allocated binary file on disk. A JSON index maps chunk hashes to byte
-offsets in that file. When a disk-tier chunk gets a cache hit, it's read
-back and promoted to RAM.
-
-> Full API docs: [kvboost.readthedocs.io](https://kvboost.readthedocs.io/en/latest/)
-
-
-## Installation
+## Quick start
 
 ```bash
 pip install kvboost
 ```
 
-**From source:**
+```python
+from kvboost import KVBoost
+
+engine = KVBoost.from_pretrained("Qwen/Qwen2.5-3B")
+
+# Warm the shared prefix once
+engine.warm("You are a helpful coding assistant. Always be concise...")
+
+# Subsequent generates reuse cached chunks automatically
+result = engine.generate(
+    "You are a helpful coding assistant. Always be concise...\n\n"
+    "User: How do I reverse a linked list?\nAssistant:",
+    max_new_tokens=128,
+)
+
+print(result.output_text)
+print(f"TTFT: {result.ttft_ms:.1f} ms | reuse: {result.kv_reuse_ratio:.0%}")
+```
+
+From source:
 
 ```bash
 git clone https://github.com/pythongiant/kvboost.git
@@ -223,32 +169,195 @@ cd kvboost
 pip install -e .
 ```
 
-**Requirements:** Python >= 3.9, PyTorch >= 2.1, Transformers >= 4.38
+Requirements: Python ≥ 3.9, PyTorch ≥ 2.1, Transformers ≥ 4.38.
 
 ---
 
-## Quick Start
+## How it works
+
+The core idea is one sentence: **split the prompt into fixed-size chunks,
+hash them, and on the next request load the K/V tensors for chunks you
+have already computed instead of recomputing them.** Everything else is
+making that produce correct outputs.
+
+### 1. Chunking
+
+[`chunk_registry.py`](src/kvboost/chunk_registry.py) splits the token
+stream into fixed-size blocks (default 128). A 1000-token prompt becomes
+7 full chunks plus a 104-token tail. With `--chunk-boundary-window=16`
+the cut point slides up to ±16 tokens to avoid splitting mid-sentence,
+which reduces seam error on natural-language prompts.
+
+### 2. Two-level hashing
+
+Each chunk gets two keys (see [`models.py`](src/kvboost/models.py)):
+
+```
+prefix_hash  = SHA256(previous_chunk.prefix_hash || this_chunk.tokens)
+content_hash = SHA256(this_chunk.tokens)
+```
+
+The prefix hash only matches when the tokens *and every preceding chunk*
+are identical — this is the case where stored K/V is directly usable.
+The content hash is a fallback: the tokens match but the history doesn't,
+so the stored K/V is approximately right but needs heavier correction.
+
+### 3. Lookup and assembly
+
+[`KVCacheManager.find_matching_chunks()`](src/kvboost/cache_manager.py)
+tries prefix hash, then falls back to content hash, and flags approximate
+matches. [`PromptAssembler`](src/kvboost/prompt_assembler.py) then splits
+the prompt into a cached prefix (K/V loaded from memory) and a live
+suffix (tokens the model still has to process).
+
+Cache storage is an `OrderedDict` in CPU RAM with frequency-based
+eviction; frequently-reused chunks (your system prompt) stay resident,
+one-off chunks get evicted first. Overflow spills to a pre-allocated
+binary file via [`disk_tier.py`](src/kvboost/disk_tier.py).
+
+### 4. Seam repair
+
+This is the part that makes stitching correct. Each cached chunk was
+originally computed without seeing the chunks now preceding it in the new
+prompt, so its K/V values are slightly wrong at the boundaries.
+
+KVBoost has two strategies (`recompute_strategy=`):
+
+- **`selective`** (default) re-runs the model on the last `R` tokens at
+  each seam with the preceding cached context visible, and overwrites the
+  stale K/V. Cheap but only fixes the boundary.
+  ([`selective_recompute.py`](src/kvboost/selective_recompute.py))
+- **`cacheblend`** does one forward pass, measures per-token cosine
+  deviation vs. what the K/V would be with full context, and recomputes
+  only the ~15% most-deviated tokens. Catches mid-chunk errors selective
+  misses. ([`cacheblend.py`](src/kvboost/cacheblend.py))
+
+Approximate (content-hash) matches force CacheBlend regardless of the
+chosen strategy — position encodings are wrong in that case and
+boundary-only repair is not enough.
+
+Two optional continuity features stack on top of either strategy:
+
+- `--overlap-k=16`: each chunk re-encodes the last K tokens of the
+  previous chunk, so seam tokens always see K tokens of real preceding
+  context at store time.
+- `--sink-tokens=32`: always keep the first N tokens (the "attention
+  sink") fully fresh, since many attention heads anchor on them.
+
+### 5. Forward pass
+
+The corrected cached K/V and the live suffix go into a single
+`model.forward(past_key_values=...)` call in
+[`engine.py`](src/kvboost/engine.py). Autoregressive decoding then
+proceeds normally. After generation, any newly-seen chunks are written
+back to the cache so the next request with overlapping text hits without
+an explicit `warm()`.
+
+### 6. Correctness guarantees
+
+Under **greedy decoding**, the cached-and-corrected path is designed to
+produce the argmax-equivalent token at every step — which matches what
+the benchmark's `cosine = 1.000` columns show on the KV-side logits.
+Despite this, *task* accuracy still drifts by a few points at high reuse.
+Why? Because "argmax matches at step 1" does not guarantee "full
+generation matches" — small K/V perturbations can tilt later tokens onto
+a different branch. The accuracy-by-reuse table is the ground truth;
+treat the logit-cosine metric as a necessary but not sufficient check.
+
+Under **sampling** (temperature > 0), outputs differ run-to-run by
+construction; the meaningful check is distributional (KL between logit
+distributions), not token-identity.
+
+### Optional: KV quantization
+
+`kv_cache_bits=8` quantizes cached tensors (per-channel for K,
+per-token for V — the KIVI-paper asymmetry) for ~2× RAM savings with
+minimal accuracy loss. `kv_cache_bits=4` is available for 4× but you
+should validate it with `verify_correctness()` on your workload before
+trusting it.
+
+---
+
+## Benchmarks
+
+All runners live under [`benchmarks_and_experiments/`](benchmarks_and_experiments/).
+The main ones:
+
+| Script                                    | What it measures                              |
+|-------------------------------------------|-----------------------------------------------|
+| `long_bench_arena.py`                     | Paired accuracy + latency on code bug-loc MC  |
+| `01_scale_models.py`                      | TTFT across 1.1B / 3B / 7B on shared workloads|
+| `02_latency_breakdown.py`                 | Where time goes (hash, lookup, recompute, fwd)|
+| `03_hyperparameter_sweep.py`              | Chunk size, recompute window, strategy sweep  |
+| `04_output_quality.py`                    | Logit cosine, KL, output-identity stats       |
+| `05_realistic_workloads.py`               | Multi-turn, RAG, system-prompt scenarios      |
+| `06_memory_analysis.py`                   | RAM / disk footprint vs. cache size           |
+| `10_statistical_rigor.py`                 | McNemar, bootstrap CIs on paired runs         |
+| `run_ablation.sh`                         | Adaptive / overlap / sink / recompute ablation|
+
+Reproduce the headline numbers:
+
+```bash
+cd benchmarks_and_experiments
+python long_bench_arena.py \
+    --model Qwen/Qwen2.5-3B \
+    --n-samples 1000 \
+    --recompute-strategy selective \
+    --chunk-boundary-window 16 \
+    --overlap-k 16 \
+    --sink-tokens 32 \
+    --output results/ablation_all_selective.json
+```
+
+Raw JSON outputs are in
+[`benchmarks_and_experiments/results/`](benchmarks_and_experiments/results/).
+
+---
+
+## API reference
+
+Minimum surface:
 
 ```python
-from kvboost import KVBoost
+KVBoost.from_pretrained(
+    model_name_or_path: str,
+    recompute_strategy: Literal["selective", "cacheblend", "none"] = "selective",
+    chunk_size: int = 128,
+    kv_cache_bits: Optional[Literal[4, 8]] = None,
+    device: Optional[str] = None,          # "cuda" | "mps" | "cpu"
+    ...
+) -> KVBoost
 
-# 1. Load any HuggingFace causal LM
-engine = KVBoost.from_pretrained("Qwen/Qwen2.5-3B")
-
-# 2. Cache your system prompt / document / few-shot examples once
-engine.warm("You are a helpful coding assistant. Always provide concise answers...")
-
-# 3. Generate -- cached prefix is reused automatically
-result = engine.generate(
-    "You are a helpful coding assistant. Always provide concise answers...\n\n"
-    "User: How do I reverse a linked list?\n"
-    "Assistant:",
-    max_new_tokens=128,
-)
-
-print(result.output_text)
-print(f"TTFT: {result.ttft_ms:.1f}ms | Cache reuse: {result.kv_reuse_ratio:.0%}")
+engine.warm(text: str) -> WarmResult
+engine.generate(prompt: str, max_new_tokens: int = ..., **kwargs) -> GenerationResult
+engine.verify_correctness(prompts: list[str], ...) -> CorrectnessReport
 ```
+
+`GenerationResult` exposes `output_text`, `ttft_ms`, `total_ms`,
+`kv_reuse_ratio`, and the token-level traces used by the benchmarks.
+
+Full docs: [kvboost.readthedocs.io](https://kvboost.readthedocs.io/en/latest/)
+
+---
+
+## Limitations and known sharp edges
+
+- **Accuracy tax scales with reuse.** At >70% reuse, expect 5–10 points
+  of accuracy loss on hard long-context tasks. Validate on your own
+  data.
+- **Total-latency can regress on short-output workloads.** TTFT wins
+  don't show up in wall-clock if you generate 5 tokens. The 3B bug-loc
+  MC run is the clearest example.
+- **No free lunch on small models.** Below ~1B params, or below ~500
+  tokens of shared context, the hashing and stitching cost dominates.
+- **Greedy-equivalent ≠ task-equivalent.** Logit cosine 1.0 still
+  coexists with a 2.2pp accuracy gap — a perturbation that doesn't flip
+  the first argmax can still flip token 40.
+- **`kv_cache_bits=4` is unvalidated for your workload by default.**
+  Run `verify_correctness()` first.
+
+---
+
 ## License
 
 [MIT](LICENSE)

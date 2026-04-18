@@ -12,7 +12,7 @@ To install a specific version:
 
 .. code-block:: bash
 
-   pip install kvboost==0.2.0
+   pip install kvboost==0.3.0
 
 From Source
 -----------
@@ -29,7 +29,7 @@ Verify Installation
 .. code-block:: python
 
    import kvboost
-   print(kvboost.__version__)  # 0.2.0
+   print(kvboost.__version__)  # 0.3.0
 
 Requirements
 ------------
@@ -57,7 +57,8 @@ For running benchmarks against MLX LLM:
 
    pip install mlx-lm
 
-For running accuracy benchmarks (HellaSwag, ARC, MMLU, GSM8K, TruthfulQA):
+For the LongBench Arena harness and accuracy benchmarks (HellaSwag, ARC,
+MMLU, GSM8K, TruthfulQA, LongBench v1/v2):
 
 .. code-block:: bash
 

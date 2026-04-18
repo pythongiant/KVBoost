@@ -33,7 +33,10 @@ Module Responsibilities
 
 **ChunkRegistry** (``chunk_registry.py``)
    Splits token sequences into cacheable chunks. Supports fixed-size,
-   semantic (paragraph-aligned), and document-level strategies.
+   semantic (paragraph-aligned), and document-level strategies. With
+   ``boundary_window > 0``, splits are nudged to nearby
+   sentence/clause boundaries so seams don't cut mid-sentence (see
+   :doc:`../guide/continuity`).
 
 **KVCacheManager** (``cache_manager.py``)
    Two-tier storage (hot RAM + cold disk) with two-tier keying
@@ -54,7 +57,10 @@ Module Responsibilities
 
 **InferenceEngine** (``engine.py``)
    Ties everything together. Exposes ``generate()``, ``generate_batch()``,
-   ``generate_many()``, ``warm()``, and ``verify_correctness()``.
+   ``generate_many()``, ``warm()``, and ``verify_correctness()``. Hosts
+   the cross-chunk continuity knobs (``overlap_k``, ``sink_tokens``,
+   ``chunk_boundary_window``) that prepend context while encoding each
+   chunk and strip it back before storing the KV.
 
 Supporting Modules
 ------------------

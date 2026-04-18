@@ -61,6 +61,23 @@ Memory-Efficient Mode
        recompute_strategy="cacheblend",  # smarter recompute
    )
 
+Long-Context Mode
+-----------------
+
+For long documents where fixed-size chunking would cut mid-sentence or
+strand later chunks from the document's attention sinks, turn on the
+continuity features added in 0.3.0 (see :doc:`guide/continuity`):
+
+.. code-block:: python
+
+   engine = KVBoost.from_pretrained(
+       "Qwen/Qwen2.5-3B",
+       chunk_boundary_window=16,     # snap splits to sentence boundaries
+       overlap_k=16,                 # encode each chunk with 16-token overlap
+       sink_tokens=32,               # carry the first 32 tokens as a global prefix
+       recompute_strategy="cacheblend",
+   )
+
 When Does It Help?
 ------------------
 
@@ -68,16 +85,21 @@ When Does It Help?
    :header-rows: 1
 
    * - Condition
-     - Expected TTFT Speedup
-   * - Multi-turn, 8+ turns, 3B+ model
-     - **10-48x**
-   * - Code/doc reuse, 800+ tokens
-     - **15-21x**
-   * - RAG, ~500 tokens
-     - 1-2x
-   * - System prompt, ~250 tokens
-     - 0.3-0.5x (overhead)
-   * - Any workload, 0.5B model
-     - <1x (overhead)
+     - Benefit
+   * - Multi-turn chat, 3B+ model, shared system prompt
+     - High: prefix-hash hits grow with history length.
+   * - Long-context retrieval / multi-hop QA (1K-4K tokens)
+     - High: this is the bucket the 0.3.0 continuity features target.
+   * - Document / code reuse, 800+ tokens
+     - High: non-prefix interior reuse via content-hash fallback.
+   * - RAG with short context (~500 tokens)
+     - Marginal: caching overhead is a larger share of total time.
+   * - System prompt only, ~250 tokens
+     - Net negative: overhead exceeds prefill savings.
+   * - Any workload, <1B model
+     - Net negative: prefill is already cheap.
 
-Rule of thumb: benefits appear on **3B+ models** with **500+ token shared context**.
+Rule of thumb: benefits appear on **3B+ models** with **500+ token
+shared context**. See :doc:`benchmarks/overview` for the LongBench Arena
+harness that produces per-bucket TTFT, accuracy, and reuse numbers on
+your own hardware.

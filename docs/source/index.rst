@@ -3,7 +3,9 @@ KVBoost
 
 **Chunk-level KV cache reuse for faster HuggingFace inference.**
 
-5-48x TTFT reduction on 3B+ models with repeated long context.
+Drop-in speedup for 3B+ models on repeated long context, with cross-chunk
+continuity knobs (adaptive boundaries, overlap encoding, attention sinks)
+for accuracy on long documents.
 
 .. code-block:: python
 
@@ -26,6 +28,7 @@ KVBoost
    :caption: User Guide
 
    guide/recompute
+   guide/continuity
    guide/quantization
    guide/batch
    guide/disk
