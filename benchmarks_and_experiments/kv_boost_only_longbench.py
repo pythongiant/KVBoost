@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-KVBoost Benchmark — vLLM Prefix Caching on Code Bug Localization
-=================================================================
-Evaluates vLLM prefix-caching performance on
+KVBoost Benchmark — KVBoost-only on Code Bug Localization
+==========================================================
+Evaluates KVBoost prefix-caching performance on
 JetBrains-Research/lca-bug-localization (Python split).
 
 Dataset: Each sample has a code diff (100-3K tokens) + issue description.
@@ -12,16 +12,16 @@ Task:    Given the diff context and bug report, pick which file was changed
 Methodology:
   1. Load bug localization samples, convert to MC format
   2. Paired queries per diff:
-     a. Q1 (cold): populates vLLM's prefix cache
-     b. Q2 (warm): reuses cached prefix KVs
-  3. Measure: accuracy, TTFT (cold vs warm), total latency
+     a. Q1 (cold): populates the KVBoost cache with diff prefix KVs
+     b. Q2 (warm): reuses cached prefix, different distractors + phrasing
+  3. Measure: accuracy, TTFT (cold vs warm), KV reuse ratio
   4. McNemar's test for cold vs warm accuracy difference
 
 Usage:
-  python long_bench_vllm.py                           # 50 samples, Qwen2.5-3B
-  python long_bench_vllm.py --n-samples 200
-  python long_bench_vllm.py --model meta-llama/Llama-3.2-3B
-  python long_bench_vllm.py --verbose
+  python long_bench_kvboost.py                        # 50 samples, Qwen2.5-3B
+  python long_bench_kvboost.py --n-samples 200
+  python long_bench_kvboost.py --model meta-llama/Llama-3.2-3B
+  python long_bench_kvboost.py --verbose
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("longbench_vllm")
+log = logging.getLogger("longbench_kvboost")
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 LETTERS = "ABCD"
@@ -85,8 +85,11 @@ class SampleResult:
 
     ttft_ms: float = 0.0
     total_ms: float = 0.0
-    is_warm: bool = False        # True = q2 (prefix cache warm), False = q1 (cold)
-    answer_position: int = 0
+    kv_reuse_ratio: float = 0.0
+    cached_tokens: int = 0
+
+    is_warm: bool = False       # True = q2 (cache warm), False = q1 (cold)
+    answer_position: int = 0    # Which ABCD slot holds the gold answer
 
 
 @dataclass
@@ -105,9 +108,10 @@ class BucketResult:
     avg_cold_total_ms: float = 0.0
     avg_warm_total_ms: float = 0.0
 
+    avg_kv_reuse_ratio: float = 0.0
     avg_context_tokens: float = 0.0
-    mcnemar_pvalue: Optional[float] = None
 
+    mcnemar_pvalue: Optional[float] = None
     samples: List[SampleResult] = field(default_factory=list)
 
 
@@ -122,11 +126,11 @@ def load_bug_localization(
     Load JetBrains-Research/lca-bug-localization (py) and convert to MC format.
 
     Each diff produces two queries:
-      q1 (cold) — populates vLLM prefix cache with the diff KV blocks
-      q2 (warm) — reuses cached prefix, different distractors and question phrasing
+      q1 (cold) — populates the KVBoost prefix cache with diff KV blocks
+      q2 (warm) — reuses cached prefix, different distractors and phrasing
 
-    FIX: q2's correct answer is forced into a different ABCD slot than q1's
-    to eliminate warm-cache positional bias.
+    q2's correct answer is forced into a different ABCD slot than q1's to
+    eliminate warm-cache positional bias toward whichever slot came first in q1.
     """
     from datasets import load_dataset
     from transformers import AutoTokenizer
@@ -197,7 +201,7 @@ def load_bug_localization(
     rng = np.random.RandomState(42)
 
     def _bucket_key(t: int) -> str:
-        if t < 512:   return "0-512"
+        if t < 512:    return "0-512"
         elif t < 1024: return "512-1K"
         elif t < 2048: return "1K-2K"
         elif t < 4096: return "2K-4K"
@@ -248,7 +252,7 @@ def load_bug_localization(
             "context_tokens": raw["ctx_tokens"],
         }
 
-        # Q1 (cold)
+        # Q1 (cold) — populates the KVBoost prefix cache
         d1 = distractor_pool[:3]
         choices_1 = d1 + [correct_file]
         rng.shuffle(choices_1)
@@ -265,7 +269,7 @@ def load_bug_localization(
             "is_warm": False,
         })
 
-        # Q2 (warm) — guarantee different answer slot from q1
+        # Q2 (warm) — guarantee different answer slot from q1 to avoid positional bias
         d2 = distractor_pool[3:6]
         choices_2 = d2 + [correct_file]
         rng.shuffle(choices_2)
@@ -299,13 +303,14 @@ def load_bug_localization(
         f"  Token range: {min(ctx_lens)}–{max(ctx_lens)} "
         f"(median={int(np.median(ctx_lens))}, mean={int(np.mean(ctx_lens))})"
     )
+    log.info(f"  q2 answer positions debiased (guaranteed ≠ q1 slot)")
     return samples
 
 
 # ── Prompt formatting ─────────────────────────────────────────────
 
 def format_prompt_prefix(context: str) -> str:
-    """Cacheable prefix: shared across q1/q2 of a pair."""
+    """Cacheable prefix: identical across q1/q2, so KVBoost can reuse its KVs."""
     return (
         "Read the following code diff and answer the question.\n\n"
         f"--- BEGIN DIFF ---\n{context}\n--- END DIFF ---\n\n"
@@ -313,7 +318,7 @@ def format_prompt_prefix(context: str) -> str:
 
 
 def format_prompt_suffix(question: str, choices: List[str]) -> str:
-    """Non-cacheable suffix: always fresh-prefilled."""
+    """Non-cacheable suffix: always fresh-prefilled to avoid q1→q2 choice bleed."""
     parts = [f"{question}\n"]
     for i, choice in enumerate(choices):
         parts.append(f"{LETTERS[i]}. {choice}")
@@ -341,106 +346,106 @@ def extract_letter_answer(text: str) -> Optional[str]:
     return None
 
 
-# ── vLLM runner ───────────────────────────────────────────────────
+# ── KVBoost runner ────────────────────────────────────────────────
 
-class VLLMRunner:
+class KVBoostRunner:
     """
-    Wraps vLLM's LLM for single-sample generation with TTFT measurement.
+    Runs KVBoost inference for cold (q1) and warm (q2) queries.
 
-    Prefix caching is always enabled so q2's diff prefix blocks are served
-    from the KV cache populated by q1. The suffix (question + choices) is
-    never shared, so it always goes through fresh prefill — no positional
-    bleed from q1's choices.
+    Q1 resets the cache and runs CHUNK_KV_REUSE, storing only the
+    cacheable diff prefix (not the per-query suffix) so q2 can reuse
+    the diff KVs without picking up q1's choice-position state.
+
+    Q2 runs CHUNK_KV_REUSE with the warm cache — the diff prefix is
+    served from cache, only the suffix is freshly prefilled.
     """
 
     def __init__(
         self,
         model_name: str,
-        max_model_len: int,
-        gpu_memory_utilization: float = 0.90,
-        tensor_parallel_size: int = 1,
-        dtype: str = "auto",
-        enforce_eager: bool = True,
-        max_new_tokens: int = 16,
+        chunk_size: int = 128,
+        recompute_strategy: str = "selective",
+        chunk_boundary_window: int = 0,
+        overlap_k: int = 0,
+        sink_tokens: int = 0,
     ):
-        from vllm import LLM, SamplingParams
+        from kvboost import KVBoost, GenerationMode
 
-        # enforce_eager=True disables CUDA graph capture, freeing ~0.5 GiB
-        # that would otherwise be reserved for graph pools — critical on 8GB GPUs.
+        self.GenerationMode = GenerationMode
+
         log.info(
-            f"Loading vLLM engine: {model_name}  "
-            f"(prefix_caching=ENABLED, enforce_eager={enforce_eager}, "
-            f"max_model_len={max_model_len}, dtype={dtype})"
+            f"Loading KVBoost model: {model_name} "
+            f"(chunk_size={chunk_size}, strategy={recompute_strategy}, "
+            f"boundary_window={chunk_boundary_window}, overlap_k={overlap_k}, "
+            f"sink_tokens={sink_tokens})"
         )
-        self.llm = LLM(
-            model=model_name,
-            max_model_len=max_model_len,
-            enable_prefix_caching=True,
-            enforce_eager=enforce_eager,
-            gpu_memory_utilization=gpu_memory_utilization,
-            tensor_parallel_size=tensor_parallel_size,
-            dtype=dtype,
-            trust_remote_code=True,
+        self.engine = KVBoost.from_pretrained(
+            model_name,
+            chunk_size=chunk_size,
+            recompute_overlap=16,
+            recompute_strategy=recompute_strategy,
+            chunk_boundary_window=chunk_boundary_window,
+            overlap_k=overlap_k,
+            sink_tokens=sink_tokens,
         )
-        self.sampling_params = SamplingParams(
-            max_tokens=max_new_tokens,
-            temperature=0.0,
-            top_p=1.0,
-        )
-        log.info("  vLLM engine ready")
+        log.info(f"  Ready on {self.engine.device}")
 
-    def generate(self, prompt: str) -> dict:
-        """
-        Generate from a single prompt.
-        Returns output text, TTFT, and total latency in milliseconds.
-        """
-        wall_start = time.perf_counter()
-        outputs = self.llm.generate([prompt], self.sampling_params)
-        wall_total_ms = (time.perf_counter() - wall_start) * 1000
-
-        output = outputs[0]
-        text = output.outputs[0].text
-
-        # Pull TTFT from vLLM metrics when available
-        metrics = getattr(output, "metrics", None)
-        if metrics is not None:
-            first_token = getattr(metrics, "first_token_time", None)
-            first_sched = getattr(metrics, "first_scheduled_time", None)
-            finished    = getattr(metrics, "finished_time", None)
-
-            if first_token is not None and first_sched is not None:
-                ttft_ms = (first_token - first_sched) * 1000
-            else:
-                ttft_ms = wall_total_ms
-
-            if finished is not None and first_sched is not None:
-                total_ms = (finished - first_sched) * 1000
-            else:
-                total_ms = wall_total_ms
-        else:
-            ttft_ms = wall_total_ms
-            total_ms = wall_total_ms
-
-        return {
-            "output": text,
-            "ttft_ms": max(ttft_ms, 0.0),
-            "total_ms": max(total_ms, 0.0),
-        }
+    def reset_cache(self):
+        self.engine.reset_cache()
 
     def count_tokens(self, text: str) -> int:
-        return len(self.llm.get_tokenizer().encode(text, add_special_tokens=True))
+        return len(self.engine.tokenizer.encode(text, add_special_tokens=True))
+
+    def cacheable_prefix_len(self, prefix: str) -> int:
+        """Token count of the diff-only prefix — caps what gets cached."""
+        return len(self.engine.tokenizer.encode(prefix, add_special_tokens=True))
+
+    def _run(
+        self,
+        prompt: str,
+        max_tokens: int = 16,
+        cacheable_prefix_len: Optional[int] = None,
+    ) -> dict:
+        start = time.perf_counter()
+        result = self.engine.generate(
+            prompt,
+            max_new_tokens=max_tokens,
+            mode=self.GenerationMode.CHUNK_KV_REUSE,
+            do_sample=False,
+            temperature=1.0,
+            cacheable_prefix_len=cacheable_prefix_len,
+        )
+        total_ms = (time.perf_counter() - start) * 1000
+        return {
+            "output": result.output_text,
+            "ttft_ms": getattr(result, "ttft_ms", total_ms),
+            "total_ms": total_ms,
+            "kv_reuse_ratio": getattr(result, "kv_reuse_ratio", 0.0),
+            "cached_tokens": getattr(result, "cached_tokens", 0),
+        }
+
+    def run_cold(self, prompt: str, max_tokens: int = 16, cacheable_prefix_len: Optional[int] = None) -> dict:
+        """Cold run: cache is empty, diff prefix is stored for q2 to reuse."""
+        return self._run(prompt, max_tokens=max_tokens, cacheable_prefix_len=cacheable_prefix_len)
+
+    def run_warm(self, prompt: str, max_tokens: int = 16, cacheable_prefix_len: Optional[int] = None) -> dict:
+        """Warm run: diff prefix already in cache, only suffix is prefilled."""
+        return self._run(prompt, max_tokens=max_tokens, cacheable_prefix_len=cacheable_prefix_len)
 
 
 # ── Checkpoint helpers ────────────────────────────────────────────
 
 def get_checkpoint_path(
-    model_name: str, n_samples: int, max_model_len: int
+    model_name: str,
+    n_samples: int,
+    max_context_tokens: int,
+    recompute_strategy: str = "selective",
 ) -> Path:
     import hashlib
     h = hashlib.md5(
-        f"{model_name}_{n_samples}_{max_model_len}".encode()
+        f"{model_name}_{n_samples}_{max_context_tokens}_{recompute_strategy}".encode()
     ).hexdigest()[:8]
-    return CHECKPOINT_DIR / f"vllm_checkpoint_{h}.json"
+    return CHECKPOINT_DIR / f"kvboost_checkpoint_{h}.json"
 
 
 def save_checkpoint(
@@ -449,13 +454,13 @@ def save_checkpoint(
     samples: List[dict],
     processed_indices: List[int],
     model_name: str = "",
-    max_model_len: int = 0,
+    max_context_tokens: int = 0,
 ):
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "timestamp": time.time(),
         "model_name": model_name,
-        "max_model_len": max_model_len,
+        "max_context_tokens": max_context_tokens,
         "n_total_samples": len(samples),
         "n_processed": len(processed_indices),
         "processed_indices": processed_indices,
@@ -473,6 +478,8 @@ def save_checkpoint(
                 "correct": s.correct,
                 "ttft_ms": s.ttft_ms,
                 "total_ms": s.total_ms,
+                "kv_reuse_ratio": s.kv_reuse_ratio,
+                "cached_tokens": s.cached_tokens,
                 "is_warm": s.is_warm,
                 "answer_position": s.answer_position,
             }
@@ -493,7 +500,8 @@ def save_checkpoint(
 
 
 def load_checkpoint_by_sample_id(
-    checkpoint_path: Path, current_samples: List[dict]
+    checkpoint_path: Path,
+    current_samples: List[dict],
 ) -> tuple[List[SampleResult], List[int]]:
     if not checkpoint_path.exists():
         return [], []
@@ -524,6 +532,8 @@ def load_checkpoint_by_sample_id(
                         correct=d["correct"],
                         ttft_ms=d["ttft_ms"],
                         total_ms=d["total_ms"],
+                        kv_reuse_ratio=d["kv_reuse_ratio"],
+                        cached_tokens=d["cached_tokens"],
                         is_warm=d["is_warm"],
                         answer_position=d.get("answer_position", 0),
                     ))
@@ -544,10 +554,10 @@ def load_checkpoint_by_sample_id(
         return [], []
 
 
-# ── Bucket helpers ────────────────────────────────────────────────
+# ── Bucket helper ─────────────────────────────────────────────────
 
 def get_bucket(n_tokens: int) -> str:
-    if n_tokens < 512:   return "0-512"
+    if n_tokens < 512:    return "0-512"
     elif n_tokens < 1024: return "512-1K"
     elif n_tokens < 2048: return "1K-2K"
     elif n_tokens < 4096: return "2K-4K"
@@ -559,66 +569,72 @@ def get_bucket(n_tokens: int) -> str:
 def run_benchmark(
     model_name: str,
     n_samples: int,
-    max_model_len: int,
-    gpu_memory_utilization: float = 0.90,
-    tensor_parallel_size: int = 1,
-    dtype: str = "auto",
-    enforce_eager: bool = True,
+    chunk_size: int = 128,
+    max_context_tokens: int = 8192,
+    recompute_strategy: str = "selective",
+    chunk_boundary_window: int = 0,
+    overlap_k: int = 0,
+    sink_tokens: int = 0,
     no_checkpoint: bool = False,
 ) -> Dict[str, BucketResult]:
     print(f"\n{'=' * 75}")
-    print(f"  BUG LOCALIZATION BENCHMARK — vLLM Prefix Caching")
+    print(f"  BUG LOCALIZATION BENCHMARK — KVBoost")
     print(f"{'=' * 75}")
-    print(f"  Dataset:           JetBrains-Research/lca-bug-localization (py)")
-    print(f"  Model:             {model_name}")
-    print(f"  Samples (pairs):   {n_samples} diffs → {n_samples*2} queries")
-    print(f"  Max model len:     {max_model_len}")
-    print(f"  Prefix caching:    ENABLED")
-    print(f"  Enforce eager:     {'YES (no CUDA graphs, saves ~0.5 GiB)' if enforce_eager else 'NO (CUDA graphs enabled)'}")
-    print(f"  GPU mem util:      {gpu_memory_utilization:.0%}")
-    print(f"  Tensor parallel:   {tensor_parallel_size}")
-    print(f"  Dtype:             {dtype}")
+    print(f"  Dataset:            JetBrains-Research/lca-bug-localization (py)")
+    print(f"  Model:              {model_name}")
+    print(f"  Samples (pairs):    {n_samples} diffs → {n_samples*2} queries")
+    print(f"  Max context tokens: {max_context_tokens}")
+    print(f"  Chunk size:         {chunk_size}")
+    print(f"  Recompute strategy: {recompute_strategy}")
+    print(f"  Boundary window:    {chunk_boundary_window}")
+    print(f"  Overlap K:          {overlap_k}")
+    print(f"  Sink tokens:        {sink_tokens}")
     print(f"{'=' * 75}\n")
 
-    samples = load_bug_localization(n_samples, max_model_len - 256, model_name)
+    samples = load_bug_localization(n_samples, max_context_tokens, model_name)
     if not samples:
         log.error("No samples loaded.")
         return {}
 
-    runner = VLLMRunner(
-        model_name=model_name,
-        max_model_len=max_model_len,
-        gpu_memory_utilization=gpu_memory_utilization,
-        tensor_parallel_size=tensor_parallel_size,
-        dtype=dtype,
-        enforce_eager=enforce_eager,
+    runner = KVBoostRunner(
+        model_name,
+        chunk_size=chunk_size,
+        recompute_strategy=recompute_strategy,
+        chunk_boundary_window=chunk_boundary_window,
+        overlap_k=overlap_k,
+        sink_tokens=sink_tokens,
     )
 
-    # Pair groups: {group_id: [q1_idx, q2_idx]}
     pair_groups: Dict[int, List[int]] = defaultdict(list)
     for idx, sample in enumerate(samples):
         pair_groups[sample["pair_group"]].append(idx)
 
     n_pairs = sum(1 for v in pair_groups.values() if len(v) > 1)
-    print(f"  {n_pairs} cold→warm pairs for prefix-cache TTFT measurement")
+    print(f"  {n_pairs} cold→warm pairs for KV reuse testing")
+    print(f"  Q1 populates cache, Q2 reuses cached diff prefix")
     print(f"  q2 answer slots debiased (guaranteed ≠ q1 slot)\n")
 
     # Dataset distribution
     bucket_counts: Dict[str, list] = defaultdict(list)
     for s in samples:
         bucket_counts[get_bucket(s["context_tokens"])].append(s)
-    print(f"  {'Bucket':<10} {'Queries':>8} {'Min':>6} {'Max':>6} {'Median':>7}")
-    print(f"  {'-'*10} {'-'*8} {'-'*6} {'-'*6} {'-'*7}")
+    print(f"  Dataset Bucket Distribution:")
+    print(f"  {'Bucket':<10} {'Queries':>8} {'Min':>6} {'Max':>6} {'Median':>7} {'Mean':>7}")
+    print(f"  {'-'*10} {'-'*8} {'-'*6} {'-'*6} {'-'*7} {'-'*7}")
     for bk in ["0-512", "512-1K", "1K-2K", "2K-4K", "4K+"]:
         bd = bucket_counts.get(bk, [])
-        if not bd: continue
+        if not bd:
+            continue
         toks = [s["context_tokens"] for s in bd]
-        print(f"  {bk:<10} {len(bd):>8} {min(toks):>6} {max(toks):>6} {int(np.median(toks)):>7}")
+        print(
+            f"  {bk:<10} {len(bd):>8} {min(toks):>6} {max(toks):>6} "
+            f"{int(np.median(toks)):>7} {int(np.mean(toks)):>7}"
+        )
     print()
 
-    # Checkpoint resume
+    # Checkpoint
     checkpoint_path = get_checkpoint_path(
-        model_name, n_samples, max_model_len
+        model_name, n_samples, max_context_tokens, recompute_strategy
     )
     if not no_checkpoint:
         all_results, processed_indices = load_checkpoint_by_sample_id(checkpoint_path, samples)
@@ -627,70 +643,60 @@ def run_benchmark(
     processed_set = set(processed_indices)
 
     if processed_set:
-        print(f"  Resuming from checkpoint: {len(processed_indices)} samples already done")
+        print(f"  Resuming from checkpoint: {len(processed_indices)} samples done")
         print(f"  (use --no-checkpoint to start fresh)\n")
-
-    # Ordered indices: q1 always before q2 within each pair
-    ordered_indices = []
-    for gid in sorted(pair_groups.keys()):
-        ordered_indices.extend(pair_groups[gid])
 
     results_by_bucket: Dict[str, List[SampleResult]] = defaultdict(list)
     for sr in all_results:
         results_by_bucket[get_bucket(sr.context_tokens)].append(sr)
 
-    total_start = time.perf_counter()
+    ordered_indices = []
+    for gid in sorted(pair_groups.keys()):
+        ordered_indices.extend(pair_groups[gid])
+
     import gc
+    total_start = time.perf_counter()
 
     from tqdm import tqdm
     for i in tqdm(ordered_indices, desc="Benchmarking", unit="query"):
         if i in processed_set:
             continue
         if i < 0 or i >= len(samples):
-            log.warning(f"Invalid sample index {i} — skipping")
+            log.warning(f"Invalid index {i} — skipping")
             continue
 
         sample = samples[i]
         context = sample["context"]
-        context_tokens = sample["context_tokens"]
-        prompt = format_prompt(context, sample["question"], sample["choices"])
-        prompt_tokens = runner.count_tokens(prompt)
-        bucket = get_bucket(context_tokens)
+        context_tokens = sample.get("context_tokens", runner.count_tokens(context))
         is_warm = sample["is_warm"]
 
+        # Reset cache at the start of each pair so q1 always starts cold
+        if not is_warm:
+            runner.reset_cache()
+
+        prefix_text = format_prompt_prefix(context)
+        suffix_text = format_prompt_suffix(sample["question"], sample["choices"])
+        prompt = prefix_text + suffix_text
+        prefix_len = runner.cacheable_prefix_len(prefix_text)
+        prompt_tokens = runner.count_tokens(prompt)
+        bucket = get_bucket(context_tokens)
+        query_type = "WARM" if is_warm else "COLD"
+
         try:
-            result = runner.generate(prompt)
-        except Exception as e:
-            e_str = str(e).lower()
-            # vLLM v1 kills the EngineCore subprocess on OOM and raises
-            # EngineDeadError (not RuntimeError), so we catch broadly and
-            # re-raise anything that isn't memory-related.
-            is_oom = (
-                "out of memory" in e_str
-                or "enginedeaderror" in type(e).__name__.lower()
-                or "enginedead" in e_str
-                or "cuda out of memory" in e_str
-            )
-            if is_oom:
-                log.warning(
-                    f"OOM at {context_tokens} tokens (prompt={prompt_tokens} tok) — "
-                    f"skipping. The vLLM engine is dead; remaining samples will be "
-                    f"skipped too. Re-run with --max-model-len 4096 to avoid this."
-                )
-                # Save checkpoint before exiting so progress isn't lost
-                try:
-                    save_checkpoint(
-                        all_results, checkpoint_path, samples, processed_indices,
-                        model_name=model_name, max_model_len=max_model_len,
-                    )
-                except Exception:
-                    pass
-                break  # Engine is dead — can't continue, but checkpoint is saved
+            if is_warm:
+                result = runner.run_warm(prompt, max_tokens=16, cacheable_prefix_len=prefix_len)
+            else:
+                result = runner.run_cold(prompt, max_tokens=16, cacheable_prefix_len=prefix_len)
+        except RuntimeError as e:
+            if "Invalid buffer size" in str(e) or "out of memory" in str(e).lower():
+                log.warning(f"OOM at {context_tokens} tokens — skipping pair")
+                runner.reset_cache()
+                gc.collect()
+                continue
             raise
 
         pred = extract_letter_answer(result["output"])
         correct = pred == sample["answer"]
-        query_type = "WARM" if is_warm else "COLD"
 
         sr = SampleResult(
             sample_id=sample["id"],
@@ -705,6 +711,8 @@ def run_benchmark(
             correct=correct,
             ttft_ms=result["ttft_ms"],
             total_ms=result["total_ms"],
+            kv_reuse_ratio=result["kv_reuse_ratio"],
+            cached_tokens=result["cached_tokens"],
             is_warm=is_warm,
             answer_position=sample.get("answer_position", LETTERS.index(sample["answer"])),
         )
@@ -718,74 +726,68 @@ def run_benchmark(
             try:
                 save_checkpoint(
                     all_results, checkpoint_path, samples, processed_indices,
-                    model_name=model_name, max_model_len=max_model_len,
+                    model_name=model_name, max_context_tokens=max_context_tokens,
                 )
             except Exception as e:
                 log.error(f"Checkpoint save failed: {e}")
 
-        # Running stats every 4 samples
         if len(all_results) % 4 == 0:
             n_done = len(all_results)
-            overall_acc = sum(s.correct for s in all_results) / n_done
-            cold = [s for s in all_results if not s.is_warm]
-            warm = [s for s in all_results if s.is_warm]
-            cold_acc = sum(s.correct for s in cold) / len(cold) if cold else 0
-            warm_acc = sum(s.correct for s in warm) / len(warm) if warm else 0
+            cold_srs = [s for s in all_results if not s.is_warm]
+            warm_srs = [s for s in all_results if s.is_warm]
+            cold_acc = sum(s.correct for s in cold_srs) / len(cold_srs) if cold_srs else 0
+            warm_acc = sum(s.correct for s in warm_srs) / len(warm_srs) if warm_srs else 0
+            avg_reuse = np.mean([s.kv_reuse_ratio for s in all_results])
             print(
                 f"  [{n_done}/{len(samples)}] [{query_type}] ctx={context_tokens:>5}tok "
-                f"TTFT={result['ttft_ms']:>7.0f}ms "
-                f"acc: cold={cold_acc:.0%} warm={warm_acc:.0%} overall={overall_acc:.0%}"
+                f"TTFT={result['ttft_ms']:>7.0f}ms reuse={result['kv_reuse_ratio']:.0%} "
+                f"avg_reuse={avg_reuse:.0%} "
+                f"acc: cold={cold_acc:.0%} warm={warm_acc:.0%}"
             )
-
-    # Final checkpoint
-    if all_results and len(all_results) % CHECKPOINT_INTERVAL != 0:
-        try:
-            save_checkpoint(
-                all_results, checkpoint_path, samples, processed_indices,
-                model_name=model_name, max_model_len=max_model_len,
-            )
-        except Exception as e:
-            log.error(f"Final checkpoint save failed: {e}")
 
     total_time = time.perf_counter() - total_start
     log.info(f"Benchmark completed in {total_time:.1f}s")
 
+    if all_results and len(all_results) % CHECKPOINT_INTERVAL != 0:
+        try:
+            save_checkpoint(
+                all_results, checkpoint_path, samples, processed_indices,
+                model_name=model_name, max_context_tokens=max_context_tokens,
+            )
+        except Exception as e:
+            log.error(f"Final checkpoint save failed: {e}")
+
     # ── Compute bucket results ──────────────────────────────────────
-    bucket_results: Dict[str, BucketResult] = {}
     results_by_bucket["ALL"] = all_results
+    bucket_results: Dict[str, BucketResult] = {}
 
-    LOW_N = 20
-
-    for bucket_name, bucket_srs in sorted(results_by_bucket.items()):
-        if not bucket_srs:
+    for bucket_name, bsrs in sorted(results_by_bucket.items()):
+        if not bsrs:
             continue
+        cold_srs = [s for s in bsrs if not s.is_warm]
+        warm_srs = [s for s in bsrs if s.is_warm]
 
-        cold_srs = [s for s in bucket_srs if not s.is_warm]
-        warm_srs = [s for s in bucket_srs if s.is_warm]
+        cold_acc  = sum(s.correct for s in cold_srs) / len(cold_srs) if cold_srs else 0.0
+        warm_acc  = sum(s.correct for s in warm_srs) / len(warm_srs) if warm_srs else 0.0
+        overall   = sum(s.correct for s in bsrs) / len(bsrs)
 
-        cold_acc  = sum(s.correct for s in cold_srs) / len(cold_srs) if cold_srs else 0
-        warm_acc  = sum(s.correct for s in warm_srs) / len(warm_srs) if warm_srs else 0
-        overall   = sum(s.correct for s in bucket_srs) / len(bucket_srs)
+        avg_cold_ttft  = np.mean([s.ttft_ms for s in cold_srs]) if cold_srs else 0.0
+        avg_warm_ttft  = np.mean([s.ttft_ms for s in warm_srs]) if warm_srs else 0.0
+        speedup = avg_cold_ttft / avg_warm_ttft if avg_warm_ttft > 0 else 0.0
 
-        avg_cold_ttft  = np.mean([s.ttft_ms for s in cold_srs]) if cold_srs else 0
-        avg_warm_ttft  = np.mean([s.ttft_ms for s in warm_srs]) if warm_srs else 0
-        speedup = avg_cold_ttft / avg_warm_ttft if avg_warm_ttft > 0 else 0
+        avg_cold_total = np.mean([s.total_ms for s in cold_srs]) if cold_srs else 0.0
+        avg_warm_total = np.mean([s.total_ms for s in warm_srs]) if warm_srs else 0.0
 
-        avg_cold_total = np.mean([s.total_ms for s in cold_srs]) if cold_srs else 0
-        avg_warm_total = np.mean([s.total_ms for s in warm_srs]) if warm_srs else 0
-        avg_ctx        = np.mean([s.context_tokens for s in bucket_srs])
+        avg_reuse = np.mean([s.kv_reuse_ratio for s in bsrs])
+        avg_ctx   = np.mean([s.context_tokens for s in bsrs])
 
-        # McNemar: cold-correct-but-warm-wrong vs warm-correct-but-cold-wrong
-        # Match by pair_group is unavailable here (results are flat), so use
-        # overall counts as an approximation. For a proper paired test,
-        # merge by pair_group in post-processing.
         cold_only = max(0, round(len(cold_srs) * cold_acc) - round(len(warm_srs) * warm_acc))
         warm_only = max(0, round(len(warm_srs) * warm_acc) - round(len(cold_srs) * cold_acc))
         mcnemar_p = mcnemar_pvalue(cold_only, warm_only)
 
         bucket_results[bucket_name] = BucketResult(
             bucket_name=bucket_name,
-            n_samples=len(bucket_srs),
+            n_samples=len(bsrs),
             cold_accuracy=cold_acc,
             warm_accuracy=warm_acc,
             overall_accuracy=overall,
@@ -794,9 +796,10 @@ def run_benchmark(
             avg_ttft_speedup=speedup,
             avg_cold_total_ms=avg_cold_total,
             avg_warm_total_ms=avg_warm_total,
+            avg_kv_reuse_ratio=avg_reuse,
             avg_context_tokens=avg_ctx,
             mcnemar_pvalue=mcnemar_p,
-            samples=bucket_srs,
+            samples=bsrs,
         )
 
     return bucket_results
@@ -804,15 +807,12 @@ def run_benchmark(
 
 # ── Summary report ────────────────────────────────────────────────
 
-def print_summary(
-    bucket_results: Dict[str, BucketResult],
-    verbose: bool = False,
-):
-    print(f"\n{'=' * 85}")
-    print(f"  BUG LOCALIZATION — vLLM Results  (prefix_caching=ENABLED)")
-    print(f"{'=' * 85}\n")
-
+def print_summary(bucket_results: Dict[str, BucketResult], verbose: bool = False):
     LOW_N = 20
+
+    print(f"\n{'=' * 85}")
+    print(f"  BUG LOCALIZATION RESULTS — KVBoost")
+    print(f"{'=' * 85}\n")
 
     # Accuracy table
     print(
@@ -835,12 +835,12 @@ def print_summary(
             f"{r.warm_accuracy:>8.1%} {delta:>+7.1%} {p_str:>9} {verdict:>8}{marker}{low_n_flag}"
         )
 
-    # TTFT speedup table
+    # TTFT + reuse table
     print(
         f"\n  {'Bucket':<10} {'N':>5} {'Avg Ctx':>8} {'Cold TTFT':>10} "
-        f"{'Warm TTFT':>10} {'Speedup':>8}"
+        f"{'Warm TTFT':>10} {'Speedup':>8} {'KV Reuse':>9}"
     )
-    print(f"  {'-'*10} {'-'*5} {'-'*8} {'-'*10} {'-'*10} {'-'*8}")
+    print(f"  {'-'*10} {'-'*5} {'-'*8} {'-'*10} {'-'*10} {'-'*8} {'-'*9}")
 
     for name in ["0-512", "512-1K", "1K-2K", "2K-4K", "4K+", "ALL"]:
         if name not in bucket_results:
@@ -850,52 +850,75 @@ def print_summary(
         print(
             f"  {name:<10} {r.n_samples:>5} {r.avg_context_tokens:>7.0f} "
             f"{r.avg_cold_ttft_ms:>9.0f}ms {r.avg_warm_ttft_ms:>9.0f}ms "
-            f"{r.avg_ttft_speedup:>7.1f}x{marker}"
+            f"{r.avg_ttft_speedup:>7.1f}x {r.avg_kv_reuse_ratio:>8.0%}{marker}"
         )
+
+    # KV reuse distribution
+    if "ALL" in bucket_results:
+        all_srs = bucket_results["ALL"].samples
+        reuse_ratios = [s.kv_reuse_ratio for s in all_srs]
+        print(f"\n  KV Reuse Ratio Distribution:")
+        stats_fn = [
+            ("Mean",   np.mean),
+            ("Median", np.median),
+            ("P25",    lambda x: np.percentile(x, 25)),
+            ("P75",    lambda x: np.percentile(x, 75)),
+            ("Min",    np.min),
+            ("Max",    np.max),
+        ]
+        for label, fn in stats_fn:
+            print(f"    {label:<8} {fn(reuse_ratios):.1%}")
+        high = [s for s in all_srs if s.kv_reuse_ratio >= 0.8]
+        if high:
+            print(f"    High reuse (>=80%): {len(high)}/{len(all_srs)} samples")
 
     # Query-type breakdown
     if "ALL" in bucket_results:
         all_srs = bucket_results["ALL"].samples
         cold_srs = [s for s in all_srs if not s.is_warm]
         warm_srs = [s for s in all_srs if s.is_warm]
-
         print(f"\n  Query-Type Breakdown:")
-        print(f"  {'Type':<10} {'N':>5} {'Accuracy':>9} {'Avg TTFT':>10} {'Avg Total':>10}")
+        print(f"  {'Type':<10} {'N':>5} {'Accuracy':>9} {'Avg TTFT':>10} {'Avg Reuse':>10}")
         print(f"  {'-'*10} {'-'*5} {'-'*9} {'-'*10} {'-'*10}")
         for label, srs in [("Cold (q1)", cold_srs), ("Warm (q2)", warm_srs)]:
-            if not srs: continue
+            if not srs:
+                continue
             acc = sum(s.correct for s in srs) / len(srs)
             avg_ttft = np.mean([s.ttft_ms for s in srs])
-            avg_total = np.mean([s.total_ms for s in srs])
-            print(
-                f"  {label:<10} {len(srs):>5} {acc:>8.1%} "
-                f"{avg_ttft:>9.0f}ms {avg_total:>9.0f}ms"
-            )
+            avg_reuse = np.mean([s.kv_reuse_ratio for s in srs])
+            print(f"  {label:<10} {len(srs):>5} {acc:>8.1%} {avg_ttft:>9.0f}ms {avg_reuse:>9.0%}")
 
-    # TTFT distribution for warm queries
+    # Conditional accuracy: KVBoost in its intended operating regime
     if "ALL" in bucket_results:
         all_srs = bucket_results["ALL"].samples
-        warm_srs = [s for s in all_srs if s.is_warm]
-        if warm_srs:
-            warm_ttfts = [s.ttft_ms for s in warm_srs]
-            cold_ttfts = [s.ttft_ms for s in all_srs if not s.is_warm]
-            print(f"\n  TTFT Distribution:")
-            print(f"  {'Stat':<12} {'Cold (q1)':>12} {'Warm (q2)':>12}")
-            print(f"  {'-'*12} {'-'*12} {'-'*12}")
-            stats_fn = [
-                ("Mean",   np.mean),
-                ("Median", np.median),
-                ("P25",    lambda x: np.percentile(x, 25)),
-                ("P75",    lambda x: np.percentile(x, 75)),
-                ("Min",    np.min),
-                ("Max",    np.max),
-            ]
-            for stat_name, fn in stats_fn:
-                c_val = fn(cold_ttfts) if cold_ttfts else 0
-                w_val = fn(warm_ttfts)
-                print(f"  {stat_name:<12} {c_val:>10.0f}ms {w_val:>10.0f}ms")
+        print(f"\n  Conditional Accuracy:")
+        print(
+            f"  {'Condition':<30} {'N':>5} {'Cold Acc':>9} {'Warm Acc':>9} "
+            f"{'Delta':>8} {'KV Reuse':>9}"
+        )
+        print(f"  {'-'*30} {'-'*5} {'-'*9} {'-'*9} {'-'*8} {'-'*9}")
 
-    # Answer-position accuracy (surfaces slot bias)
+        conditions = [
+            ("reuse > 0%",      [s for s in all_srs if s.kv_reuse_ratio > 0]),
+            ("reuse >= 50%",    [s for s in all_srs if s.kv_reuse_ratio >= 0.5]),
+            ("reuse >= 80%",    [s for s in all_srs if s.kv_reuse_ratio >= 0.8]),
+            ("ctx >= 512 tok",  [s for s in all_srs if s.context_tokens >= 512]),
+            ("ctx >= 1K tok",   [s for s in all_srs if s.context_tokens >= 1024]),
+        ]
+        for label, subset in conditions:
+            if not subset:
+                continue
+            cold_sub = [s for s in subset if not s.is_warm]
+            warm_sub = [s for s in subset if s.is_warm]
+            c_acc = sum(s.correct for s in cold_sub) / len(cold_sub) if cold_sub else 0
+            w_acc = sum(s.correct for s in warm_sub) / len(warm_sub) if warm_sub else 0
+            avg_reuse = np.mean([s.kv_reuse_ratio for s in subset])
+            print(
+                f"  {label:<30} {len(subset):>5} {c_acc:>8.1%} "
+                f"{w_acc:>8.1%} {w_acc-c_acc:>+7.1%} {avg_reuse:>8.0%}"
+            )
+
+    # Answer-position accuracy (slot bias check)
     if "ALL" in bucket_results:
         all_srs = bucket_results["ALL"].samples
         print(f"\n  Accuracy by Answer Slot (bias check):")
@@ -903,7 +926,8 @@ def print_summary(
         print(f"  {'-'*6} {'-'*7} {'-'*6} {'-'*8} {'-'*8}")
         for pos in range(4):
             slot_srs = [s for s in all_srs if s.answer_position == pos]
-            if not slot_srs: continue
+            if not slot_srs:
+                continue
             n_c = sum(s.correct for s in slot_srs)
             print(
                 f"  {pos:<6} {LETTERS[pos]:<7} {len(slot_srs):>6} "
@@ -917,24 +941,20 @@ def print_summary(
         if errors:
             from collections import Counter
             print(f"\n  Error Distribution by Predicted Letter:")
-            letter_counts = Counter(s.predicted or "?" for s in errors)
-            for letter in sorted(letter_counts):
-                count = letter_counts[letter]
-                bar = "█" * count
-                print(f"    {letter}: {count:>3} / {len(errors)}  {bar}")
-            a_rate = letter_counts.get("A", 0) / max(len(errors), 1)
-            if a_rate > 0.5:
-                print(f"    ⚠ A-bias: {letter_counts['A']}/{len(errors)} errors predict A")
+            lc = Counter(s.predicted or "?" for s in errors)
+            for letter in sorted(lc):
+                count = lc[letter]
+                print(f"    {letter}: {count:>3} / {len(errors)}  {'█' * count}")
+            if lc.get("A", 0) / max(len(errors), 1) > 0.5:
+                print(f"    ⚠ A-bias: {lc['A']}/{len(errors)} errors predict A")
 
-            # Warm-only errors
             warm_errors = [s for s in errors if s.is_warm]
             if warm_errors:
                 warm_lc = Counter(s.predicted or "?" for s in warm_errors)
                 print(f"\n  Warm (q2) Error Distribution:")
                 for letter in sorted(warm_lc):
                     count = warm_lc[letter]
-                    bar = "█" * count
-                    print(f"    {letter}: {count:>3}  {bar}")
+                    print(f"    {letter}: {count:>3}  {'█' * count}")
 
     # Difficulty breakdown
     if "ALL" in bucket_results:
@@ -944,13 +964,13 @@ def print_summary(
             by_diff[s.difficulty].append(s)
         if len(by_diff) > 1:
             print(f"\n  Accuracy by Difficulty:")
-            print(f"  {'Difficulty':<12} {'N':>5} {'Accuracy':>9} {'Avg TTFT':>10}")
-            print(f"  {'-'*12} {'-'*5} {'-'*9} {'-'*10}")
+            print(f"  {'Difficulty':<12} {'N':>5} {'Accuracy':>9} {'KV Reuse':>9}")
+            print(f"  {'-'*12} {'-'*5} {'-'*9} {'-'*9}")
             for diff in sorted(by_diff):
                 ds = by_diff[diff]
                 acc = sum(s.correct for s in ds) / len(ds)
-                avg_t = np.mean([s.ttft_ms for s in ds])
-                print(f"  {diff:<12} {len(ds):>5} {acc:>8.1%} {avg_t:>9.0f}ms")
+                avg_reuse = np.mean([s.kv_reuse_ratio for s in ds])
+                print(f"  {diff:<12} {len(ds):>5} {acc:>8.1%} {avg_reuse:>8.0%}")
 
     # Verdict
     print(f"\n{'=' * 85}")
@@ -961,17 +981,17 @@ def print_summary(
         speed_label = f"{r.avg_ttft_speedup:.1f}x" if r.avg_ttft_speedup > 0 else "N/A"
         if acc_ok:
             print(
-                f"  RESULT: Warm (prefix-cached) accuracy matches cold (delta={delta:+.1%}, "
-                f"p={r.mcnemar_pvalue or 'N/A'}) with {speed_label} TTFT speedup"
+                f"  RESULT: Warm accuracy matches cold (delta={delta:+.1%}, "
+                f"p={r.mcnemar_pvalue or 'N/A'}) with {speed_label} TTFT speedup "
+                f"at {r.avg_kv_reuse_ratio:.0%} avg KV reuse"
             )
         else:
             print(
-                f"  RESULT: Accuracy difference detected between cold/warm "
+                f"  RESULT: Accuracy difference detected cold vs warm "
                 f"(delta={delta:+.1%}, p={r.mcnemar_pvalue:.3f})"
             )
     print(f"{'=' * 85}\n")
 
-    # Verbose: per-sample divergence between cold/warm (by pair)
     if verbose and "ALL" in bucket_results:
         all_srs = bucket_results["ALL"].samples
         warm_wrong = [s for s in all_srs if s.is_warm and not s.correct]
@@ -981,7 +1001,7 @@ def print_summary(
                 print(
                     f"    {s.sample_id}: ctx={s.context_tokens}tok "
                     f"pred={s.predicted} gold={s.gold_answer}({LETTERS[s.answer_position]}) "
-                    f"ttft={s.ttft_ms:.0f}ms"
+                    f"ttft={s.ttft_ms:.0f}ms reuse={s.kv_reuse_ratio:.0%}"
                 )
             if len(warm_wrong) > 15:
                 print(f"    ... and {len(warm_wrong) - 15} more")
@@ -996,12 +1016,13 @@ def save_results(
 ):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     serializable = {
-        "benchmark": "bug_localization_vllm",
+        "benchmark": "bug_localization_kvboost",
         "dataset": "JetBrains-Research/lca-bug-localization/py",
         "model": args.model,
         "n_samples": args.n_samples,
-        "max_model_len": args.max_model_len,
-        "enable_prefix_caching": True,
+        "chunk_size": args.chunk_size,
+        "max_context_tokens": args.max_context_tokens,
+        "recompute_strategy": args.recompute_strategy,
         "buckets": {},
     }
     for name, r in bucket_results.items():
@@ -1019,19 +1040,28 @@ def save_results(
             "avg_ttft_speedup": r.avg_ttft_speedup,
             "avg_cold_total_ms": r.avg_cold_total_ms,
             "avg_warm_total_ms": r.avg_warm_total_ms,
+            "avg_kv_reuse_ratio": r.avg_kv_reuse_ratio,
             "avg_context_tokens": r.avg_context_tokens,
+            "kv_reuse_distribution": {
+                "mean":   float(np.mean([s.kv_reuse_ratio for s in r.samples])),
+                "median": float(np.median([s.kv_reuse_ratio for s in r.samples])),
+                "p25":    float(np.percentile([s.kv_reuse_ratio for s in r.samples], 25)),
+                "p75":    float(np.percentile([s.kv_reuse_ratio for s in r.samples], 75)),
+                "min":    float(np.min([s.kv_reuse_ratio for s in r.samples])),
+                "max":    float(np.max([s.kv_reuse_ratio for s in r.samples])),
+            },
             "ttft_distribution": {
                 "cold": {
-                    "mean": float(np.mean([s.ttft_ms for s in cold_srs])) if cold_srs else 0,
+                    "mean":   float(np.mean([s.ttft_ms for s in cold_srs])) if cold_srs else 0,
                     "median": float(np.median([s.ttft_ms for s in cold_srs])) if cold_srs else 0,
-                    "p25": float(np.percentile([s.ttft_ms for s in cold_srs], 25)) if cold_srs else 0,
-                    "p75": float(np.percentile([s.ttft_ms for s in cold_srs], 75)) if cold_srs else 0,
+                    "p25":    float(np.percentile([s.ttft_ms for s in cold_srs], 25)) if cold_srs else 0,
+                    "p75":    float(np.percentile([s.ttft_ms for s in cold_srs], 75)) if cold_srs else 0,
                 },
                 "warm": {
-                    "mean": float(np.mean([s.ttft_ms for s in warm_srs])) if warm_srs else 0,
+                    "mean":   float(np.mean([s.ttft_ms for s in warm_srs])) if warm_srs else 0,
                     "median": float(np.median([s.ttft_ms for s in warm_srs])) if warm_srs else 0,
-                    "p25": float(np.percentile([s.ttft_ms for s in warm_srs], 25)) if warm_srs else 0,
-                    "p75": float(np.percentile([s.ttft_ms for s in warm_srs], 75)) if warm_srs else 0,
+                    "p25":    float(np.percentile([s.ttft_ms for s in warm_srs], 25)) if warm_srs else 0,
+                    "p75":    float(np.percentile([s.ttft_ms for s in warm_srs], 75)) if warm_srs else 0,
                 },
             },
             "samples": [
@@ -1049,6 +1079,8 @@ def save_results(
                     "correct": s.correct,
                     "ttft_ms": s.ttft_ms,
                     "total_ms": s.total_ms,
+                    "kv_reuse_ratio": s.kv_reuse_ratio,
+                    "cached_tokens": s.cached_tokens,
                     "is_warm": s.is_warm,
                 }
                 for s in r.samples
@@ -1063,68 +1095,60 @@ def save_results(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Bug Localization Benchmark — vLLM Prefix Caching",
+        description="Bug Localization Benchmark — KVBoost",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--model", default="Qwen/Qwen2.5-3B",
-        help="HuggingFace model name (default: Qwen/Qwen2.5-3B)",
-    )
-    parser.add_argument(
-        "--n-samples", type=int, default=50,
-        help="Number of diff pairs to evaluate (default: 50 → 100 queries)",
-    )
-    parser.add_argument(
-        "--max-model-len", type=int, default=8192,
-        help="vLLM max_model_len / context window (default: 8192)",
-    )
-    parser.add_argument(
-        "--gpu-memory-utilization", type=float, default=0.90,
-        help="vLLM GPU memory utilization (default: 0.90)",
-    )
-    parser.add_argument(
-        "--tensor-parallel-size", type=int, default=1,
-        help="vLLM tensor parallel size (default: 1)",
-    )
-    parser.add_argument(
-        "--dtype", default="auto",
-        choices=["auto", "float16", "bfloat16", "float32"],
-        help="Model dtype (default: auto)",
-    )
-    parser.add_argument(
-        "--no-enforce-eager", action="store_true",
-        help="Re-enable CUDA graphs (faster decode, but uses ~0.5 GiB extra; may OOM on 8GB GPUs)",
-    )
-    parser.add_argument(
-        "--output", default=None,
-        help="Output JSON path (default: results/bug_localization_vllm.json)",
-    )
-    parser.add_argument(
-        "--no-checkpoint", action="store_true",
-        help="Ignore existing checkpoint and start fresh",
-    )
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="Show per-sample details for warm errors",
-    )
-    parser.add_argument(
-        "--debug", action="store_true",
-        help="Enable debug logging",
-    )
+    parser.add_argument("--model", default="Qwen/Qwen2.5-3B",
+                        help="HuggingFace model name (default: Qwen/Qwen2.5-3B)")
+    parser.add_argument("--n-samples", type=int, default=50,
+                        help="Number of diff pairs to evaluate (default: 50 → 100 queries)")
+    parser.add_argument("--chunk-size", type=int, default=128,
+                        help="KVBoost chunk size (default: 128)")
+    parser.add_argument("--max-context-tokens", type=int, default=0,
+                        help="Max context tokens (default: auto-detect from RAM)")
+    parser.add_argument("--recompute-strategy", default="selective",
+                        choices=["selective", "cacheblend", "none"],
+                        help="KVBoost recompute strategy (default: selective)")
+    parser.add_argument("--chunk-boundary-window", type=int, default=0,
+                        help="Adaptive boundary window (0=disabled, 16=recommended)")
+    parser.add_argument("--overlap-k", type=int, default=0,
+                        help="Overlap tokens from previous chunk (0=disabled, 16=recommended)")
+    parser.add_argument("--sink-tokens", type=int, default=0,
+                        help="Attention sink tokens (0=disabled, 32=recommended)")
+    parser.add_argument("--output", default=None,
+                        help="Output JSON path")
+    parser.add_argument("--no-checkpoint", action="store_true",
+                        help="Ignore checkpoint and start fresh")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Show per-sample details for warm errors")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logging")
 
     args = parser.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    if args.max_context_tokens <= 0:
+        try:
+            import psutil
+            ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+        except ImportError:
+            import os
+            ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
+        safe_tokens = int((ram_gb - 8) * 3000)
+        args.max_context_tokens = max(2048, min(safe_tokens, 131072))
+        log.info(f"Auto-detected RAM: {ram_gb:.0f}GB → max_context_tokens={args.max_context_tokens}")
+
     bucket_results = run_benchmark(
         model_name=args.model,
         n_samples=args.n_samples,
-        max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        tensor_parallel_size=args.tensor_parallel_size,
-        dtype=args.dtype,
-        enforce_eager=not args.no_enforce_eager,
+        chunk_size=args.chunk_size,
+        max_context_tokens=args.max_context_tokens,
+        recompute_strategy=args.recompute_strategy,
+        chunk_boundary_window=args.chunk_boundary_window,
+        overlap_k=args.overlap_k,
+        sink_tokens=args.sink_tokens,
         no_checkpoint=args.no_checkpoint,
     )
 
@@ -1132,20 +1156,17 @@ def main():
         print("No results produced.")
         return
 
-    print_summary(
-        bucket_results,
-        verbose=args.verbose,
-    )
+    print_summary(bucket_results, verbose=args.verbose)
 
+    strategy_suffix = f"_{args.recompute_strategy}" if args.recompute_strategy != "selective" else ""
     out_path = (
         Path(args.output) if args.output
-        else RESULTS_DIR / "bug_localization_vllm.json"
+        else RESULTS_DIR / f"bug_localization_kvboost{strategy_suffix}.json"
     )
     save_results(bucket_results, args, out_path)
 
-    # Clean checkpoint on success
     checkpoint_path = get_checkpoint_path(
-        args.model, args.n_samples, args.max_model_len
+        args.model, args.n_samples, args.max_context_tokens, args.recompute_strategy
     )
     if checkpoint_path.exists():
         checkpoint_path.unlink()
