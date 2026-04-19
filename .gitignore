@@ -35,5 +35,3 @@ cache_dir/
 
 # Sphinx docs build
 docs/build/
-
-benchmarks_and_experiments/
