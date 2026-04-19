@@ -15,7 +15,13 @@ Two-tier storage with two-tier keying:
     1. Try prefix_hash (exact) → use directly
     2. Try content_hash (approximate) → use but flag for full recompute
 
-Eviction policy: LRU by access_count + age.
+Eviction policy: hard byte budget with recency window + importance-based eviction.
+
+  - max_cache_bytes is required and enforced on every store().
+  - The most-recently-stored `recency_window_chunks` are pinned (never evicted).
+  - When budget is exceeded, chunks outside the window are evicted lowest
+    importance first (ties → LRU). Pruned = evicted: a dropped chunk is
+    gone entirely and becomes a cache miss on next lookup (recomputed on demand).
 """
 
 from __future__ import annotations
@@ -46,16 +52,29 @@ class ChunkMatch:
 class KVCacheManager:
     def __init__(
         self,
+        *,
+        max_cache_bytes: int,
+        recency_window_chunks: int = 8,
         max_chunks: int = 64,
         disk_dir: Optional[str] = None,
         device: Optional[str] = None,
         kv_cache_bits: int = 16,
     ):
+        if max_cache_bytes is None or max_cache_bytes <= 0:
+            raise ValueError(
+                "max_cache_bytes is required and must be > 0 "
+                "(strictly memory-bounded KV cache)."
+            )
+        if recency_window_chunks < 0:
+            raise ValueError("recency_window_chunks must be >= 0.")
+        self.max_cache_bytes = int(max_cache_bytes)
+        self.recency_window_chunks = int(recency_window_chunks)
         self.max_chunks = max_chunks
         self.device = device if device is not None else default_device()
         self.kv_cache_bits = kv_cache_bits  # 16 = no quantization, 8 = int8, 4 = int4
 
-        # Primary store keyed by prefix_hash (exact match)
+        # Primary store keyed by prefix_hash (exact match). Insertion order
+        # is also recency order — the last N entries form the pinned window.
         self._hot: OrderedDict[str, CachedChunk] = OrderedDict()
 
         # Quantized storage: chunk_id → QuantizedKV (when bits < 16)
@@ -65,9 +84,13 @@ class KVCacheManager:
         self._content_index: Dict[str, str] = {}
 
         # Frequency counter: chunk_id → number of generate() calls it appeared in.
-        # Chunks that appear across many requests (system prompts) get high counts
-        # and are protected from eviction. One-off document chunks stay at 1.
+        # Used as a secondary tiebreaker when importance is equal.
         self._frequency: Dict[str, int] = {}
+
+        # Byte-size bookkeeping: tracked at store/evict time so we never
+        # have to walk every chunk on the hot path.
+        self._bytes_per_chunk: Dict[str, int] = {}
+        self._bytes_used: int = 0
 
         # Optional disk tier (flat mmap block pool)
         self._disk: Optional[DiskTier] = None
@@ -81,16 +104,29 @@ class KVCacheManager:
         self.hits = 0
         self.misses = 0
         self.approximate_hits = 0
+        self.evictions = 0
+        self.budget_rejections = 0
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def store(self, chunk: CachedChunk) -> None:
-        """Store a chunk. Evicts lowest-frequency entry if over capacity."""
+        """
+        Store a chunk under the strict byte budget.
+
+        On insert:
+          1. Move KV tensors to storage device (and optionally quantize).
+          2. Compute the chunk's on-device byte size.
+          3. Evict older chunks (outside the recency window) — lowest
+             importance first — until the new chunk fits in the budget.
+          4. If the new chunk still doesn't fit after evicting everything
+             outside the window, it is rejected (pruned = evicted).
+        """
         key = chunk.prefix_hash or chunk.chunk_id
 
         if key in self._hot:
+            # Re-hit on an already-cached chunk: bump recency + frequency.
             self._hot.move_to_end(key)
             self._frequency[key] = self._frequency.get(key, 0) + 1
             return
@@ -111,18 +147,50 @@ class KVCacheManager:
                 qkv.memory_bytes() / 1e6,
             )
 
-        if len(self._hot) >= self.max_chunks:
-            self._evict_lfu()
+        incoming_bytes = self._chunk_bytes(chunk, key)
+
+        # Reject chunks that can't possibly fit even with an empty cache.
+        if incoming_bytes > self.max_cache_bytes:
+            log.debug(
+                "Rejecting chunk %s: %.2fMB exceeds total budget %.2fMB",
+                key[:8], incoming_bytes / 1e6, self.max_cache_bytes / 1e6,
+            )
+            self.budget_rejections += 1
+            # Drop any quantized artifact we created above.
+            self._quantized.pop(key, None)
+            return
+
+        # Evict older chunks (outside recency window) until we fit.
+        self._evict_until_fits(incoming_bytes)
+
+        # If the recency window alone still doesn't leave room, reject.
+        if self._bytes_used + incoming_bytes > self.max_cache_bytes:
+            log.debug(
+                "Rejecting chunk %s: recency window (%d chunks, %.2fMB) "
+                "leaves no room for %.2fMB",
+                key[:8], self.recency_window_chunks,
+                self._bytes_used / 1e6, incoming_bytes / 1e6,
+            )
+            self.budget_rejections += 1
+            self._quantized.pop(key, None)
+            return
 
         self._hot[key] = chunk
         self._frequency[key] = 1
+        self._bytes_per_chunk[key] = incoming_bytes
+        self._bytes_used += incoming_bytes
 
         # Index by content_hash for approximate lookup
         if chunk.content_hash:
             self._content_index[chunk.content_hash] = key
 
         if self.kv_cache_bits >= 16:
-            log.debug("Stored chunk %s (%.2fMB)", key[:8], chunk.memory_bytes() / 1e6)
+            log.debug(
+                "Stored chunk %s (%.2fMB, cache=%.2f/%.2fMB, %d chunks)",
+                key[:8], incoming_bytes / 1e6,
+                self._bytes_used / 1e6, self.max_cache_bytes / 1e6,
+                len(self._hot),
+            )
 
     def get(self, chunk_id: str) -> Optional[CachedChunk]:
         """Retrieve a chunk by prefix_hash (exact match only). Dequantizes if needed."""
@@ -304,6 +372,9 @@ class KVCacheManager:
                 del self._content_index[chunk.content_hash]
         self._quantized.pop(chunk_id, None)
         self._frequency.pop(chunk_id, None)
+        self._bytes_used -= self._bytes_per_chunk.pop(chunk_id, 0)
+        if self._bytes_used < 0:
+            self._bytes_used = 0
         if self._disk:
             self._disk.remove(chunk_id)
 
@@ -326,19 +397,27 @@ class KVCacheManager:
         self._quantized.clear()
         self._content_index.clear()
         self._frequency.clear()
+        self._bytes_per_chunk.clear()
+        self._bytes_used = 0
         self.hits = 0
         self.misses = 0
         self.approximate_hits = 0
+        self.evictions = 0
+        self.budget_rejections = 0
 
     def stats(self) -> Dict:
         total = self.hits + self.misses + self.approximate_hits
-        hot_mb = sum(c.memory_bytes() for c in self._hot.values()) / 1e6
         result = {
             "hot_chunks": len(self._hot),
-            "hot_memory_mb": round(hot_mb, 2),
+            "hot_memory_mb": round(self._bytes_used / 1e6, 2),
+            "budget_mb": round(self.max_cache_bytes / 1e6, 2),
+            "budget_utilization": round(self._bytes_used / max(self.max_cache_bytes, 1), 3),
+            "recency_window_chunks": self.recency_window_chunks,
             "cache_hits": self.hits,
             "approximate_hits": self.approximate_hits,
             "cache_misses": self.misses,
+            "evictions": self.evictions,
+            "budget_rejections": self.budget_rejections,
             "hit_rate": round((self.hits + self.approximate_hits) / max(total, 1), 3),
             "exact_hit_rate": round(self.hits / max(total, 1), 3),
         }
@@ -379,41 +458,82 @@ class KVCacheManager:
     # Internal
     # ------------------------------------------------------------------
 
-    def _evict_lfu(self) -> None:
+    def _chunk_bytes(self, chunk: CachedChunk, key: str) -> int:
         """
-        Frequency-aware eviction: evict the chunk with the lowest frequency
-        count. Chunks that appear across many generate() calls (system prompts)
-        are protected; one-off document chunks are evicted first.
+        Size in bytes of a chunk as stored. Uses the quantized representation
+        if present, otherwise the raw KV tensors.
+        """
+        if key in self._quantized:
+            return int(self._quantized[key].memory_bytes())
+        return int(chunk.memory_bytes())
 
-        Tie-breaking: among chunks with equal frequency, evict the LRU one
-        (first in OrderedDict insertion order).
+    def _pinned_keys(self) -> set:
         """
-        if not self._hot:
+        The most-recently-stored `recency_window_chunks` keys. These are
+        NEVER evicted: they represent the model's hard sliding window of
+        "guaranteed to survive" context. Returned as a set for O(1) lookup.
+        """
+        if self.recency_window_chunks <= 0 or not self._hot:
+            return set()
+        # _hot is an OrderedDict in insertion order; last N keys = window.
+        all_keys = list(self._hot.keys())
+        return set(all_keys[-self.recency_window_chunks:])
+
+    def _evict_until_fits(self, incoming_bytes: int) -> None:
+        """
+        Evict older chunks (outside the recency window) until the incoming
+        chunk would fit in the budget. Victim selection:
+          1. Lowest importance first.
+          2. Tie → lowest frequency.
+          3. Tie → LRU (earliest in insertion order).
+
+        Stops when either the budget has room or no evictable chunks remain.
+        """
+        target = self.max_cache_bytes - incoming_bytes
+        if self._bytes_used <= target:
             return
 
-        # Find the entry with the lowest frequency
-        min_freq = float("inf")
-        victim_id = None
-        for cid in self._hot:
-            freq = self._frequency.get(cid, 0)
-            if freq < min_freq:
-                min_freq = freq
-                victim_id = cid
-
-        if victim_id is None:
+        pinned = self._pinned_keys()
+        candidates = [k for k in self._hot.keys() if k not in pinned]
+        if not candidates:
             return
 
-        victim = self._hot[victim_id]
-        log.debug("Evicting chunk %s (freq=%d)", victim_id[:8], min_freq)
+        # Sort candidates: lowest importance, then frequency, then LRU order.
+        # Insertion order in self._hot gives us LRU → so enumerate for index.
+        order_index = {k: i for i, k in enumerate(self._hot.keys())}
+        candidates.sort(
+            key=lambda k: (
+                float(self._hot[k].importance),
+                self._frequency.get(k, 0),
+                order_index[k],
+            )
+        )
 
-        # Clean up content index
+        for victim_id in candidates:
+            if self._bytes_used <= target:
+                break
+            self._evict_one(victim_id)
+
+    def _evict_one(self, victim_id: str) -> None:
+        """Drop a single chunk. Pruned = evicted: cache miss next time."""
+        victim = self._hot.get(victim_id)
+        if victim is None:
+            return
+
+        log.debug(
+            "Evicting chunk %s (importance=%.3f, freq=%d, %.2fMB)",
+            victim_id[:8],
+            float(victim.importance),
+            self._frequency.get(victim_id, 0),
+            self._bytes_per_chunk.get(victim_id, 0) / 1e6,
+        )
+
         if victim.content_hash in self._content_index:
             if self._content_index[victim.content_hash] == victim_id:
                 del self._content_index[victim.content_hash]
 
-        # Demote to disk tier if available
+        # Demote to disk tier if available (preserves exact-match recovery).
         if self._disk:
-            # Dequantize first if stored quantized
             if victim_id in self._quantized:
                 victim = self._dequantize_chunk(victim, victim_id)
             self._disk.write(victim)
@@ -421,6 +541,10 @@ class KVCacheManager:
         del self._hot[victim_id]
         self._frequency.pop(victim_id, None)
         self._quantized.pop(victim_id, None)
+        self._bytes_used -= self._bytes_per_chunk.pop(victim_id, 0)
+        if self._bytes_used < 0:
+            self._bytes_used = 0
+        self.evictions += 1
 
     @staticmethod
     def _move_kv(kv: PastKVType, device: str) -> PastKVType:

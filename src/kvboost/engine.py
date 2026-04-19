@@ -78,8 +78,11 @@ class InferenceEngine:
         self,
         model: AutoModelForCausalLM,
         tokenizer: AutoTokenizer,
+        *,
+        max_cache_bytes: int,
         chunk_size: int = 128,
         max_chunks: int = 128,
+        recency_window_chunks: int = 8,
         recompute_overlap: int = 16,
         recompute_strategy: RecomputeStrategy = RecomputeStrategy.SELECTIVE,
         recompute_ratio: float = 0.15,
@@ -110,6 +113,8 @@ class InferenceEngine:
 
         # Sub-systems (CPU storage for cache tensors, move to device on use)
         self.cache_manager = KVCacheManager(
+            max_cache_bytes=max_cache_bytes,
+            recency_window_chunks=recency_window_chunks,
             max_chunks=max_chunks,
             disk_dir=disk_cache_dir,
             device="cpu",
@@ -464,6 +469,7 @@ class InferenceEngine:
                 content_hash=c_hash,
                 overlap_prefix_len=overlap_len,
                 sink_prefix_len=sink_len,
+                importance=self._kv_importance(kv),
             )
             self.cache_manager.store(chunk)
             parent_hash = p_hash
@@ -762,6 +768,24 @@ class InferenceEngine:
         return self.tokenizer.encode(text, add_special_tokens=True)
 
     @staticmethod
+    def _kv_importance(kv: PastKVType) -> float:
+        """
+        Scalar importance of a chunk. We use the mean L2 norm of the K
+        tensor across layers, heads, and tokens. Larger norms correlate
+        with tokens that carry more attention mass — cheap signal, no
+        extra forward pass required.
+        """
+        if not kv:
+            return 0.0
+        total = 0.0
+        count = 0
+        for layer_k, _ in kv:
+            # layer_k: [batch, heads, seq, head_dim]
+            total += float(layer_k.float().pow(2).sum().sqrt().item())
+            count += 1
+        return total / max(count, 1)
+
+    @staticmethod
     def _as_cache(past_kv):
         """Convert tuple-of-tuples KV to DynamicCache for newer transformers."""
         if past_kv is None or hasattr(past_kv, "get_seq_length"):
@@ -939,6 +963,7 @@ class InferenceEngine:
                     content_hash=c_hash,
                     overlap_prefix_len=overlap_len,
                     sink_prefix_len=sink_len,
+                    importance=self._kv_importance(kv),
                 )
                 self.cache_manager.store(chunk)
             parent_hash = p_hash

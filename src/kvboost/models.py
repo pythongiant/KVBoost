@@ -53,6 +53,10 @@ class CachedChunk:
     created_at: float = field(default_factory=time.time)
     access_count: int = 0
     recomputed: bool = False    # True if boundary recompute was applied
+    # Per-token importance score (mean L2 norm of K across layers/heads).
+    # Used by the byte-bounded cache to rank which older chunks survive
+    # when the budget is exceeded. Higher = more "informative" tokens.
+    importance: float = 0.0
 
     @property
     def length(self) -> int:

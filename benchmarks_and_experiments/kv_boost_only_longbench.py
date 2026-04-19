@@ -363,11 +363,13 @@ class KVBoostRunner:
     def __init__(
         self,
         model_name: str,
+        max_cache_bytes: int,
         chunk_size: int = 128,
         recompute_strategy: str = "selective",
         chunk_boundary_window: int = 0,
         overlap_k: int = 0,
         sink_tokens: int = 0,
+        recency_window_chunks: int = 8,
     ):
         from kvboost import KVBoost, GenerationMode
 
@@ -377,10 +379,14 @@ class KVBoostRunner:
             f"Loading KVBoost model: {model_name} "
             f"(chunk_size={chunk_size}, strategy={recompute_strategy}, "
             f"boundary_window={chunk_boundary_window}, overlap_k={overlap_k}, "
-            f"sink_tokens={sink_tokens})"
+            f"sink_tokens={sink_tokens}, "
+            f"max_cache_bytes={max_cache_bytes/1e9:.2f}GB, "
+            f"recency_window={recency_window_chunks} chunks)"
         )
         self.engine = KVBoost.from_pretrained(
             model_name,
+            max_cache_bytes=max_cache_bytes,
+            recency_window_chunks=recency_window_chunks,
             chunk_size=chunk_size,
             recompute_overlap=16,
             recompute_strategy=recompute_strategy,
@@ -569,12 +575,14 @@ def get_bucket(n_tokens: int) -> str:
 def run_benchmark(
     model_name: str,
     n_samples: int,
+    max_cache_bytes: int,
     chunk_size: int = 128,
     max_context_tokens: int = 8192,
     recompute_strategy: str = "selective",
     chunk_boundary_window: int = 0,
     overlap_k: int = 0,
     sink_tokens: int = 0,
+    recency_window_chunks: int = 8,
     no_checkpoint: bool = False,
 ) -> Dict[str, BucketResult]:
     print(f"\n{'=' * 75}")
@@ -589,6 +597,8 @@ def run_benchmark(
     print(f"  Boundary window:    {chunk_boundary_window}")
     print(f"  Overlap K:          {overlap_k}")
     print(f"  Sink tokens:        {sink_tokens}")
+    print(f"  Max cache bytes:    {max_cache_bytes/1e9:.2f} GB (hard budget)")
+    print(f"  Recency window:     {recency_window_chunks} chunks (pinned)")
     print(f"{'=' * 75}\n")
 
     samples = load_bug_localization(n_samples, max_context_tokens, model_name)
@@ -598,11 +608,13 @@ def run_benchmark(
 
     runner = KVBoostRunner(
         model_name,
+        max_cache_bytes=max_cache_bytes,
         chunk_size=chunk_size,
         recompute_strategy=recompute_strategy,
         chunk_boundary_window=chunk_boundary_window,
         overlap_k=overlap_k,
         sink_tokens=sink_tokens,
+        recency_window_chunks=recency_window_chunks,
     )
 
     pair_groups: Dict[int, List[int]] = defaultdict(list)
@@ -1115,6 +1127,15 @@ def main():
                         help="Overlap tokens from previous chunk (0=disabled, 16=recommended)")
     parser.add_argument("--sink-tokens", type=int, default=0,
                         help="Attention sink tokens (0=disabled, 32=recommended)")
+    parser.add_argument("--max-cache-bytes", type=float, required=True,
+                        help="REQUIRED. Hard KV cache memory budget in bytes "
+                             "(accepts float for e.g. 2e9 = 2GB). When exceeded, "
+                             "older chunks outside the recency window are evicted "
+                             "lowest-importance first. Pruned = evicted: dropped "
+                             "chunks are recomputed on demand.")
+    parser.add_argument("--recency-window-chunks", type=int, default=8,
+                        help="Number of most-recent chunks pinned against eviction "
+                             "(default: 8). These form the hard sliding window.")
     parser.add_argument("--output", default=None,
                         help="Output JSON path")
     parser.add_argument("--no-checkpoint", action="store_true",
@@ -1143,12 +1164,14 @@ def main():
     bucket_results = run_benchmark(
         model_name=args.model,
         n_samples=args.n_samples,
+        max_cache_bytes=int(args.max_cache_bytes),
         chunk_size=args.chunk_size,
         max_context_tokens=args.max_context_tokens,
         recompute_strategy=args.recompute_strategy,
         chunk_boundary_window=args.chunk_boundary_window,
         overlap_k=args.overlap_k,
         sink_tokens=args.sink_tokens,
+        recency_window_chunks=args.recency_window_chunks,
         no_checkpoint=args.no_checkpoint,
     )
 
