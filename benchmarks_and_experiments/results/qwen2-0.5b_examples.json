@@ -1,0 +1,93 @@
+{
+  "model": "Qwen/Qwen2-0.5B",
+  "device": "mps",
+  "platform": "MacBook Air M-series, 16GB",
+  "dtype": "float16",
+  "chunk_size": 64,
+  "max_new_tokens": 64,
+  "sampling": "greedy",
+  "date": "2026-03-30",
+  "note": "Small model baseline — demonstrates that KV cache overhead exceeds prefill savings at 0.5B scale with short prompts",
+  "examples": {
+    "chatbot_system_prompt_reuse": {
+      "warmed_chunks": 1,
+      "queries": [
+        {
+          "query": "How do I reverse a linked list?",
+          "baseline": {"ttft_ms": 166.9, "reuse_pct": 0, "tok_per_sec": 37.4},
+          "kv_reuse": {"ttft_ms": 13.1, "reuse_pct": 0, "tok_per_sec": 59.7}
+        },
+        {
+          "query": "What is the time complexity of quicksort?",
+          "baseline": {"ttft_ms": 30.0, "reuse_pct": 0, "tok_per_sec": 59.3},
+          "kv_reuse": {"ttft_ms": 12.2, "reuse_pct": 0, "tok_per_sec": 60.4}
+        },
+        {
+          "query": "Explain the difference between a mutex and a semaphore.",
+          "baseline": {"ttft_ms": 27.2, "reuse_pct": 0, "tok_per_sec": 60.2},
+          "kv_reuse": {"ttft_ms": 12.1, "reuse_pct": 0, "tok_per_sec": 60.6}
+        },
+        {
+          "query": "How does consistent hashing work?",
+          "baseline": {"ttft_ms": 30.1, "reuse_pct": 0, "tok_per_sec": 60.4},
+          "kv_reuse": {"ttft_ms": 12.1, "reuse_pct": 0, "tok_per_sec": 60.9}
+        }
+      ]
+    },
+    "rag_document_reuse": {
+      "warmed_chunks": 2,
+      "queries": [
+        {
+          "query": "What does the retriever module do in RAG?",
+          "baseline": {"ttft_ms": 244.3, "reuse_pct": 0, "tok_per_sec": 39.9},
+          "kv_reuse": {"ttft_ms": 12.4, "reuse_pct": 0, "tok_per_sec": 50.9}
+        },
+        {
+          "query": "How does RAG reduce hallucinations?",
+          "baseline": {"ttft_ms": 28.8, "reuse_pct": 0, "tok_per_sec": 40.5},
+          "kv_reuse": {"ttft_ms": 152.4, "reuse_pct": 83, "tok_per_sec": 37.3}
+        },
+        {
+          "query": "What are the key design choices in a RAG system?",
+          "baseline": {"ttft_ms": 26.8, "reuse_pct": 0, "tok_per_sec": 49.7},
+          "kv_reuse": {"ttft_ms": 140.5, "reuse_pct": 81, "tok_per_sec": 49.3}
+        }
+      ]
+    },
+    "multiturn_conversation": {
+      "turns": [
+        {"turn": 1, "history_tokens": 23, "baseline_ttft_ms": 47.1, "kv_reuse_ttft_ms": 11.7, "reuse_pct": 0, "speedup": 4.0},
+        {"turn": 2, "history_tokens": 48, "baseline_ttft_ms": 12.1, "kv_reuse_ttft_ms": 11.9, "reuse_pct": 0, "speedup": 1.0},
+        {"turn": 3, "history_tokens": 83, "baseline_ttft_ms": 54.8, "kv_reuse_ttft_ms": 12.0, "reuse_pct": 0, "speedup": 4.6},
+        {"turn": 4, "history_tokens": 110, "baseline_ttft_ms": 197.1, "kv_reuse_ttft_ms": 100.4, "reuse_pct": 58, "speedup": 2.0}
+      ]
+    },
+    "code_context_reuse": {
+      "warmed_chunks": 4,
+      "queries": [
+        {
+          "query": "What is the time complexity of the insert method?",
+          "baseline": {"ttft_ms": 215.8, "reuse_pct": 0, "tok_per_sec": 42.8},
+          "kv_reuse": {"ttft_ms": 13.3, "reuse_pct": 0, "tok_per_sec": 47.2}
+        },
+        {
+          "query": "How would you add a delete method to this BST?",
+          "baseline": {"ttft_ms": 31.7, "reuse_pct": 0, "tok_per_sec": 47.8},
+          "kv_reuse": {"ttft_ms": 94.0, "reuse_pct": 74, "tok_per_sec": 48.5}
+        },
+        {
+          "query": "Is this BST self-balancing? Why or why not?",
+          "baseline": {"ttft_ms": 28.6, "reuse_pct": 0, "tok_per_sec": 47.8},
+          "kv_reuse": {"ttft_ms": 41.0, "reuse_pct": 73, "tok_per_sec": 50.7}
+        }
+      ]
+    }
+  },
+  "final_cache_stats": {
+    "hot_chunks": 27,
+    "hot_memory_mb": 19.17,
+    "cache_hits": 28,
+    "cache_misses": 36,
+    "hit_rate": 0.438
+  }
+}

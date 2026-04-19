@@ -1,0 +1,142 @@
+[
+  {
+    "chunk_size": 64,
+    "recompute_overlap": 0,
+    "workloads": {
+      "system_prompt": {
+        "ttft_ms": {
+          "mean": 136.823,
+          "median": 141.97,
+          "min": 97.075,
+          "max": 171.424,
+          "stdev": 37.441
+        },
+        "output_match_rate": 1.0,
+        "cache_hit_rate": 0.75,
+        "hot_memory_mb": 5.95,
+        "hot_chunks": 5,
+        "n_samples": 3
+      },
+      "rag_document": {
+        "ttft_ms": {
+          "mean": 108.199,
+          "median": 115.159,
+          "min": 68.023,
+          "max": 141.416,
+          "stdev": 37.188
+        },
+        "output_match_rate": 0.667,
+        "cache_hit_rate": 0.892,
+        "hot_memory_mb": 16.04,
+        "hot_chunks": 12,
+        "n_samples": 3
+      }
+    },
+    "memory_per_chunk_mb": 0.79
+  },
+  {
+    "chunk_size": 64,
+    "recompute_overlap": 16,
+    "workloads": {
+      "system_prompt": {
+        "ttft_ms": {
+          "mean": 109.619,
+          "median": 104.165,
+          "min": 61.19,
+          "max": 163.504,
+          "stdev": 51.375
+        },
+        "output_match_rate": 1.0,
+        "cache_hit_rate": 0.75,
+        "hot_memory_mb": 5.95,
+        "hot_chunks": 5,
+        "n_samples": 3
+      },
+      "rag_document": {
+        "ttft_ms": {
+          "mean": 182.368,
+          "median": 154.985,
+          "min": 117.912,
+          "max": 274.207,
+          "stdev": 81.666
+        },
+        "output_match_rate": 0.667,
+        "cache_hit_rate": 0.892,
+        "hot_memory_mb": 16.04,
+        "hot_chunks": 12,
+        "n_samples": 3
+      }
+    },
+    "memory_per_chunk_mb": 0.79
+  },
+  {
+    "chunk_size": 128,
+    "recompute_overlap": 0,
+    "workloads": {
+      "system_prompt": {
+        "ttft_ms": {
+          "mean": 51.513,
+          "median": 50.465,
+          "min": 34.344,
+          "max": 69.73,
+          "stdev": 17.716
+        },
+        "output_match_rate": 1.0,
+        "cache_hit_rate": 0.429,
+        "hot_memory_mb": 10.27,
+        "hot_chunks": 4,
+        "n_samples": 3
+      },
+      "rag_document": {
+        "ttft_ms": {
+          "mean": 34.305,
+          "median": 29.655,
+          "min": 28.93,
+          "max": 44.329,
+          "stdev": 8.689
+        },
+        "output_match_rate": 0.667,
+        "cache_hit_rate": 0.792,
+        "hot_memory_mb": 26.06,
+        "hot_chunks": 11,
+        "n_samples": 3
+      }
+    },
+    "memory_per_chunk_mb": 2.23
+  },
+  {
+    "chunk_size": 128,
+    "recompute_overlap": 16,
+    "workloads": {
+      "system_prompt": {
+        "ttft_ms": {
+          "mean": 49.74,
+          "median": 54.458,
+          "min": 31.431,
+          "max": 63.332,
+          "stdev": 16.466
+        },
+        "output_match_rate": 1.0,
+        "cache_hit_rate": 0.429,
+        "hot_memory_mb": 10.27,
+        "hot_chunks": 4,
+        "n_samples": 3
+      },
+      "rag_document": {
+        "ttft_ms": {
+          "mean": 146.208,
+          "median": 145.251,
+          "min": 113.728,
+          "max": 179.645,
+          "stdev": 32.969
+        },
+        "output_match_rate": 0.667,
+        "cache_hit_rate": 0.792,
+        "hot_memory_mb": 26.06,
+        "hot_chunks": 11,
+        "n_samples": 3
+      }
+    },
+    "memory_per_chunk_mb": 2.23
+  }
+]

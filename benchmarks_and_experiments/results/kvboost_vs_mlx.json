@@ -1,0 +1,131 @@
+{
+  "model": "Qwen/Qwen2.5-3B",
+  "device": "mps",
+  "platform": "MacBook Air M-series, 16GB",
+  "dtype": "float16",
+  "chunk_size": 128,
+  "max_new_tokens": 64,
+  "sampling": "greedy",
+  "date": "2026-04-02",
+  "workloads": {
+    "chatbot": {
+      "desc": "System prompt reuse (~250 tokens)",
+      "queries": [
+        {
+          "query": "Q1 (cold)",
+          "hf_baseline": {"ttft_ms": 52122.4, "total_ms": 76818.6, "tok_per_sec": 0.8},
+          "kvboost": {"ttft_ms": 81.4, "total_ms": 8727.0, "tok_per_sec": 7.3, "reuse_pct": 0},
+          "mlx": {"ttft_ms": 60527.3, "total_ms": 67565.2, "tok_per_sec": 0.9},
+          "kv_vs_hf": 640.2,
+          "kv_vs_mlx": 743.4
+        },
+        {
+          "query": "Q2",
+          "hf_baseline": {"ttft_ms": 20276.1, "total_ms": 43217.0, "tok_per_sec": 0.7},
+          "kvboost": {"ttft_ms": 1301.3, "total_ms": 4799.0, "tok_per_sec": 6.5, "reuse_pct": 92},
+          "mlx": {"ttft_ms": 56555.7, "total_ms": 60193.5, "tok_per_sec": 0.5},
+          "kv_vs_hf": 15.6,
+          "kv_vs_mlx": 43.5
+        },
+        {
+          "query": "Q3",
+          "hf_baseline": {"ttft_ms": 19570.6, "total_ms": 54737.6, "tok_per_sec": 1.2},
+          "kvboost": {"ttft_ms": 1308.2, "total_ms": 9394.9, "tok_per_sec": 6.8, "reuse_pct": 91},
+          "mlx": {"ttft_ms": 52906.0, "total_ms": 60532.0, "tok_per_sec": 1.1},
+          "kv_vs_hf": 15.0,
+          "kv_vs_mlx": 40.4
+        }
+      ]
+    },
+    "code": {
+      "desc": "Code context reuse (~800 tokens)",
+      "queries": [
+        {
+          "query": "Q1 (cold)",
+          "hf_baseline": {"ttft_ms": 63369.1, "total_ms": 77106.9, "tok_per_sec": 0.8},
+          "kvboost": {"ttft_ms": 493.0, "total_ms": 15423.4, "tok_per_sec": 4.1, "reuse_pct": 0},
+          "mlx": {"ttft_ms": 49342.3, "total_ms": 56395.1, "tok_per_sec": 1.1},
+          "kv_vs_hf": 128.5,
+          "kv_vs_mlx": 100.1
+        },
+        {
+          "query": "Q2",
+          "hf_baseline": {"ttft_ms": 40635.4, "total_ms": 54551.2, "tok_per_sec": 1.2},
+          "kvboost": {"ttft_ms": 137.0, "total_ms": 11298.7, "tok_per_sec": 5.7, "reuse_pct": 89},
+          "mlx": {"ttft_ms": 47166.6, "total_ms": 54175.2, "tok_per_sec": 1.2},
+          "kv_vs_hf": 296.6,
+          "kv_vs_mlx": 344.2
+        },
+        {
+          "query": "Q3",
+          "hf_baseline": {"ttft_ms": 39529.2, "total_ms": 55084.7, "tok_per_sec": 1.2},
+          "kvboost": {"ttft_ms": 152.1, "total_ms": 11878.7, "tok_per_sec": 5.4, "reuse_pct": 89},
+          "mlx": {"ttft_ms": 48591.7, "total_ms": 56038.6, "tok_per_sec": 1.1},
+          "kv_vs_hf": 259.8,
+          "kv_vs_mlx": 319.4
+        }
+      ]
+    },
+    "multiturn": {
+      "desc": "Multi-turn conversation (232 -> 1100+ tokens)",
+      "queries": [
+        {
+          "query": "Q1",
+          "hf_baseline": {"ttft_ms": 71835.0, "total_ms": 83766.5, "tok_per_sec": 0.6},
+          "kvboost": {"ttft_ms": 107.6, "total_ms": 7641.0, "tok_per_sec": 6.5, "reuse_pct": 0},
+          "mlx": {"ttft_ms": 61066.6, "total_ms": 66783.1, "tok_per_sec": 0.8},
+          "kv_vs_hf": 667.6,
+          "kv_vs_mlx": 567.5
+        },
+        {
+          "query": "Q2",
+          "hf_baseline": {"ttft_ms": 41743.2, "total_ms": 54632.4, "tok_per_sec": 0.8},
+          "kvboost": {"ttft_ms": 348.6, "total_ms": 6127.5, "tok_per_sec": 6.7, "reuse_pct": 49},
+          "mlx": {"ttft_ms": 45344.4, "total_ms": 49453.2, "tok_per_sec": 0.8},
+          "kv_vs_hf": 119.7,
+          "kv_vs_mlx": 130.1
+        },
+        {
+          "query": "Q3",
+          "hf_baseline": {"ttft_ms": 48858.1, "total_ms": 59775.9, "tok_per_sec": 1.1},
+          "kvboost": {"ttft_ms": 153.0, "total_ms": 6061.6, "tok_per_sec": 5.8, "reuse_pct": 77},
+          "mlx": {"ttft_ms": 46962.4, "total_ms": 54752.5, "tok_per_sec": 1.2},
+          "kv_vs_hf": 319.3,
+          "kv_vs_mlx": 306.9
+        },
+        {
+          "query": "Q4",
+          "hf_baseline": {"ttft_ms": 40834.2, "total_ms": 58993.6, "tok_per_sec": 1.1},
+          "kvboost": {"ttft_ms": 233.3, "total_ms": 11933.3, "tok_per_sec": 5.4, "reuse_pct": 64},
+          "mlx": {"ttft_ms": 62975.1, "total_ms": 69828.9, "tok_per_sec": 0.9},
+          "kv_vs_hf": 175.1,
+          "kv_vs_mlx": 270.0
+        },
+        {
+          "query": "Q5",
+          "hf_baseline": {"ttft_ms": 51665.6, "total_ms": 58438.3, "tok_per_sec": 0.5},
+          "kvboost": {"ttft_ms": 129.7, "total_ms": 9991.6, "tok_per_sec": 6.4, "reuse_pct": 82},
+          "mlx": {"ttft_ms": 53864.5, "total_ms": 60317.7, "tok_per_sec": 1.1},
+          "kv_vs_hf": 398.4,
+          "kv_vs_mlx": 415.3
+        },
+        {
+          "query": "Q6",
+          "hf_baseline": {"ttft_ms": 52664.1, "total_ms": 64421.8, "tok_per_sec": 1.0},
+          "kvboost": {"ttft_ms": 152.7, "total_ms": 10099.0, "tok_per_sec": 6.3, "reuse_pct": 67},
+          "mlx": {"ttft_ms": 50860.1, "total_ms": 57998.1, "tok_per_sec": 1.1},
+          "kv_vs_hf": 344.9,
+          "kv_vs_mlx": 333.1
+        },
+        {
+          "query": "Q7",
+          "hf_baseline": {"ttft_ms": 50675.7, "total_ms": 63072.0, "tok_per_sec": 1.0},
+          "kvboost": {"ttft_ms": 143.7, "total_ms": 10820.2, "tok_per_sec": 5.9, "reuse_pct": 81},
+          "mlx": {"ttft_ms": 46060.3, "total_ms": 52479.8, "tok_per_sec": 1.2},
+          "kv_vs_hf": 352.6,
+          "kv_vs_mlx": 320.5
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,219 @@
+{
+  "our_system": {
+    "system_prompt": {
+      "baseline": {
+        "ttft_ms": {
+          "mean": 44.501,
+          "median": 48.532,
+          "min": 32.115,
+          "max": 52.857,
+          "stdev": 10.943
+        },
+        "total_ms": {
+          "mean": 1587.128,
+          "median": 1578.418,
+          "min": 1514.72,
+          "max": 1668.248,
+          "stdev": 77.134
+        },
+        "n_samples": 3,
+        "sample_outputs": [
+          "\n\nA: The best strategy for reducing P99 latency in a",
+          "\n\n1. Identify the rate limiting requirements: Determine the",
+          "\n\nSynchronous model serving:\n- Synchronous model serving is ideal for"
+        ]
+      },
+      "prefix_cache": {
+        "ttft_ms": {
+          "mean": 36.272,
+          "median": 38.591,
+          "min": 23.696,
+          "max": 46.528,
+          "stdev": 11.591
+        },
+        "total_ms": {
+          "mean": 1476.526,
+          "median": 1417.643,
+          "min": 1256.232,
+          "max": 1755.704,
+          "stdev": 254.889
+        },
+        "n_samples": 3,
+        "sample_outputs": [
+          "\n\nA: The best strategy for reducing P99 latency in a",
+          "\n\n1. Identify the rate limiting requirements: Determine the",
+          "\n\nSynchronous model serving:\n- Synchronous model serving is ideal for"
+        ]
+      },
+      "chunk_kv_reuse": {
+        "ttft_ms": {
+          "mean": 61.273,
+          "median": 64.27,
+          "min": 49.907,
+          "max": 69.643,
+          "stdev": 10.204
+        },
+        "total_ms": {
+          "mean": 1277.045,
+          "median": 1242.873,
+          "min": 1218.694,
+          "max": 1369.568,
+          "stdev": 81.034
+        },
+        "n_samples": 3,
+        "sample_outputs": [
+          "\n\nA: The best strategy for reducing P99 latency in a",
+          "\n\n1. Identify the rate limiting requirements: Determine the",
+          "\n\nSynchronous model serving:\n- Synchronous model serving is ideal for"
+        ]
+      }
+    },
+    "rag_document": {
+      "baseline": {
+        "ttft_ms": {
+          "mean": 27.228,
+          "median": 22.058,
+          "min": 19.773,
+          "max": 39.851,
+          "stdev": 10.992
+        },
+        "total_ms": {
+          "mean": 1220.724,
+          "median": 1218.325,
+          "min": 816.579,
+          "max": 1627.267,
+          "stdev": 405.349
+        },
+        "n_samples": 3,
+        "sample_outputs": [
+          "",
+          "\n\n- When prompts share a long, stable prefix.\n- When",
+          ""
+        ]
+      },
+      "prefix_cache": {
+        "ttft_ms": {
+          "mean": 34.954,
+          "median": 30.845,
+          "min": 30.791,
+          "max": 43.226,
+          "stdev": 7.164
+        },
+        "total_ms": {
+          "mean": 951.946,
+          "median": 517.9,
+          "min": 361.947,
+          "max": 1975.99,
+          "stdev": 890.27
+        },
+        "n_samples": 3,
+        "sample_outputs": [
+          "",
+          "\n\n- Chunk-level caching is more efficient for prompts that share",
+          ""
+        ]
+      },
+      "chunk_kv_reuse": {
+        "ttft_ms": {
+          "mean": 54.939,
+          "median": 54.29,
+          "min": 50.104,
+          "max": 60.424,
+          "stdev": 5.19
+        },
+        "total_ms": {
+          "mean": 865.801,
+          "median": 379.003,
+          "min": 372.701,
+          "max": 1845.698,
+          "stdev": 848.621
+        },
+        "n_samples": 3,
+        "sample_outputs": [
+          "",
+          "\n\n- Chunk-level caching is more efficient for prompts that share",
+          ""
+        ]
+      }
+    }
+  },
+  "vllm": {
+    "status": "skipped (pass --include-vllm to enable)",
+    "install": "pip install vllm (requires CUDA GPU)"
+  },
+  "qualitative_comparison": {
+    "features": [
+      {
+        "feature": "Prefix caching (exact shared prefix)",
+        "our_system": true,
+        "vllm": true,
+        "sglang_radix": true,
+        "notes": "All systems support basic prefix caching"
+      },
+      {
+        "feature": "Non-prefix chunk reuse",
+        "our_system": true,
+        "vllm": false,
+        "sglang_radix": "partial",
+        "notes": "Our system can reuse arbitrary chunks, not just leading prefix. SGLang RadixAttention supports subtree matching."
+      },
+      {
+        "feature": "Selective boundary recompute",
+        "our_system": true,
+        "vllm": false,
+        "sglang_radix": false,
+        "notes": "Unique to our approach. Fixes KV staleness at chunk seams."
+      },
+      {
+        "feature": "Content-addressable cache keys",
+        "our_system": true,
+        "vllm": "hash-based",
+        "sglang_radix": "trie-based",
+        "notes": "We use SHA256 of token bytes. vLLM uses block hashing. SGLang uses radix trie on token sequences."
+      },
+      {
+        "feature": "Disk-backed cold storage",
+        "our_system": true,
+        "vllm": false,
+        "sglang_radix": false,
+        "notes": "Our two-tier storage allows larger effective cache sizes."
+      },
+      {
+        "feature": "Semantic chunking",
+        "our_system": true,
+        "vllm": false,
+        "sglang_radix": false,
+        "notes": "Our system supports paragraph-boundary chunking for better reuse."
+      },
+      {
+        "feature": "Continuous batching",
+        "our_system": false,
+        "vllm": true,
+        "sglang_radix": true,
+        "notes": "Production serving systems support in-flight batching."
+      },
+      {
+        "feature": "PagedAttention",
+        "our_system": false,
+        "vllm": true,
+        "sglang_radix": true,
+        "notes": "Memory-efficient KV storage via paging. Orthogonal to our approach."
+      },
+      {
+        "feature": "Multi-GPU / tensor parallel",
+        "our_system": false,
+        "vllm": true,
+        "sglang_radix": true,
+        "notes": "Our system is single-device. Could be extended."
+      },
+      {
+        "feature": "Quantized KV cache",
+        "our_system": false,
+        "vllm": true,
+        "sglang_radix": false,
+        "notes": "FP8/INT8 KV cache reduces memory 2x. Complementary to our approach."
+      }
+    ],
+    "summary": "Our system's key differentiator is chunk-level reuse with selective boundary recomputation, enabling cache hits for non-prefix shared content (e.g., RAG documents that appear at different positions). This is complementary to, not competitive with, production serving optimizations like PagedAttention and continuous batching. The ideal production system would combine chunk-level KV reuse with PagedAttention for memory efficiency."
+  }
+}

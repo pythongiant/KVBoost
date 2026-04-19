@@ -1,0 +1,574 @@
+{
+  "long_context_rag": [
+    {
+      "n_documents": 1,
+      "mode": "baseline",
+      "prompt_tokens": 185,
+      "ttft_ms": {
+        "mean": 25.058,
+        "median": 15.788,
+        "min": 15.539,
+        "max": 43.847,
+        "stdev": 16.273
+      },
+      "n_samples": 3
+    },
+    {
+      "n_documents": 1,
+      "mode": "chunk_kv_reuse",
+      "prompt_tokens": 185,
+      "ttft_ms": {
+        "mean": 48.586,
+        "median": 43.403,
+        "min": 31.651,
+        "max": 70.705,
+        "stdev": 20.036
+      },
+      "n_samples": 3
+    },
+    {
+      "n_documents": 2,
+      "mode": "baseline",
+      "prompt_tokens": 375,
+      "ttft_ms": {
+        "mean": 24.706,
+        "median": 25.292,
+        "min": 19.91,
+        "max": 28.914,
+        "stdev": 4.53
+      },
+      "n_samples": 3
+    },
+    {
+      "n_documents": 2,
+      "mode": "chunk_kv_reuse",
+      "prompt_tokens": 375,
+      "ttft_ms": {
+        "mean": 93.573,
+        "median": 97.031,
+        "min": 86.027,
+        "max": 97.661,
+        "stdev": 6.543
+      },
+      "n_samples": 3
+    },
+    {
+      "n_documents": 3,
+      "mode": "baseline",
+      "prompt_tokens": 557,
+      "ttft_ms": {
+        "mean": 19.623,
+        "median": 14.507,
+        "min": 12.025,
+        "max": 32.337,
+        "stdev": 11.08
+      },
+      "n_samples": 3
+    },
+    {
+      "n_documents": 3,
+      "mode": "chunk_kv_reuse",
+      "prompt_tokens": 557,
+      "ttft_ms": {
+        "mean": 242.782,
+        "median": 297.525,
+        "min": 126.649,
+        "max": 304.173,
+        "stdev": 100.629
+      },
+      "n_samples": 3
+    },
+    {
+      "n_documents": 4,
+      "mode": "baseline",
+      "prompt_tokens": 743,
+      "ttft_ms": {
+        "mean": 47.323,
+        "median": 48.175,
+        "min": 41.69,
+        "max": 52.104,
+        "stdev": 5.259
+      },
+      "n_samples": 3
+    },
+    {
+      "n_documents": 4,
+      "mode": "chunk_kv_reuse",
+      "prompt_tokens": 743,
+      "ttft_ms": {
+        "mean": 156.982,
+        "median": 150.758,
+        "min": 104.568,
+        "max": 215.619,
+        "stdev": 55.787
+      },
+      "n_samples": 3
+    }
+  ],
+  "multi_turn": [
+    {
+      "turn": 1,
+      "mode": "baseline",
+      "history_tokens": 118,
+      "ttft_ms": 59.77216601604596,
+      "kv_reuse_ratio": 0.0
+    },
+    {
+      "turn": 1,
+      "mode": "chunk_kv_reuse",
+      "history_tokens": 118,
+      "ttft_ms": 83.77291599754244,
+      "kv_reuse_ratio": 0.0
+    },
+    {
+      "turn": 2,
+      "mode": "baseline",
+      "history_tokens": 160,
+      "ttft_ms": 532.1811250178143,
+      "kv_reuse_ratio": 0.0
+    },
+    {
+      "turn": 2,
+      "mode": "chunk_kv_reuse",
+      "history_tokens": 160,
+      "ttft_ms": 379.6335000079125,
+      "kv_reuse_ratio": 0.8
+    },
+    {
+      "turn": 3,
+      "mode": "baseline",
+      "history_tokens": 202,
+      "ttft_ms": 286.88845795113593,
+      "kv_reuse_ratio": 0.0
+    },
+    {
+      "turn": 3,
+      "mode": "chunk_kv_reuse",
+      "history_tokens": 202,
+      "ttft_ms": 162.17616596259177,
+      "kv_reuse_ratio": 0.6336633663366337
+    },
+    {
+      "turn": 4,
+      "mode": "baseline",
+      "history_tokens": 255,
+      "ttft_ms": 207.72208296693861,
+      "kv_reuse_ratio": 0.0
+    },
+    {
+      "turn": 4,
+      "mode": "chunk_kv_reuse",
+      "history_tokens": 255,
+      "ttft_ms": 135.20508399233222,
+      "kv_reuse_ratio": 0.5019607843137255
+    },
+    {
+      "turn": 5,
+      "mode": "baseline",
+      "history_tokens": 312,
+      "ttft_ms": 259.3307500355877,
+      "kv_reuse_ratio": 0.0
+    },
+    {
+      "turn": 5,
+      "mode": "chunk_kv_reuse",
+      "history_tokens": 312,
+      "ttft_ms": 116.61029199603945,
+      "kv_reuse_ratio": 0.8205128205128205
+    },
+    {
+      "turn": 6,
+      "mode": "baseline",
+      "history_tokens": 372,
+      "ttft_ms": 187.9053339944221,
+      "kv_reuse_ratio": 0.0
+    },
+    {
+      "turn": 6,
+      "mode": "chunk_kv_reuse",
+      "history_tokens": 372,
+      "ttft_ms": 83.68633396457881,
+      "kv_reuse_ratio": 0.6881720430107527
+    },
+    {
+      "turn": 7,
+      "mode": "baseline",
+      "history_tokens": 425,
+      "ttft_ms": 204.42050002748147,
+      "kv_reuse_ratio": 0.0
+    },
+    {
+      "turn": 7,
+      "mode": "chunk_kv_reuse",
+      "history_tokens": 425,
+      "ttft_ms": 112.48412501299754,
+      "kv_reuse_ratio": 0.9035294117647059
+    },
+    {
+      "turn": 8,
+      "mode": "baseline",
+      "history_tokens": 483,
+      "ttft_ms": 419.1457909764722,
+      "kv_reuse_ratio": 0.0
+    },
+    {
+      "turn": 8,
+      "mode": "chunk_kv_reuse",
+      "history_tokens": 483,
+      "ttft_ms": 405.07866599364206,
+      "kv_reuse_ratio": 0.7950310559006211
+    }
+  ],
+  "server_simulation": {
+    "baseline": {
+      "ttft_ms": {
+        "mean": 332.878,
+        "median": 209.298,
+        "min": 31.035,
+        "max": 1719.02,
+        "stdev": 437.16,
+        "p95": 1719.02,
+        "p99": 1719.02
+      },
+      "total_ms": {
+        "mean": 1335.843,
+        "median": 1219.404,
+        "min": 746.199,
+        "max": 3247.972,
+        "stdev": 559.983,
+        "p95": 3247.972,
+        "p99": 3247.972
+      },
+      "tokens_per_sec": {
+        "mean": 13.434,
+        "median": 13.123,
+        "min": 4.926,
+        "max": 21.442,
+        "stdev": 4.105,
+        "p95": 21.442,
+        "p99": 21.442
+      },
+      "total_queries": 20,
+      "total_time_sec": 26.72,
+      "aggregate_qps": 0.75
+    },
+    "chunk_kv_reuse": {
+      "ttft_ms": {
+        "mean": 78.434,
+        "median": 48.429,
+        "min": 12.159,
+        "max": 710.637,
+        "stdev": 150.493,
+        "p95": 710.637,
+        "p99": 710.637
+      },
+      "total_ms": {
+        "mean": 1304.53,
+        "median": 978.646,
+        "min": 566.737,
+        "max": 4762.214,
+        "stdev": 1159.78,
+        "p95": 4762.214,
+        "p99": 4762.214
+      },
+      "tokens_per_sec": {
+        "mean": 16.568,
+        "median": 16.349,
+        "min": 3.36,
+        "max": 28.232,
+        "stdev": 6.15,
+        "p95": 28.232,
+        "p99": 28.232
+      },
+      "total_queries": 20,
+      "total_time_sec": 26.09,
+      "aggregate_qps": 0.77
+    }
+  },
+  "server_details": {
+    "baseline": [
+      {
+        "user_id": 0,
+        "ttft_ms": 295.7469579996541,
+        "total_ms": 1725.0582079868764,
+        "tokens_per_sec": 9.275049343796823,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 0,
+        "ttft_ms": 1719.0197500167415,
+        "total_ms": 3247.9721670388244,
+        "tokens_per_sec": 4.926150587856545,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 0,
+        "ttft_ms": 190.85983402328566,
+        "total_ms": 1748.893500014674,
+        "tokens_per_sec": 9.14864169823134,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 0,
+        "ttft_ms": 515.1279999990948,
+        "total_ms": 1294.659709034022,
+        "tokens_per_sec": 12.358459824117027,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 1,
+        "ttft_ms": 227.73537499597296,
+        "total_ms": 887.7884169924073,
+        "tokens_per_sec": 18.02231217907052,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 1,
+        "ttft_ms": 493.95954102510586,
+        "total_ms": 1193.6156250303611,
+        "tokens_per_sec": 13.404650261337707,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 1,
+        "ttft_ms": 367.10524995578453,
+        "total_ms": 1081.834250013344,
+        "tokens_per_sec": 14.789696295715029,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 1,
+        "ttft_ms": 65.99387497408316,
+        "total_ms": 1235.0335409864783,
+        "tokens_per_sec": 12.955113743081068,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 2,
+        "ttft_ms": 71.48154103197157,
+        "total_ms": 1039.2860830179416,
+        "tokens_per_sec": 15.395183541319284,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 2,
+        "ttft_ms": 79.49795800959691,
+        "total_ms": 1005.0334159750491,
+        "tokens_per_sec": 15.919868678672087,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 2,
+        "ttft_ms": 75.77925000805408,
+        "total_ms": 939.0177499735728,
+        "tokens_per_sec": 17.039081530088538,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 2,
+        "ttft_ms": 1320.4028339823708,
+        "total_ms": 2009.6748750074767,
+        "tokens_per_sec": 7.961486805143282,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 3,
+        "ttft_ms": 34.847666043788195,
+        "total_ms": 841.2511660135351,
+        "tokens_per_sec": 19.01929013164966,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 3,
+        "ttft_ms": 382.28529202751815,
+        "total_ms": 1539.8101250175387,
+        "tokens_per_sec": 10.390891539187507,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 3,
+        "ttft_ms": 115.90804200386629,
+        "total_ms": 1406.3032500562258,
+        "tokens_per_sec": 11.37734695511818,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 3,
+        "ttft_ms": 95.79137497348711,
+        "total_ms": 1203.7744999979623,
+        "tokens_per_sec": 13.291525946119547,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 4,
+        "ttft_ms": 270.7342079957016,
+        "total_ms": 891.0700419801287,
+        "tokens_per_sec": 17.955939764785413,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 4,
+        "ttft_ms": 31.035457970574498,
+        "total_ms": 746.1990829906426,
+        "tokens_per_sec": 21.441999011677478,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 4,
+        "ttft_ms": 60.42995798634365,
+        "total_ms": 1242.1227080048993,
+        "tokens_per_sec": 12.881175021507529,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 4,
+        "ttft_ms": 243.8212920096703,
+        "total_ms": 1438.465500017628,
+        "tokens_per_sec": 11.122964019508235,
+        "kv_reuse_ratio": 0.0
+      }
+    ],
+    "chunk_kv_reuse": [
+      {
+        "user_id": 0,
+        "ttft_ms": 710.6374999857508,
+        "total_ms": 4762.213749985676,
+        "tokens_per_sec": 3.35978199215609,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 0,
+        "ttft_ms": 14.791292021982372,
+        "total_ms": 566.7372920433991,
+        "tokens_per_sec": 28.231775506268903,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 0,
+        "ttft_ms": 12.159125006292015,
+        "total_ms": 610.6572499847971,
+        "tokens_per_sec": 26.20127739480426,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 0,
+        "ttft_ms": 27.339708001818508,
+        "total_ms": 4535.644416988362,
+        "tokens_per_sec": 3.5276133949283213,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 1,
+        "ttft_ms": 34.25874997628853,
+        "total_ms": 715.96858400153,
+        "tokens_per_sec": 22.347349251801543,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 1,
+        "ttft_ms": 20.578583993483335,
+        "total_ms": 1206.352084001992,
+        "tokens_per_sec": 13.263126256574346,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 1,
+        "ttft_ms": 26.840999955311418,
+        "total_ms": 722.0341669744812,
+        "tokens_per_sec": 22.159616167534473,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 1,
+        "ttft_ms": 24.138249980751425,
+        "total_ms": 715.270499989856,
+        "tokens_per_sec": 22.369159639922117,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 2,
+        "ttft_ms": 25.644333043601364,
+        "total_ms": 976.363375026267,
+        "tokens_per_sec": 16.387341444029026,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 2,
+        "ttft_ms": 51.371917012147605,
+        "total_ms": 1064.691125007812,
+        "tokens_per_sec": 15.027832602514277,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 2,
+        "ttft_ms": 52.857790957205,
+        "total_ms": 1018.1649159640074,
+        "tokens_per_sec": 15.71454658192682,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 2,
+        "ttft_ms": 45.486750022973865,
+        "total_ms": 1159.9754170165397,
+        "tokens_per_sec": 13.793395761051599,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 3,
+        "ttft_ms": 81.04412502143532,
+        "total_ms": 1087.2347920085303,
+        "tokens_per_sec": 14.716232517211854,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 3,
+        "ttft_ms": 81.68325002770871,
+        "total_ms": 1234.1819169814698,
+        "tokens_per_sec": 12.964053175509479,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 3,
+        "ttft_ms": 39.39479199470952,
+        "total_ms": 944.5570830139332,
+        "tokens_per_sec": 16.939156232830857,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 3,
+        "ttft_ms": 52.32412496116012,
+        "total_ms": 863.4620829834603,
+        "tokens_per_sec": 18.530055129596793,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 4,
+        "ttft_ms": 56.78637500386685,
+        "total_ms": 905.931250017602,
+        "tokens_per_sec": 17.661384348634762,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 4,
+        "ttft_ms": 73.34383396664634,
+        "total_ms": 1085.3105419664644,
+        "tokens_per_sec": 14.74232432222555,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 4,
+        "ttft_ms": 85.10629198281094,
+        "total_ms": 934.9141669808887,
+        "tokens_per_sec": 17.113870518904083,
+        "kv_reuse_ratio": 0.0
+      },
+      {
+        "user_id": 4,
+        "ttft_ms": 52.900708047673106,
+        "total_ms": 980.9294170117937,
+        "tokens_per_sec": 16.311061451027555,
+        "kv_reuse_ratio": 0.0
+      }
+    ]
+  }
+}

@@ -1,0 +1,4525 @@
+{
+  "model": "Qwen/Qwen2.5-3B",
+  "n_samples_per_bench": 500,
+  "chunk_size": 128,
+  "total_time_seconds": 3513.835348499939,
+  "benchmarks": {
+    "hellaswag": {
+      "n_samples": 500,
+      "baseline_accuracy": 0.596,
+      "cached_accuracy": 0.596,
+      "divergence_rate": 0.0,
+      "mcnemar_pvalue": null,
+      "cache_hit_rate": 0.0,
+      "speedup": 0.5485648463018493,
+      "confusion_matrix": {
+        "both_correct": 298,
+        "both_wrong": 202,
+        "baseline_only_correct": 0,
+        "cached_only_correct": 0
+      },
+      "samples": [
+        {
+          "idx": 0,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 1,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 2,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 3,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 4,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 5,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 6,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 7,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 8,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 9,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 10,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 11,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 12,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 13,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 14,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 15,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 16,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 17,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 18,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 19,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 20,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 21,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 22,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 23,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 24,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 25,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 26,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 27,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 28,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 29,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 30,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 31,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 32,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 33,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 34,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 35,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 36,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 37,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 38,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 39,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 40,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 41,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 42,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 43,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 44,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 45,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 46,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 47,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 48,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 49,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 50,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 51,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 52,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 53,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 54,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 55,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 56,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 57,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 58,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 59,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 60,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 61,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 62,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 63,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 64,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 65,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 66,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 67,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 68,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 69,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 70,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 71,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 72,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 73,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 74,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 75,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 76,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 77,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 78,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 79,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 80,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 81,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 82,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 83,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 84,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 85,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 86,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 87,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 88,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 89,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 90,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 91,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 92,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 93,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 94,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 95,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 96,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 97,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 98,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 99,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 100,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 101,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 102,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 103,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 104,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 105,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 106,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 107,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 108,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 109,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 110,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 111,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 112,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 113,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 114,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 115,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 116,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 117,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 118,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 119,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 120,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 121,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 122,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 123,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 124,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 125,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 126,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 127,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 128,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 129,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 130,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 131,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 132,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 133,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 134,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 135,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 136,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 137,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 138,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 139,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 140,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 141,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 142,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 143,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 144,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 145,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 146,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 147,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 148,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 149,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 150,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 151,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 152,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 153,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 154,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 155,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 156,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 157,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 158,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 159,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 160,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 161,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 162,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 163,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 164,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 165,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 166,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 167,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 168,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 169,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 170,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 171,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 172,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 173,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 174,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 175,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 176,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 177,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 178,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 179,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 180,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 181,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 182,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 183,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 184,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 185,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 186,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 187,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 188,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 189,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 190,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 191,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 192,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 193,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 194,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 195,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 196,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 197,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 198,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 199,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 200,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 201,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 202,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 203,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 204,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 205,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 206,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 207,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 208,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 209,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 210,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 211,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 212,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 213,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 214,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 215,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 216,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 217,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 218,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 219,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 220,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 221,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 222,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 223,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 224,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 225,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 226,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 227,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 228,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 229,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 230,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 231,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 232,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 233,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 234,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 235,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 236,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 237,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 238,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 239,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 240,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 241,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 242,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 243,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 244,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 245,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 246,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 247,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 248,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 249,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 250,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 251,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 252,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 253,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 254,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 255,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 256,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 257,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 258,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 259,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 260,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 261,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 262,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 263,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 264,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 265,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 266,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 267,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 268,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 269,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 270,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 271,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 272,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 273,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 274,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 275,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 276,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 277,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 278,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 279,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 280,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 281,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 282,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 283,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 284,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 285,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 286,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 287,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 288,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 289,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 290,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 291,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 292,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 293,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 294,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 295,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 296,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 297,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 298,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 299,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 300,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 301,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 302,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 303,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 304,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 305,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 306,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 307,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 308,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 309,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 310,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 311,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 312,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 313,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 314,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 315,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 316,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 317,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 318,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 319,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 320,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 321,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 322,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 323,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 324,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 325,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 326,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 327,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 328,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 329,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 330,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 331,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 332,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 333,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 334,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 335,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 336,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 337,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 338,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 339,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 340,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 341,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 342,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 343,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 344,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 345,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 346,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 347,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 348,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 349,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 350,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 351,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 352,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 353,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 354,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 355,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 356,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 357,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 358,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 359,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 360,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 361,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 362,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 363,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 364,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 365,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 366,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 367,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 368,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 369,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 370,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 371,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 372,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 373,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 374,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 375,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 376,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 377,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 378,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 379,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 380,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 381,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 382,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 383,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 384,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 385,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 386,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 387,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 388,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 389,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 390,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 391,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 392,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 393,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 394,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 395,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 396,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 397,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 398,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 399,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 400,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 401,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 402,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 403,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 404,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 405,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 406,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 407,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 408,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 409,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 410,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 411,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 412,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 413,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 414,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 415,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 416,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 417,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 418,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 419,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 420,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 421,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 422,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 423,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 424,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 425,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 426,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 427,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 428,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 429,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 430,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 431,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 432,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 433,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 434,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 435,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 436,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 437,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 438,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 439,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 440,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 441,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 442,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 443,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 444,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 445,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 446,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 447,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 448,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 449,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 450,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 451,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 452,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 453,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 454,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 455,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 456,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 457,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 458,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 459,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 460,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 461,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 462,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 463,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 464,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "A",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 465,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 466,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 467,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 468,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 469,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 470,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 471,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 472,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 473,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "B",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 474,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 475,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 476,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 477,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 478,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 479,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 480,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 481,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 482,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 483,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 484,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 485,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 486,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 487,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 488,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 489,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 490,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "D",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 491,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 492,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 493,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 494,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "C",
+          "baseline_correct": false,
+          "cached_correct": false,
+          "diverged": false
+        },
+        {
+          "idx": 495,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 496,
+          "baseline_output": "A",
+          "cached_output": "A",
+          "gold_answer": "A",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 497,
+          "baseline_output": "B",
+          "cached_output": "B",
+          "gold_answer": "B",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 498,
+          "baseline_output": "C",
+          "cached_output": "C",
+          "gold_answer": "C",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        },
+        {
+          "idx": 499,
+          "baseline_output": "D",
+          "cached_output": "D",
+          "gold_answer": "D",
+          "baseline_correct": true,
+          "cached_correct": true,
+          "diverged": false
+        }
+      ]
+    }
+  }
+}
