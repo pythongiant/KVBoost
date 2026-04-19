@@ -26,115 +26,6 @@
   <a href="https://kvboost.readthedocs.io/en/latest/">Docs</a>
 </p>
 
----
-
-## TL;DR
-
-- **What it is**: a library that caches the per-chunk KV tensors of your HF
-  model and reuses them across requests that share prefixes.
-- **What it gives you**: lower TTFT on repeated long context. Exact
-  magnitude depends on reuse ratio, context length, and model size.
-- **What it costs you**: a small accuracy tax on long-context reasoning
-  tasks, and extra RAM for the cache. Quantified below.
-- **What it is not**: a free speedup. Short prompts, small models, and
-  prompts with zero overlap will get slower, not faster.
-
----
-
-## Headline results
-
-All numbers come from [`benchmarks_and_experiments/`](benchmarks_and_experiments/)
-and are reproducible from the scripts in that directory. We report what we
-actually measured, including the cases where KVBoost lost.
-
-### Bug-localization arena (Qwen2.5-3B, 720 samples, selective recompute + all continuity features)
-
-Dataset: `JetBrains-Research/lca-bug-localization`, 4-way multiple choice
-over code diffs (100–3K tokens).
-
-| Metric                   | Baseline HF | KVBoost | Delta |
-|--------------------------|-------------|---------|-------|
-| Accuracy                 | 99.58%      | 97.36%  | **−2.22 pp** |
-| TTFT (mean)              | 8331 ms     | 4209 ms | **1.98× faster** |
-| Total latency (mean)     | 13476 ms    | 14445 ms| **0.93× (7% slower)** |
-| Logit cosine (min / mean)| —           | 1.000 / 1.000 | identical under greedy |
-
-McNemar: 0 samples where baseline was wrong and KVBoost was right;
-16 samples where baseline was right and KVBoost was wrong. The accuracy
-cost is real and one-sided.
-
-**What this means.** Prefill gets meaningfully faster (2× TTFT). Total
-wall-clock gets slightly worse here because this benchmark generates short
-MC answers, so the decode phase dominates and KVBoost's extra stitching
-work shows up. For workloads that generate longer answers, TTFT savings
-translate directly into total speedup.
-
-### Accuracy vs. KV reuse (same run)
-
-Accuracy is close to baseline at low reuse and degrades as reuse climbs.
-This is the honest picture: the more of the prompt you serve from cached
-chunks, the more likely a downstream token depends on context the seam
-repair didn't fully reconstruct.
-
-| Reuse bucket | N   | Accuracy | TTFT speedup |
-|--------------|-----|----------|--------------|
-| ~0.0         | 360 | 99.44%   | 1.24×        |
-| ~0.2         | 16  | 100.00%  | 0.90×        |
-| ~0.3         | 15  | 100.00%  | 1.62×        |
-| ~0.4         | 26  | 100.00%  | 3.25×        |
-| ~0.5         | 34  | 100.00%  | 2.61×        |
-| ~0.6         | 46  | 100.00%  | 3.08×        |
-| ~0.7         | 66  | 95.45%   | 3.56×        |
-| ~0.8         | 81  | 91.36%   | 4.04×        |
-| ~0.9         | 73  | 90.41%   | 7.57×        |
-| ~1.0         | 3   | 100.00%  | 29.23×       |
-
-### Context-length scaling (earlier 820-sample checkpoint, same workload)
-
-Speedup and reuse both grow with context length; the short-context bucket
-is essentially free of accuracy loss, and the hit concentrates in the
-1K–4K bucket where reuse is highest.
-
-| Context   | N   | Base acc | KV acc | Δ acc  | Base TTFT | KV TTFT  | Speedup | Reuse |
-|-----------|-----|----------|--------|--------|-----------|----------|---------|-------|
-| 0–512     | 200 | 100.0%   | 100.0% | +0.0%  | 387 ms    | 243 ms   | 2.3×    | 21%   |
-| 512–1K    | 200 | 99.5%    | 98.0%  | −1.5%  | 4521 ms   | 2309 ms  | 3.5×    | 33%   |
-| 1K–2K     | 200 | 99.0%    | 96.0%  | −3.0%  | 9134 ms   | 5255 ms  | 4.1×    | 40%   |
-| 2K–4K     | 200 | 98.5%    | 92.0%  | −6.5%  | 26 075 ms | 10 909 ms| 11.2×   | 44%   |
-| 4K+       | 20  | 100.0%   | 90.0%  | −10.0% | 73 791 ms | 39 428 ms| 29.0×   | 42%   |
-| **All**   | 820 | 99.3%    | 96.3%  | −2.9%  | 11 584 ms | 5527 ms  | 5.8×    | 35%   |
-
-Takeaway: you buy 2–29× TTFT with 0–10 points of task accuracy, and the
-trade sharpens with context length. If you are latency-bound on long
-prompts, this is usually a good deal; if you are accuracy-bound on long
-reasoning, it is not.
-
----
-
-## When KVBoost helps (and when it doesn't)
-
-| Workload                                                  | Expect             |
-|-----------------------------------------------------------|--------------------|
-| Multi-turn conversation, 3B+ model, repeated system prompt| **~2× TTFT**       |
-| Code/doc Q&A with repeated code context, 1K–4K tokens     | **3–11× TTFT**     |
-| Very long shared context (4K+)                            | **up to ~29× TTFT**|
-| RAG with mostly-unique documents (~500 tok, low reuse)    | roughly break-even |
-| Short prompts (<500 tok) or <1B models                    | **slower** than baseline |
-| One-shot prompts with no shared prefix                    | slower (pure overhead) |
-
-Rules of thumb:
-
-1. **You need reuse.** If successive prompts share nothing, KVBoost adds
-   hashing and bookkeeping for no gain. `% zero reuse: 50%` in the bug
-   run above is why the mean total latency was a wash.
-2. **Prefill has to be expensive enough to amortize the overhead.** On a
-   0.5B model or a 200-token prompt, prefill is already cheap. KVBoost
-   cannot beat "just run it."
-3. **Accuracy-critical long-context work needs testing.** Run
-   `verify_correctness()` on your own prompts before shipping; don't
-   assume the bug-localization numbers transfer.
-
----
 
 ## Quick start
 
@@ -276,43 +167,6 @@ minimal accuracy loss. `kv_cache_bits=4` is available for 4× but you
 should validate it with `verify_correctness()` on your workload before
 trusting it.
 
----
-
-## Benchmarks
-
-All runners live under [`benchmarks_and_experiments/`](benchmarks_and_experiments/).
-The main ones:
-
-| Script                                    | What it measures                              |
-|-------------------------------------------|-----------------------------------------------|
-| `long_bench_arena.py`                     | Paired accuracy + latency on code bug-loc MC  |
-| `01_scale_models.py`                      | TTFT across 1.1B / 3B / 7B on shared workloads|
-| `02_latency_breakdown.py`                 | Where time goes (hash, lookup, recompute, fwd)|
-| `03_hyperparameter_sweep.py`              | Chunk size, recompute window, strategy sweep  |
-| `04_output_quality.py`                    | Logit cosine, KL, output-identity stats       |
-| `05_realistic_workloads.py`               | Multi-turn, RAG, system-prompt scenarios      |
-| `06_memory_analysis.py`                   | RAM / disk footprint vs. cache size           |
-| `10_statistical_rigor.py`                 | McNemar, bootstrap CIs on paired runs         |
-| `run_ablation.sh`                         | Adaptive / overlap / sink / recompute ablation|
-
-Reproduce the headline numbers:
-
-```bash
-cd benchmarks_and_experiments
-python long_bench_arena.py \
-    --model Qwen/Qwen2.5-3B \
-    --n-samples 1000 \
-    --recompute-strategy selective \
-    --chunk-boundary-window 16 \
-    --overlap-k 16 \
-    --sink-tokens 32 \
-    --output results/ablation_all_selective.json
-```
-
-Raw JSON outputs are in
-[`benchmarks_and_experiments/results/`](benchmarks_and_experiments/results/).
-
----
 
 ## API reference
 
@@ -339,25 +193,6 @@ engine.verify_correctness(prompts: list[str], ...) -> CorrectnessReport
 Full docs: [kvboost.readthedocs.io](https://kvboost.readthedocs.io/en/latest/)
 
 ---
-
-## Limitations and known sharp edges
-
-- **Accuracy tax scales with reuse.** At >70% reuse, expect 5–10 points
-  of accuracy loss on hard long-context tasks. Validate on your own
-  data.
-- **Total-latency can regress on short-output workloads.** TTFT wins
-  don't show up in wall-clock if you generate 5 tokens. The 3B bug-loc
-  MC run is the clearest example.
-- **No free lunch on small models.** Below ~1B params, or below ~500
-  tokens of shared context, the hashing and stitching cost dominates.
-- **Greedy-equivalent ≠ task-equivalent.** Logit cosine 1.0 still
-  coexists with a 2.2pp accuracy gap — a perturbation that doesn't flip
-  the first argmax can still flip token 40.
-- **`kv_cache_bits=4` is unvalidated for your workload by default.**
-  Run `verify_correctness()` first.
-
----
-
 ## License
 
 [MIT](LICENSE)
