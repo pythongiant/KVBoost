@@ -701,7 +701,12 @@ def run_benchmark(
                 result = runner.run_cold(prompt, max_tokens=16, cacheable_prefix_len=prefix_len)
         except RuntimeError as e:
             if "Invalid buffer size" in str(e) or "out of memory" in str(e).lower():
-                log.warning(f"OOM at {context_tokens} tokens — skipping pair")
+                import traceback
+                log.warning(
+                    f"OOM at {context_tokens} tokens [{query_type}] — skipping pair\n"
+                    f"  exception: {type(e).__name__}: {e}\n"
+                    f"  traceback:\n{traceback.format_exc()}"
+                )
                 runner.reset_cache()
                 gc.collect()
                 continue
