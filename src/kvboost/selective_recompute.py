@@ -39,7 +39,7 @@ import torch
 
 from .models import PastKVType, AssembledPrompt
 from .cache_manager import KVCacheManager
-from .compat import default_device, logits_to_keep_kwargs
+from .compat import default_device, last_logit_only
 
 log = logging.getLogger(__name__)
 
@@ -144,13 +144,12 @@ class SelectiveRecompute:
             input_ids = input_ids.to(model_device)
             pos_ids = pos_ids.to(model_device)
 
-            with torch.no_grad():
+            with torch.no_grad(), last_logit_only(model):
                 out = model(
                     input_ids=input_ids,
                     past_key_values=prefix_kv_dev,
                     position_ids=pos_ids,
                     use_cache=True,
-                    **logits_to_keep_kwargs(model),
                 )
 
             # Normalize DynamicCache → plain tuple[(key, val), ...]

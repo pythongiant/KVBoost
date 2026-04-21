@@ -41,7 +41,7 @@ from .chunk_registry import ChunkRegistry, ChunkStrategy
 from .prompt_assembler import AssemblyMode, PromptAssembler
 from .selective_recompute import SelectiveRecompute
 from .cacheblend import CacheBlendRecompute
-from .compat import check_model_compatibility, default_device, SUPPORTED_ARCHITECTURES
+from .compat import check_model_compatibility, default_device, last_logit_only, SUPPORTED_ARCHITECTURES
 
 log = logging.getLogger(__name__)
 
@@ -523,7 +523,7 @@ class InferenceEngine:
         generated = []
         first_token_logits = None
 
-        with torch.no_grad():
+        with torch.no_grad(), last_logit_only(self.model):
             past = None
             cur_ids = input_ids
             for step in range(max_new_tokens):
@@ -531,7 +531,6 @@ class InferenceEngine:
                     input_ids=cur_ids,
                     past_key_values=self._as_cache(past),
                     use_cache=True,
-                    **self._forward_kwargs(keep_last_logit=True),
                 )
                 if first_token_time is None:
                     first_token_time = time.perf_counter()
@@ -661,13 +660,12 @@ class InferenceEngine:
                 dtype=torch.long, device=self.device,
             ).unsqueeze(0)
 
-            with torch.no_grad():
+            with torch.no_grad(), last_logit_only(self.model):
                 out = self.model(
                     input_ids=input_ids,
                     past_key_values=self._as_cache(past_kv),
                     position_ids=pos_ids,
                     use_cache=True,
-                    **self._forward_kwargs(keep_last_logit=True),
                 )
             first_token_time = time.perf_counter()
             # Capture first-token logits for comparison with baseline
@@ -691,13 +689,12 @@ class InferenceEngine:
                 trimmed_kv = tuple(
                     (layer[0].to(self.device), layer[1].to(self.device)) for layer in trimmed_kv
                 )
-            with torch.no_grad():
+            with torch.no_grad(), last_logit_only(self.model):
                 out = self.model(
                     input_ids=input_ids,
                     past_key_values=self._as_cache(trimmed_kv),
                     position_ids=pos_ids,
                     use_cache=True,
-                    **self._forward_kwargs(keep_last_logit=True),
                 )
             first_token_time = time.perf_counter()
             # Capture first-token logits for comparison with baseline
@@ -714,13 +711,12 @@ class InferenceEngine:
                 break
             cur_ids = torch.tensor([[generated[-1]]], dtype=torch.long, device=self.device)
             pos_ids = torch.tensor([[cur_pos]], dtype=torch.long, device=self.device)
-            with torch.no_grad():
+            with torch.no_grad(), last_logit_only(self.model):
                 out = self.model(
                     input_ids=cur_ids,
                     past_key_values=self._as_cache(past_kv),
                     position_ids=pos_ids,
                     use_cache=True,
-                    **self._forward_kwargs(keep_last_logit=True),
                 )
             past_kv = self._normalize_past_kv(out.past_key_values)
             next_token = self._sample(out.logits[:, -1, :], temperature, do_sample)
@@ -774,35 +770,6 @@ class InferenceEngine:
 
     def _encode(self, text: str) -> List[int]:
         return self.tokenizer.encode(text, add_special_tokens=True)
-
-    def _forward_kwargs(self, keep_last_logit: bool = False) -> dict:
-        """
-        Build extra kwargs for self.model(...). When keep_last_logit=True,
-        ask the LM head to project only the final token position — saves a
-        `[batch, seq_len, vocab]` tensor worth of memory on long prefills.
-
-        transformers >= 4.45 accepts `logits_to_keep`; older versions used
-        `num_logits_to_keep`. We probe once and cache the chosen key. If the
-        model forward accepts neither, we return {} and the caller just
-        pays the full logits allocation.
-        """
-        if not keep_last_logit:
-            return {}
-        key = getattr(self, "_logits_kwarg", None)
-        if key is None:
-            import inspect
-            try:
-                params = inspect.signature(self.model.forward).parameters
-            except (TypeError, ValueError):
-                params = {}
-            if "logits_to_keep" in params:
-                key = "logits_to_keep"
-            elif "num_logits_to_keep" in params:
-                key = "num_logits_to_keep"
-            else:
-                key = ""
-            self._logits_kwarg = key
-        return {key: 1} if key else {}
 
     @staticmethod
     def _kv_importance(kv: PastKVType) -> float:
@@ -864,12 +831,11 @@ class InferenceEngine:
             position_offset, position_offset + len(token_ids),
             dtype=torch.long, device=self.device,
         ).unsqueeze(0)
-        with torch.no_grad():
+        with torch.no_grad(), last_logit_only(self.model):
             out = self.model(
                 input_ids=input_ids,
                 position_ids=pos_ids,
                 use_cache=True,
-                **self._forward_kwargs(keep_last_logit=True),
             )
         kv = out.past_key_values
         # Extract (k, v) tuples for CPU storage
@@ -925,12 +891,11 @@ class InferenceEngine:
         input_ids = torch.tensor([full_ids], dtype=torch.long, device=self.device)
         pos_ids = torch.tensor([all_positions], dtype=torch.long, device=self.device)
 
-        with torch.no_grad():
+        with torch.no_grad(), last_logit_only(self.model):
             out = self.model(
                 input_ids=input_ids,
                 position_ids=pos_ids,
                 use_cache=True,
-                **self._forward_kwargs(keep_last_logit=True),
             )
 
         # Extract full KV to CPU

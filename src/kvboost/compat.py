@@ -42,6 +42,9 @@ def logits_to_keep_kwargs(model) -> dict:
 
     The kwarg choice is cached per model type since inspecting signatures
     on every forward is wasteful.
+
+    Note: relying on this kwarg alone is brittle across transformers versions
+    and stale bytecode. For hard guarantees use `last_logit_only(model)`.
     """
     cls = type(model)
     if cls in _logits_kwarg_cache:
@@ -59,6 +62,60 @@ def logits_to_keep_kwargs(model) -> dict:
             key = ""
         _logits_kwarg_cache[cls] = key
     return {key: 1} if key else {}
+
+
+class _LastTokenHead(torch.nn.Module):
+    """
+    Wraps an LM head so it projects only the final sequence position on
+    the forward pass. Replaces `x → self.inner(x)` with
+    `x → self.inner(x[:, -1:, :])`. Downstream callers that only read
+    logits[:, -1, :] get identical results. Callers that try to read
+    intermediate positions will see wrong values — only use this inside
+    `last_logit_only()` context.
+    """
+    def __init__(self, inner: torch.nn.Module):
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.dim() >= 3 and hidden_states.shape[-2] > 1:
+            hidden_states = hidden_states[..., -1:, :]
+        return self.inner(hidden_states)
+
+
+class last_logit_only:  # noqa: N801 — context-manager factory
+    """
+    Context manager that temporarily replaces the model's LM head with a
+    last-position-only projection. Guarantees the `[batch, seq_len, vocab]`
+    allocation is reduced to `[batch, 1, vocab]`, regardless of
+    transformers version or whether `logits_to_keep` is honored.
+
+        with last_logit_only(model):
+            out = model(input_ids=...)
+            # out.logits.shape == [batch, 1, vocab]
+
+    Works for any HF CausalLM that exposes an `lm_head` attribute. If the
+    model has no `lm_head` (e.g. models where the projection lives in a
+    submodule), the context manager is a no-op and falls back to whatever
+    the forward pass does naturally.
+    """
+    def __init__(self, model):
+        self.model = model
+        self._original = None
+
+    def __enter__(self):
+        head = getattr(self.model, "lm_head", None)
+        if head is None or isinstance(head, _LastTokenHead):
+            return self
+        self._original = head
+        self.model.lm_head = _LastTokenHead(head)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._original is not None:
+            self.model.lm_head = self._original
+            self._original = None
+        return False
 
 
 def default_device() -> str:

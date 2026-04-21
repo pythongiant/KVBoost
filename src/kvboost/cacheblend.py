@@ -50,7 +50,7 @@ import torch.nn.functional as F
 
 from .models import PastKVType, AssembledPrompt
 from .cache_manager import KVCacheManager
-from .compat import default_device, logits_to_keep_kwargs
+from .compat import default_device, last_logit_only
 
 log = logging.getLogger(__name__)
 
@@ -124,12 +124,11 @@ class CacheBlendRecompute:
             0, cached_length, dtype=torch.long, device=model_device
         ).unsqueeze(0)
 
-        with torch.no_grad():
+        with torch.no_grad(), last_logit_only(model):
             out = model(
                 input_ids=input_ids,
                 position_ids=pos_ids,
                 use_cache=True,
-                **logits_to_keep_kwargs(model),
             )
 
         updated_kv = self._extract_kv(out.past_key_values)
