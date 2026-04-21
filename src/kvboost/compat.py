@@ -19,6 +19,7 @@ Known-broken architectures:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import warnings
 from typing import Optional
@@ -26,6 +27,38 @@ from typing import Optional
 import torch
 
 log = logging.getLogger(__name__)
+
+
+_logits_kwarg_cache: dict = {}
+
+
+def logits_to_keep_kwargs(model) -> dict:
+    """
+    Return {"logits_to_keep": 1} (or {"num_logits_to_keep": 1}) if the given
+    model's forward accepts either, else {}. Used by callers that only need
+    the final token's logits (or don't need logits at all) to avoid a
+    `[batch, seq_len, vocab]` allocation on the LM head — a 1.5GB+ tensor
+    on long prefills with large-vocab models like Qwen2.5.
+
+    The kwarg choice is cached per model type since inspecting signatures
+    on every forward is wasteful.
+    """
+    cls = type(model)
+    if cls in _logits_kwarg_cache:
+        key = _logits_kwarg_cache[cls]
+    else:
+        try:
+            params = inspect.signature(model.forward).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "logits_to_keep" in params:
+            key = "logits_to_keep"
+        elif "num_logits_to_keep" in params:
+            key = "num_logits_to_keep"
+        else:
+            key = ""
+        _logits_kwarg_cache[cls] = key
+    return {key: 1} if key else {}
 
 
 def default_device() -> str:

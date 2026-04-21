@@ -50,7 +50,7 @@ import torch.nn.functional as F
 
 from .models import PastKVType, AssembledPrompt
 from .cache_manager import KVCacheManager
-from .compat import default_device
+from .compat import default_device, logits_to_keep_kwargs
 
 log = logging.getLogger(__name__)
 
@@ -129,6 +129,7 @@ class CacheBlendRecompute:
                 input_ids=input_ids,
                 position_ids=pos_ids,
                 use_cache=True,
+                **logits_to_keep_kwargs(model),
             )
 
         updated_kv = self._extract_kv(out.past_key_values)
