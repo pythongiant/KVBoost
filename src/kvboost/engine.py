@@ -527,7 +527,12 @@ class InferenceEngine:
             past = None
             cur_ids = input_ids
             for step in range(max_new_tokens):
-                out = self.model(input_ids=cur_ids, past_key_values=self._as_cache(past), use_cache=True)
+                out = self.model(
+                    input_ids=cur_ids,
+                    past_key_values=self._as_cache(past),
+                    use_cache=True,
+                    **self._forward_kwargs(keep_last_logit=True),
+                )
                 if first_token_time is None:
                     first_token_time = time.perf_counter()
                 # Capture first-token logits for comparison with cached versions
@@ -662,6 +667,7 @@ class InferenceEngine:
                     past_key_values=self._as_cache(past_kv),
                     position_ids=pos_ids,
                     use_cache=True,
+                    **self._forward_kwargs(keep_last_logit=True),
                 )
             first_token_time = time.perf_counter()
             # Capture first-token logits for comparison with baseline
@@ -691,6 +697,7 @@ class InferenceEngine:
                     past_key_values=self._as_cache(trimmed_kv),
                     position_ids=pos_ids,
                     use_cache=True,
+                    **self._forward_kwargs(keep_last_logit=True),
                 )
             first_token_time = time.perf_counter()
             # Capture first-token logits for comparison with baseline
@@ -713,6 +720,7 @@ class InferenceEngine:
                     past_key_values=self._as_cache(past_kv),
                     position_ids=pos_ids,
                     use_cache=True,
+                    **self._forward_kwargs(keep_last_logit=True),
                 )
             past_kv = self._normalize_past_kv(out.past_key_values)
             next_token = self._sample(out.logits[:, -1, :], temperature, do_sample)
@@ -766,6 +774,35 @@ class InferenceEngine:
 
     def _encode(self, text: str) -> List[int]:
         return self.tokenizer.encode(text, add_special_tokens=True)
+
+    def _forward_kwargs(self, keep_last_logit: bool = False) -> dict:
+        """
+        Build extra kwargs for self.model(...). When keep_last_logit=True,
+        ask the LM head to project only the final token position — saves a
+        `[batch, seq_len, vocab]` tensor worth of memory on long prefills.
+
+        transformers >= 4.45 accepts `logits_to_keep`; older versions used
+        `num_logits_to_keep`. We probe once and cache the chosen key. If the
+        model forward accepts neither, we return {} and the caller just
+        pays the full logits allocation.
+        """
+        if not keep_last_logit:
+            return {}
+        key = getattr(self, "_logits_kwarg", None)
+        if key is None:
+            import inspect
+            try:
+                params = inspect.signature(self.model.forward).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "logits_to_keep" in params:
+                key = "logits_to_keep"
+            elif "num_logits_to_keep" in params:
+                key = "num_logits_to_keep"
+            else:
+                key = ""
+            self._logits_kwarg = key
+        return {key: 1} if key else {}
 
     @staticmethod
     def _kv_importance(kv: PastKVType) -> float:
@@ -832,6 +869,7 @@ class InferenceEngine:
                 input_ids=input_ids,
                 position_ids=pos_ids,
                 use_cache=True,
+                **self._forward_kwargs(keep_last_logit=True),
             )
         kv = out.past_key_values
         # Extract (k, v) tuples for CPU storage
@@ -892,6 +930,7 @@ class InferenceEngine:
                 input_ids=input_ids,
                 position_ids=pos_ids,
                 use_cache=True,
+                **self._forward_kwargs(keep_last_logit=True),
             )
 
         # Extract full KV to CPU
