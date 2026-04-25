@@ -34,113 +34,122 @@ RESULTS_DIR.mkdir(exist_ok=True, parents=True)
 def run_all_benchmarks(
     model: str,
     n_samples: int,
+    max_context_tokens: int = 8192,
     output_dir: Path = RESULTS_DIR,
     backends: list = None,
+    checkpoint: bool = True,
+    kvboost_max_cache_bytes: int = 4_000_000_000,
+    kvboost_recency_window_chunks: int = 8,
     kvboost_recompute_strategy: str = "selective",
     kvboost_chunk_boundary_window: int = 0,
     kvboost_overlap_k: int = 0,
     kvboost_sink_tokens: int = 0,
 ) -> Dict[str, Any]:
     """Run all three benchmarks"""
-    
+
     if backends is None:
         backends = ['kvboost', 'vllm_prefixcache', 'baseline']
-    
+
     print(f"\n{'='*100}")
     print(f"  COMPREHENSIVE 3-WAY BENCHMARK SUITE")
     print(f"  KVBoost vs vLLM (prefix-caching) vs Baseline")
     print(f"{'='*100}")
-    print(f"  Model:          {model}")
-    print(f"  Samples/backend: {n_samples}")
-    print(f"  Backends:        {', '.join(backends)}")
-    print(f"  Timestamp:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Model:              {model}")
+    print(f"  Samples/backend:    {n_samples}")
+    print(f"  Max context tokens: {max_context_tokens}")
+    print(f"  Backends:           {', '.join(backends)}")
+    print(f"  Checkpoint:         {checkpoint}")
+    print(f"  KVBoost cache:      {kvboost_max_cache_bytes/1e9:.2f} GB  recency={kvboost_recency_window_chunks} chunks")
+    print(f"  KVBoost strategy:   {kvboost_recompute_strategy}  boundary={kvboost_chunk_boundary_window}  overlap={kvboost_overlap_k}  sink={kvboost_sink_tokens}")
+    print(f"  Timestamp:          {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*100}\n")
-    
+
     all_results = {
         "timestamp": datetime.now().isoformat(),
         "model": model,
         "n_samples": n_samples,
+        "max_context_tokens": max_context_tokens,
         "backends": backends,
     }
-    
+
+    shared_kwargs = dict(
+        max_context_tokens=max_context_tokens,
+        kvboost_max_cache_bytes=kvboost_max_cache_bytes,
+        kvboost_recency_window_chunks=kvboost_recency_window_chunks,
+        kvboost_recompute_strategy=kvboost_recompute_strategy,
+        kvboost_chunk_boundary_window=kvboost_chunk_boundary_window,
+        kvboost_overlap_k=kvboost_overlap_k,
+        kvboost_sink_tokens=kvboost_sink_tokens,
+        checkpoint=checkpoint,
+    )
+
     # === ACCURACY BENCHMARK ===
     if benchmark_accuracy:
         print("\n► RUNNING ACCURACY BENCHMARK...")
         print(f"  Testing exact-match accuracy on LongBench tasks\n")
-        
+
         accuracy_results = {}
         for backend in backends:
             print(f"  [{backend}] Running...")
             accuracy_results[backend] = benchmark_accuracy(
-                backend, model, n_samples,
-                kvboost_recompute_strategy=kvboost_recompute_strategy,
-                kvboost_chunk_boundary_window=kvboost_chunk_boundary_window,
-                kvboost_overlap_k=kvboost_overlap_k,
-                kvboost_sink_tokens=kvboost_sink_tokens,
+                backend, model, n_samples, **shared_kwargs,
             )
 
         accuracy_agg = aggregate_accuracy_results(accuracy_results)
         print_accuracy_table(accuracy_agg)
-        
+
         accuracy_output = save_accuracy_results(accuracy_agg, model)
         all_results["accuracy"] = accuracy_agg
         log.info(f"  ✓ Accuracy benchmark complete: {accuracy_output}")
     else:
         log.warning("  ⚠ Accuracy benchmark module not available")
-    
+
     # === LATENCY BENCHMARK ===
     if benchmark_latency:
         print("\n► RUNNING LATENCY BENCHMARK...")
         print(f"  Measuring TTFT and throughput\n")
-        
+
         latency_results = {}
         for backend in backends:
             print(f"  [{backend}] Running...")
-            vllm_pc = True if backend == 'vllm_prefixcache' else False
+            vllm_pc = backend == 'vllm_prefixcache'
             latency_results[backend] = benchmark_latency(
                 backend, model, n_samples,
                 vllm_prefix_caching=vllm_pc,
-                kvboost_recompute_strategy=kvboost_recompute_strategy,
-                kvboost_chunk_boundary_window=kvboost_chunk_boundary_window,
-                kvboost_overlap_k=kvboost_overlap_k,
-                kvboost_sink_tokens=kvboost_sink_tokens,
+                **shared_kwargs,
             )
-        
+
         latency_agg = aggregate_latency_results(latency_results)
         print_latency_table(latency_agg)
-        
+
         latency_output = save_latency_results(latency_agg, model)
         all_results["latency"] = latency_agg
         log.info(f"  ✓ Latency benchmark complete: {latency_output}")
     else:
         log.warning("  ⚠ Latency benchmark module not available")
-    
+
     # === GPU MEMORY BENCHMARK ===
     if benchmark_gpu_memory:
         print("\n► RUNNING GPU MEMORY BENCHMARK...")
         print(f"  Measuring peak GPU memory and cache efficiency\n")
-        
+
         memory_results = {}
         for backend in backends:
             print(f"  [{backend}] Running...")
             memory_results[backend] = benchmark_gpu_memory(
-                backend, model, n_samples,
-                kvboost_recompute_strategy=kvboost_recompute_strategy,
-                kvboost_chunk_boundary_window=kvboost_chunk_boundary_window,
-                kvboost_overlap_k=kvboost_overlap_k,
-                kvboost_sink_tokens=kvboost_sink_tokens,
+                backend, model, n_samples, **shared_kwargs,
             )
-        
+
         memory_agg = aggregate_gpu_memory_results(memory_results)
         print_gpu_memory_table(memory_agg)
         print_memory_breakdown(memory_agg)
-        
+
         memory_output = save_gpu_memory_results(memory_agg, model)
         all_results["gpu_memory"] = memory_agg
         log.info(f"  ✓ GPU memory benchmark complete: {memory_output}")
     else:
         log.warning("  ⚠ GPU memory benchmark module not available")
-    
+
     return all_results
 
 
@@ -219,6 +228,12 @@ Examples:
         help="Number of samples per benchmark (default: 50)"
     )
     parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=8192,
+        help="Max context token length for dataset filtering (default: 8192)"
+    )
+    parser.add_argument(
         "--backends",
         nargs="+",
         default=None,
@@ -230,6 +245,23 @@ Examples:
         type=Path,
         default=RESULTS_DIR,
         help=f"Output directory (default: {RESULTS_DIR})"
+    )
+    parser.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help="Disable mid-run checkpointing"
+    )
+    parser.add_argument(
+        "--max-cache-bytes",
+        type=float,
+        default=4e9,
+        help="KVBoost max cache size in bytes (default: 4e9)"
+    )
+    parser.add_argument(
+        "--recency-window-chunks",
+        type=int,
+        default=8,
+        help="KVBoost recency window in chunks — pinned from eviction (default: 8)"
     )
     parser.add_argument(
         "--recompute-strategy",
@@ -270,8 +302,12 @@ Examples:
     all_results = run_all_benchmarks(
         model=args.model,
         n_samples=args.n_samples,
+        max_context_tokens=args.max_context_tokens,
         output_dir=args.output_dir,
         backends=args.backends or ['kvboost', 'vllm_prefixcache', 'baseline'],
+        checkpoint=not args.no_checkpoint,
+        kvboost_max_cache_bytes=int(args.max_cache_bytes),
+        kvboost_recency_window_chunks=args.recency_window_chunks,
         kvboost_recompute_strategy=args.recompute_strategy,
         kvboost_chunk_boundary_window=args.chunk_boundary_window,
         kvboost_overlap_k=args.overlap_k,

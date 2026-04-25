@@ -262,6 +262,8 @@ def _measure_kvboost(
     samples: List[Dict],
     model: str,
     max_new_tokens: int = 64,
+    max_cache_bytes: int = 4_000_000_000,
+    recency_window_chunks: int = 8,
     recompute_strategy: str = "selective",
     chunk_boundary_window: int = 0,
     overlap_k: int = 0,
@@ -272,7 +274,8 @@ def _measure_kvboost(
 
     engine = KVBoost.from_pretrained(
         model_name=model,
-        max_cache_bytes=4_000_000_000,
+        max_cache_bytes=max_cache_bytes,
+        recency_window_chunks=recency_window_chunks,
         chunk_size=128,
         recompute_overlap=16,
         recompute_strategy=recompute_strategy,
@@ -466,6 +469,9 @@ def benchmark_gpu_memory(
     n_samples: int = 50,
     dataset_path: Optional[Path] = None,
     max_context_tokens: int = 8192,
+    checkpoint: bool = True,
+    kvboost_max_cache_bytes: int = 4_000_000_000,
+    kvboost_recency_window_chunks: int = 8,
     kvboost_recompute_strategy: str = "selective",
     kvboost_chunk_boundary_window: int = 0,
     kvboost_overlap_k: int = 0,
@@ -485,6 +491,9 @@ def benchmark_gpu_memory(
         n_samples: Number of test samples
         dataset_path: Unused; kept for API compatibility
         max_context_tokens: Max context length
+        checkpoint: Enable mid-run checkpointing
+        kvboost_max_cache_bytes: KVBoost max KV cache size in bytes
+        kvboost_recency_window_chunks: KVBoost recency window (chunks pinned from eviction)
         kvboost_recompute_strategy: KVBoost recompute strategy ('selective', 'cacheblend', 'none')
         kvboost_chunk_boundary_window: Adaptive boundary splitting window
         kvboost_overlap_k: Overlapping chunk encoding tokens
@@ -503,6 +512,8 @@ def benchmark_gpu_memory(
     if backend == "kvboost":
         results = _measure_kvboost(
             samples, model,
+            max_cache_bytes=kvboost_max_cache_bytes,
+            recency_window_chunks=kvboost_recency_window_chunks,
             recompute_strategy=kvboost_recompute_strategy,
             chunk_boundary_window=kvboost_chunk_boundary_window,
             overlap_k=kvboost_overlap_k,
