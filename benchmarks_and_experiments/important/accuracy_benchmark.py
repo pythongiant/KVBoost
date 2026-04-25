@@ -20,8 +20,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True, parents=True)
 
-# LongBench tasks best suited for QA accuracy evaluation
-LONGBENCH_TASKS = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa"]
+DATASET_REPO = "JetBrains-Research/lca-bug-localization"
+DATASET_CONFIG = "py"
+
+_SAMPLE_CACHE: Dict[tuple, List[Dict]] = {}
 
 
 @dataclass
@@ -62,60 +64,102 @@ def compute_f1(gold: str, pred: str) -> float:
 def _load_longbench_samples(
     n_samples: int,
     max_context_tokens: int,
-    tasks: List[str] = LONGBENCH_TASKS,
 ) -> List[Dict]:
     """
-    Load samples from LongBench via HuggingFace datasets.
+    Load bug-localization samples from JetBrains-Research/lca-bug-localization.
 
-    Each returned dict has keys: task, context, input (question), answers (list[str]).
-    Samples are filtered to fit within max_context_tokens and spread evenly across tasks.
+    Task: given a code diff (context) + issue description (question), identify
+    the correct changed file from multiple-choice options (A/B/C/D).
+
+    Each returned dict has keys:
+        task, context, input (question), answers (list[str]), approx_tokens,
+        choices (list[str]), correct_idx (int)
+
+    Results are cached in-process so repeated calls within one run are free.
     """
+    cache_key = (n_samples, max_context_tokens)
+    if cache_key in _SAMPLE_CACHE:
+        return _SAMPLE_CACHE[cache_key]
+
     from datasets import load_dataset
+    import json as _json
+
+    try:
+        ds = load_dataset(DATASET_REPO, DATASET_CONFIG, split="train")
+    except Exception as e:
+        log.error("Could not load %s: %s", DATASET_REPO, e)
+        return []
 
     samples = []
-    per_task = max(1, n_samples // len(tasks))
+    for item in ds:
+        if len(samples) >= n_samples:
+            break
 
-    for task in tasks:
-        try:
-            ds = load_dataset("THUDM/LongBench", task, split="test")
-        except Exception as e:
-            log.warning("Could not load LongBench task %s: %s", task, e)
+        diff = item.get("diff", "")
+        if not diff or len(diff) < 10:
             continue
 
-        count = 0
-        for item in ds:
-            if count >= per_task:
-                break
-            context = item.get("context", "")
-            question = item.get("input", "")
-            answers = item.get("answers", [])
-            if not context or not question or not answers:
-                continue
-            # Rough token estimate: ~0.75 tokens per word
-            approx_tokens = int(len((context + question).split()) * 0.75)
-            if approx_tokens > max_context_tokens:
-                continue
-            samples.append({
-                "task": task,
-                "context": context,
-                "input": question,
-                "answers": answers,
-                "approx_tokens": approx_tokens,
-            })
-            count += 1
+        issue_title = item.get("issue_title", "").strip()
+        issue_body = (item.get("issue_body", "") or "").strip()
+        question = issue_title
+        if issue_body:
+            question += "\n" + issue_body[:1000] + ("..." if len(issue_body) > 1000 else "")
+        if not question:
+            continue
 
-    # Trim/pad to exactly n_samples
-    return samples[:n_samples]
+        # Changed files: may be a JSON string or a list
+        changed_files = item.get("changed_files", [])
+        if isinstance(changed_files, str):
+            try:
+                changed_files = _json.loads(changed_files)
+            except Exception:
+                changed_files = [changed_files]
+        if not changed_files:
+            continue
+
+        correct_file = changed_files[0]
+        approx_tokens = int(len((diff + question).split()) * 0.75)
+        if approx_tokens > max_context_tokens:
+            continue
+
+        # Build 4-choice options: correct answer + up to 3 distractors from other files
+        options = list(dict.fromkeys(changed_files))  # deduplicated, order preserved
+        if len(options) < 2:
+            continue
+        import random as _random
+        _random.seed(42)
+        distractors = [f for f in options if f != correct_file]
+        choices = [correct_file] + distractors[:3]
+        _random.shuffle(choices)
+        correct_idx = choices.index(correct_file)
+        letter = chr(ord("A") + correct_idx)
+
+        samples.append({
+            "task": "bug_localization",
+            "context": diff,
+            "input": question,
+            "answers": [letter, correct_file],  # accept letter or filename
+            "approx_tokens": approx_tokens,
+            "choices": choices,
+            "correct_idx": correct_idx,
+            "repo": f"{item.get('repo_owner','')}/{item.get('repo_name','')}",
+        })
+
+    log.info("Loaded %d samples from %s", len(samples), DATASET_REPO)
+    _SAMPLE_CACHE[cache_key] = samples
+    return samples
 
 
-def _format_prompt(context: str, question: str) -> str:
-    return (
-        f"Read the following passage carefully and answer the question based only on "
-        f"the information provided.\n\n"
-        f"Passage:\n{context}\n\n"
-        f"Question: {question}\n\n"
-        f"Answer:"
+def _format_prompt(context: str, question: str, choices: Optional[List[str]] = None) -> str:
+    header = (
+        "You are a code reviewer. Read the following git diff carefully.\n\n"
+        f"Diff:\n{context}\n\n"
+        f"Issue: {question}\n\n"
     )
+    if choices:
+        opts = "\n".join(f"  {chr(ord('A')+i)}) {c}" for i, c in enumerate(choices))
+        return header + f"Which file contains the bug? Choose one:\n{opts}\n\nAnswer (letter only):"
+    return header + "Which file contains the bug?\n\nAnswer:"
 
 
 def _extract_answer(raw_output: str) -> str:
@@ -260,10 +304,10 @@ def benchmark_accuracy(
 
     samples = _load_longbench_samples(n_samples, max_context_tokens)
     if not samples:
-        log.warning("No LongBench samples loaded — check dataset availability")
+        log.warning("No samples loaded — check dataset availability")
         return []
 
-    prompts = [_format_prompt(s["context"], s["input"]) for s in samples]
+    prompts = [_format_prompt(s["context"], s["input"], s.get("choices")) for s in samples]
 
     log.info("Running inference on %d samples with %s...", len(prompts), backend)
     if backend == "kvboost":

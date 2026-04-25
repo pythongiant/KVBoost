@@ -21,7 +21,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True, parents=True)
 
-LONGBENCH_TASKS = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa"]
+DATASET_REPO = "JetBrains-Research/lca-bug-localization"
+DATASET_CONFIG = "py"
+
+_SAMPLE_CACHE: Dict[tuple, List[Dict]] = {}
 
 
 @dataclass
@@ -45,50 +48,78 @@ class LatencyResult:
 def _load_longbench_samples(
     n_samples: int,
     max_context_tokens: int,
-    tasks: List[str] = LONGBENCH_TASKS,
 ) -> List[Dict]:
+    cache_key = (n_samples, max_context_tokens)
+    if cache_key in _SAMPLE_CACHE:
+        return _SAMPLE_CACHE[cache_key]
+
     from datasets import load_dataset
+    import json as _json, random as _random
+
+    try:
+        ds = load_dataset(DATASET_REPO, DATASET_CONFIG, split="train")
+    except Exception as e:
+        log.error("Could not load %s: %s", DATASET_REPO, e)
+        return []
 
     samples = []
-    per_task = max(1, n_samples // len(tasks))
-
-    for task in tasks:
-        try:
-            ds = load_dataset("THUDM/LongBench", task, split="test")
-        except Exception as e:
-            log.warning("Could not load LongBench task %s: %s", task, e)
+    for item in ds:
+        if len(samples) >= n_samples:
+            break
+        diff = item.get("diff", "")
+        if not diff or len(diff) < 10:
             continue
+        issue_title = item.get("issue_title", "").strip()
+        issue_body = (item.get("issue_body", "") or "").strip()
+        question = issue_title + ("\n" + issue_body[:1000] if issue_body else "")
+        if not question:
+            continue
+        changed_files = item.get("changed_files", [])
+        if isinstance(changed_files, str):
+            try:
+                changed_files = _json.loads(changed_files)
+            except Exception:
+                changed_files = [changed_files]
+        if not changed_files:
+            continue
+        correct_file = changed_files[0]
+        approx_tokens = int(len((diff + question).split()) * 0.75)
+        if approx_tokens > max_context_tokens:
+            continue
+        options = list(dict.fromkeys(changed_files))
+        if len(options) < 2:
+            continue
+        _random.seed(42)
+        choices = [correct_file] + [f for f in options if f != correct_file][:3]
+        _random.shuffle(choices)
+        correct_idx = choices.index(correct_file)
+        letter = chr(ord("A") + correct_idx)
+        samples.append({
+            "task": "bug_localization",
+            "context": diff,
+            "input": question,
+            "answers": [letter, correct_file],
+            "approx_tokens": approx_tokens,
+            "choices": choices,
+            "correct_idx": correct_idx,
+        })
 
-        count = 0
-        for item in ds:
-            if count >= per_task:
-                break
-            context = item.get("context", "")
-            question = item.get("input", "")
-            if not context or not question:
-                continue
-            approx_tokens = int(len((context + question).split()) * 0.75)
-            if approx_tokens > max_context_tokens:
-                continue
-            samples.append({
-                "task": task,
-                "context": context,
-                "input": question,
-                "approx_tokens": approx_tokens,
-            })
-            count += 1
-
-    return samples[:n_samples]
+    log.info("Loaded %d samples from %s", len(samples), DATASET_REPO)
+    _SAMPLE_CACHE[cache_key] = samples
+    return samples
 
 
-def _format_prompt(context: str, question: str) -> str:
-    return (
-        f"Read the following passage carefully and answer the question based only on "
-        f"the information provided.\n\n"
-        f"Passage:\n{context}\n\n"
-        f"Question: {question}\n\n"
-        f"Answer:"
+def _format_prompt(context: str, question: str, choices: Optional[List[str]] = None) -> str:
+    header = (
+        "You are a code reviewer. Read the following git diff carefully.\n\n"
+        f"Diff:\n{context}\n\nIssue: {question}\n\n"
     )
+    if choices:
+        opts = "\n".join(f"  {chr(ord('A')+i)}) {c}" for i, c in enumerate(choices))
+        return header + f"Which file contains the bug? Choose one:\n{opts}\n\nAnswer (letter only):"
+    return header + "Which file contains the bug?\n\nAnswer:"
+
+
 
 
 def _measure_kvboost(
@@ -117,7 +148,7 @@ def _measure_kvboost(
 
     results = []
     for i, sample in enumerate(samples):
-        prompt = _format_prompt(sample["context"], sample["input"])
+        prompt = _format_prompt(sample["context"], sample["input"], sample.get("choices"))
         prompt_tokens = len(tokenizer.encode(prompt))
 
         # Warm GPU/caches on first sample to avoid cold-start skew
@@ -177,7 +208,7 @@ def _measure_vllm_prefixcache(
 
     results = []
     for i, sample in enumerate(samples):
-        prompt = _format_prompt(sample["context"], sample["input"])
+        prompt = _format_prompt(sample["context"], sample["input"], sample.get("choices"))
         prompt_tokens = len(tokenizer.encode(prompt))
 
         if torch.cuda.is_available():
@@ -249,7 +280,7 @@ def _measure_baseline(
     results = []
     with torch.no_grad():
         for i, sample in enumerate(samples):
-            prompt = _format_prompt(sample["context"], sample["input"])
+            prompt = _format_prompt(sample["context"], sample["input"], sample.get("choices"))
             inputs = tokenizer(prompt, return_tensors="pt").to(device)
             prompt_tokens = inputs["input_ids"].shape[1]
 
