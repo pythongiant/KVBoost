@@ -8,6 +8,7 @@ Tests exact match accuracy on LongBench long-context QA tasks.
 import json
 import logging
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
@@ -61,115 +62,233 @@ def compute_f1(gold: str, pred: str) -> float:
     return f1
 
 
+LETTERS = ["A", "B", "C", "D"]
+
+
 def _load_longbench_samples(
     n_samples: int,
     max_context_tokens: int,
+    model_name: str = "Qwen/Qwen2.5-3B",
 ) -> List[Dict]:
     """
     Load bug-localization samples from JetBrains-Research/lca-bug-localization.
 
-    Task: given a code diff (context) + issue description (question), identify
-    the correct changed file from multiple-choice options (A/B/C/D).
+    Two-pass loading:
+      Pass 1 — collect all_files from entire dataset + filter by token length.
+      Pass 2 — build 4-choice MC questions using global distractor pool so every
+               sample has 3 valid distractors even when only 1 file was changed.
 
-    Each returned dict has keys:
-        task, context, input (question), answers (list[str]), approx_tokens,
-        choices (list[str]), correct_idx (int)
-
-    Results are cached in-process so repeated calls within one run are free.
+    Paired queries (q1/q2) share the same diff but use different distractors and
+    question phrasing. q2's correct answer is guaranteed in a different slot than
+    q1's to eliminate warm-cache positional bias.
     """
-    cache_key = (n_samples, max_context_tokens)
+    cache_key = (n_samples, max_context_tokens, model_name)
     if cache_key in _SAMPLE_CACHE:
         return _SAMPLE_CACHE[cache_key]
 
     from datasets import load_dataset
-    import json as _json
+    from transformers import AutoTokenizer
 
+    log.info("Loading %s ...", DATASET_REPO)
     try:
         ds = load_dataset(DATASET_REPO, DATASET_CONFIG, split="train")
     except Exception as e:
         log.error("Could not load %s: %s", DATASET_REPO, e)
         return []
 
-    samples = []
-    for item in ds:
-        if len(samples) >= n_samples:
-            break
+    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
-        diff = item.get("diff", "")
-        if not diff or len(diff) < 10:
+    # Pass 1: filter by token length, accumulate global file pool
+    raw_samples = []
+    all_files: set = set()
+    skipped_long = 0
+    skipped_nodiff = 0
+
+    for row in ds:
+        diff = row.get("diff", "")
+        if not diff or len(diff.strip()) < 10:
+            skipped_nodiff += 1
             continue
 
-        issue_title = item.get("issue_title", "").strip()
-        issue_body = (item.get("issue_body", "") or "").strip()
+        ctx_tokens = len(tok.encode(diff))
+        if ctx_tokens > max_context_tokens:
+            skipped_long += 1
+            continue
+
+        changed_files_raw = row.get("changed_files", "")
+        if isinstance(changed_files_raw, str):
+            changed_files = [f.strip() for f in changed_files_raw.replace(",", "\n").split("\n") if f.strip()]
+        elif isinstance(changed_files_raw, list):
+            changed_files = changed_files_raw
+        else:
+            changed_files = []
+
+        if not changed_files:
+            skipped_nodiff += 1
+            continue
+
+        all_files.update(changed_files)
+        issue_title = (row.get("issue_title", "") or "").strip()
+        issue_body = (row.get("issue_body", "") or "").strip()
         question = issue_title
         if issue_body:
-            question += "\n" + issue_body[:1000] + ("..." if len(issue_body) > 1000 else "")
-        if not question:
-            continue
+            body_preview = issue_body[:1000] + ("..." if len(issue_body) > 1000 else "")
+            question = f"{issue_title}\n{body_preview}"
 
-        # Changed files: may be a JSON string or a list
-        changed_files = item.get("changed_files", [])
-        if isinstance(changed_files, str):
-            try:
-                changed_files = _json.loads(changed_files)
-            except Exception:
-                changed_files = [changed_files]
-        if not changed_files:
-            continue
-
-        correct_file = changed_files[0]
-        approx_tokens = int(len((diff + question).split()) * 0.75)
-        if approx_tokens > max_context_tokens:
-            continue
-
-        # Build 4-choice options: correct answer + up to 3 distractors from other files
-        options = list(dict.fromkeys(changed_files))  # deduplicated, order preserved
-        if len(options) < 2:
-            continue
-        import random as _random
-        _random.seed(42)
-        distractors = [f for f in options if f != correct_file]
-        choices = [correct_file] + distractors[:3]
-        _random.shuffle(choices)
-        correct_idx = choices.index(correct_file)
-        letter = chr(ord("A") + correct_idx)
-
-        samples.append({
-            "task": "bug_localization",
-            "context": diff,
-            "input": question,
-            "answers": [letter, correct_file],  # accept letter or filename
-            "approx_tokens": approx_tokens,
-            "choices": choices,
-            "correct_idx": correct_idx,
-            "repo": f"{item.get('repo_owner','')}/{item.get('repo_name','')}",
+        raw_samples.append({
+            "diff": diff,
+            "correct_file": changed_files[0],
+            "all_changed_files": changed_files,
+            "question": question,
+            "ctx_tokens": ctx_tokens,
+            "repo": f"{row.get('repo_owner', '')}/{row.get('repo_name', '')}",
+            "changed_files_count": row.get("changed_files_count", len(changed_files)),
         })
 
-    log.info("Loaded %d samples from %s", len(samples), DATASET_REPO)
+    log.info("After filtering: %d eligible, %d too long, %d no diff/files",
+             len(raw_samples), skipped_long, skipped_nodiff)
+
+    if not raw_samples:
+        log.error("No samples fit within %d tokens!", max_context_tokens)
+        return []
+
+    all_files_list = sorted(all_files)
+
+    # Stratified sampling by token-length bucket
+    rng = np.random.RandomState(42)
+
+    def _bucket(t: int) -> str:
+        if t < 512: return "0-512"
+        elif t < 1024: return "512-1K"
+        elif t < 2048: return "1K-2K"
+        elif t < 4096: return "2K-4K"
+        else: return "4K+"
+
+    bucket_pools: Dict[str, list] = defaultdict(list)
+    for s in raw_samples:
+        bucket_pools[_bucket(s["ctx_tokens"])].append(s)
+    for bk in bucket_pools:
+        rng.shuffle(bucket_pools[bk])
+
+    n_buckets = len(bucket_pools)
+    per_bucket = n_samples // n_buckets if n_buckets else n_samples
+    selected = []
+    overflow = []
+    for bk in ["0-512", "512-1K", "1K-2K", "2K-4K", "4K+"]:
+        pool = bucket_pools.get(bk, [])
+        take = min(per_bucket, len(pool))
+        selected.extend(pool[:take])
+        overflow.extend(pool[take:])
+    remaining = n_samples - len(selected)
+    if remaining > 0 and overflow:
+        rng.shuffle(overflow)
+        selected.extend(overflow[:remaining])
+
+    log.info("Stratified sampling: %d samples across %d buckets", len(selected), n_buckets)
+
+    # Pass 2: build paired MC samples with global distractors
+    samples = []
+    for idx, raw in enumerate(selected):
+        correct_file = raw["correct_file"]
+        distractor_pool = [f for f in all_files_list if f not in raw["all_changed_files"]]
+        rng.shuffle(distractor_pool)
+        while len(distractor_pool) < 6:
+            distractor_pool.append(f"src/fake_module_{len(distractor_pool)}.py")
+
+        base_info = {
+            "task": "bug_localization",
+            "context": raw["diff"],
+            "ctx_tokens": raw["ctx_tokens"],
+            "repo": raw["repo"],
+        }
+
+        # q1 (cold)
+        d1 = distractor_pool[:3]
+        choices_1 = d1 + [correct_file]
+        rng.shuffle(choices_1)
+        q1_pos = choices_1.index(correct_file)
+
+        samples.append({
+            **base_info,
+            "id": f"bug_{idx}_q1",
+            "input": f"Bug report: {raw['question']}\n\nWhich file was modified to fix this bug?",
+            "choices": choices_1,
+            "answers": [LETTERS[q1_pos], correct_file],
+            "correct_idx": q1_pos,
+            "approx_tokens": raw["ctx_tokens"],
+            "pair_group": idx,
+        })
+
+        # q2 (warm) — force different answer slot than q1
+        d2 = distractor_pool[3:6]
+        choices_2 = d2 + [correct_file]
+        rng.shuffle(choices_2)
+        for _ in range(20):
+            if choices_2.index(correct_file) != q1_pos:
+                break
+            rng.shuffle(choices_2)
+        else:
+            pos = choices_2.index(correct_file)
+            target = (q1_pos + 1) % 4
+            choices_2[pos], choices_2[target] = choices_2[target], choices_2[pos]
+        q2_pos = choices_2.index(correct_file)
+
+        samples.append({
+            **base_info,
+            "id": f"bug_{idx}_q2",
+            "input": f"Issue: {raw['question']}\n\nIdentify the file that contains the fix for this issue.",
+            "choices": choices_2,
+            "answers": [LETTERS[q2_pos], correct_file],
+            "correct_idx": q2_pos,
+            "approx_tokens": raw["ctx_tokens"],
+            "pair_group": idx,
+        })
+
+    log.info("Loaded %d paired samples from %s", len(samples), DATASET_REPO)
     _SAMPLE_CACHE[cache_key] = samples
     return samples
 
 
-def _format_prompt(context: str, question: str, choices: Optional[List[str]] = None) -> str:
-    header = (
-        "You are a code reviewer. Read the following git diff carefully.\n\n"
-        f"Diff:\n{context}\n\n"
-        f"Issue: {question}\n\n"
+def _format_prompt_prefix(context: str) -> str:
+    return (
+        "Read the following code diff and answer the question.\n\n"
+        f"--- BEGIN DIFF ---\n{context}\n--- END DIFF ---\n\n"
     )
+
+
+def _format_prompt_suffix(question: str, choices: List[str]) -> str:
+    parts = [f"{question}\n"]
+    for i, choice in enumerate(choices):
+        parts.append(f"{LETTERS[i]}. {choice}")
+    parts.append("\nAnswer with just the letter (A, B, C, or D):")
+    return "\n".join(parts)
+
+
+def _format_prompt(context: str, question: str, choices: Optional[List[str]] = None) -> str:
     if choices:
-        opts = "\n".join(f"  {chr(ord('A')+i)}) {c}" for i, c in enumerate(choices))
-        return header + f"Which file contains the bug? Choose one:\n{opts}\n\nAnswer (letter only):"
-    return header + "Which file contains the bug?\n\nAnswer:"
+        return _format_prompt_prefix(context) + _format_prompt_suffix(question, choices)
+    return (
+        "Read the following code diff and answer the question.\n\n"
+        f"--- BEGIN DIFF ---\n{context}\n--- END DIFF ---\n\n"
+        f"{question}\n\nAnswer:"
+    )
+
+
+import re as _re
 
 
 def _extract_answer(raw_output: str) -> str:
-    """Strip prompt echo and trailing whitespace from generated text."""
-    # vLLM and transformers return only the completion; KVBoost also returns completion only
-    answer = raw_output.strip()
-    # Truncate at the first newline to avoid multi-sentence drift
-    if "\n" in answer:
-        answer = answer[: answer.index("\n")].strip()
-    return answer
+    """Extract A/B/C/D letter from model output."""
+    text = raw_output.strip()
+    m = _re.match(r"^\(?([A-Da-d])\)?[\.\)\s:]?", text)
+    if m:
+        return m.group(1).upper()
+    for ch in text:
+        if ch.upper() in LETTERS:
+            return ch.upper()
+    if "\n" in text:
+        text = text[: text.index("\n")].strip()
+    return text
 
 
 def _score(gold_answers: List[str], predicted: str) -> Tuple[bool, bool, float]:
@@ -193,7 +312,7 @@ def _score(gold_answers: List[str], predicted: str) -> Tuple[bool, bool, float]:
 # ---------------------------------------------------------------------------
 
 def _run_kvboost(
-    prompts: List[str],
+    samples: List[Dict],
     model: str,
     max_new_tokens: int = 64,
     recompute_strategy: str = "selective",
@@ -215,12 +334,17 @@ def _run_kvboost(
         sink_tokens=sink_tokens,
     )
     outputs = []
-    for prompt in prompts:
+    for sample in samples:
+        prefix = _format_prompt_prefix(sample["context"])
+        suffix = _format_prompt_suffix(sample["input"], sample["choices"])
+        prompt = prefix + suffix
+        cacheable_prefix_len = len(engine.tokenizer.encode(prefix, add_special_tokens=True))
         result = engine.generate(
             prompt,
             max_new_tokens=max_new_tokens,
             mode=GenerationMode.CHUNK_KV_REUSE,
             do_sample=False,
+            cacheable_prefix_len=cacheable_prefix_len,
         )
         outputs.append(result.output_text)
     del engine
@@ -229,9 +353,10 @@ def _run_kvboost(
     return outputs
 
 
-def _run_vllm_prefixcache(prompts: List[str], model: str, max_new_tokens: int = 64) -> List[str]:
+def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int = 64) -> List[str]:
     from vllm import LLM, SamplingParams
 
+    prompts = [_format_prompt(s["context"], s["input"], s.get("choices")) for s in samples]
     llm = LLM(model=model, enable_prefix_caching=True)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
     outputs = llm.generate(prompts, params)
@@ -239,7 +364,7 @@ def _run_vllm_prefixcache(prompts: List[str], model: str, max_new_tokens: int = 
     return [o.outputs[0].text for o in outputs]
 
 
-def _run_baseline(prompts: List[str], model: str, max_new_tokens: int = 64) -> List[str]:
+def _run_baseline(samples: List[Dict], model: str, max_new_tokens: int = 64) -> List[str]:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -252,7 +377,8 @@ def _run_baseline(prompts: List[str], model: str, max_new_tokens: int = 64) -> L
 
     outputs = []
     with torch.no_grad():
-        for prompt in prompts:
+        for sample in samples:
+            prompt = _format_prompt(sample["context"], sample["input"], sample.get("choices"))
             inputs = tokenizer(prompt, return_tensors="pt").to(device)
             prompt_len = inputs["input_ids"].shape[1]
             gen_ids = hf_model.generate(
@@ -302,26 +428,24 @@ def benchmark_accuracy(
     """
     log.info("Starting accuracy benchmark for %s with %s", backend, model)
 
-    samples = _load_longbench_samples(n_samples, max_context_tokens)
+    samples = _load_longbench_samples(n_samples, max_context_tokens, model_name=model)
     if not samples:
         log.warning("No samples loaded — check dataset availability")
         return []
 
-    prompts = [_format_prompt(s["context"], s["input"], s.get("choices")) for s in samples]
-
-    log.info("Running inference on %d samples with %s...", len(prompts), backend)
+    log.info("Running inference on %d samples with %s...", len(samples), backend)
     if backend == "kvboost":
         raw_outputs = _run_kvboost(
-            prompts, model,
+            samples, model,
             recompute_strategy=kvboost_recompute_strategy,
             chunk_boundary_window=kvboost_chunk_boundary_window,
             overlap_k=kvboost_overlap_k,
             sink_tokens=kvboost_sink_tokens,
         )
     elif backend == "vllm_prefixcache":
-        raw_outputs = _run_vllm_prefixcache(prompts, model)
+        raw_outputs = _run_vllm_prefixcache(samples, model)
     elif backend == "baseline":
-        raw_outputs = _run_baseline(prompts, model)
+        raw_outputs = _run_baseline(samples, model)
     else:
         raise ValueError(f"Unknown backend: {backend!r}")
 
@@ -332,7 +456,7 @@ def benchmark_accuracy(
         is_exact, is_f1, f1_score = _score(gold_answers, predicted)
 
         results.append(AccuracyResult(
-            sample_id=f"{sample['task']}_{i:04d}",
+            sample_id=sample.get("id", f"{sample['task']}_{i:04d}"),
             backend=backend,
             model=model,
             task_name=sample["task"],
