@@ -412,11 +412,11 @@ class BenchmarkRunner:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         hf_model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            torch_dtype=torch.float16 if device in ("cuda", "mps") else torch.float32,
         ).to(device)
         hf_model.eval()
 

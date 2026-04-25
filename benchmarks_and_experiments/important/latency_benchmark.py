@@ -17,7 +17,7 @@ import numpy as np
 from datetime import datetime
 
 log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True, parents=True)
@@ -269,7 +269,6 @@ def _measure_kvboost(
         if i == 0 and torch.cuda.is_available():
             torch.cuda.synchronize()
 
-        t0 = time.perf_counter()
         result = engine.generate(
             prompt,
             max_new_tokens=max_new_tokens,
@@ -384,11 +383,11 @@ def _measure_baseline(
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(model)
     hf_model = AutoModelForCausalLM.from_pretrained(
         model,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        torch_dtype=torch.float16 if device in ("cuda", "mps") else torch.float32,
     ).to(device)
     hf_model.eval()
 
@@ -405,8 +404,8 @@ def _measure_baseline(
             # TTFT: time the first forward pass / first token generation
             t_start = time.perf_counter()
 
-            # Generate first token only
-            first_out = hf_model.generate(
+            # Generate first token only to measure TTFT
+            hf_model.generate(
                 **inputs,
                 max_new_tokens=1,
                 do_sample=False,

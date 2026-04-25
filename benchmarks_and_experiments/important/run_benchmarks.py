@@ -25,7 +25,7 @@ from latency_benchmark import benchmark_latency, aggregate_latency_results, prin
 from memory_benchmark import benchmark_gpu_memory, aggregate_gpu_memory_results, print_gpu_memory_table, print_memory_breakdown, save_gpu_memory_results
 
 log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True, parents=True)
