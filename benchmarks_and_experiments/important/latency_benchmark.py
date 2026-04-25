@@ -95,6 +95,10 @@ def _measure_kvboost(
     samples: List[Dict],
     model: str,
     max_new_tokens: int = 64,
+    recompute_strategy: str = "selective",
+    chunk_boundary_window: int = 0,
+    overlap_k: int = 0,
+    sink_tokens: int = 0,
 ) -> List[LatencyResult]:
     import torch
     from kvboost import KVBoost, GenerationMode
@@ -104,6 +108,10 @@ def _measure_kvboost(
         max_cache_bytes=4_000_000_000,
         chunk_size=128,
         recompute_overlap=16,
+        recompute_strategy=recompute_strategy,
+        chunk_boundary_window=chunk_boundary_window,
+        overlap_k=overlap_k,
+        sink_tokens=sink_tokens,
     )
     tokenizer = engine.tokenizer
 
@@ -303,6 +311,10 @@ def benchmark_latency(
     dataset_path: Optional[Path] = None,
     max_context_tokens: int = 8192,
     vllm_prefix_caching: bool = True,
+    kvboost_recompute_strategy: str = "selective",
+    kvboost_chunk_boundary_window: int = 0,
+    kvboost_overlap_k: int = 0,
+    kvboost_sink_tokens: int = 0,
 ) -> List[LatencyResult]:
     """
     Run latency benchmark for a specific backend.
@@ -314,6 +326,10 @@ def benchmark_latency(
         dataset_path: Unused; kept for API compatibility
         max_context_tokens: Max context length
         vllm_prefix_caching: For vLLM backend, enable prefix caching
+        kvboost_recompute_strategy: KVBoost recompute strategy ('selective', 'cacheblend', 'none')
+        kvboost_chunk_boundary_window: Adaptive boundary splitting window
+        kvboost_overlap_k: Overlapping chunk encoding tokens
+        kvboost_sink_tokens: Attention sink prefix tokens
 
     Returns:
         List of LatencyResult objects
@@ -331,7 +347,13 @@ def benchmark_latency(
         return []
 
     if backend == "kvboost":
-        results = _measure_kvboost(samples, model)
+        results = _measure_kvboost(
+            samples, model,
+            recompute_strategy=kvboost_recompute_strategy,
+            chunk_boundary_window=kvboost_chunk_boundary_window,
+            overlap_k=kvboost_overlap_k,
+            sink_tokens=kvboost_sink_tokens,
+        )
     elif backend == "vllm_prefixcache":
         results = _measure_vllm_prefixcache(samples, model, enable_prefix_caching=vllm_prefix_caching)
     elif backend == "baseline":

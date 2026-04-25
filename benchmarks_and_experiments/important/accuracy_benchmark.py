@@ -148,7 +148,15 @@ def _score(gold_answers: List[str], predicted: str) -> Tuple[bool, bool, float]:
 # Backend inference helpers
 # ---------------------------------------------------------------------------
 
-def _run_kvboost(prompts: List[str], model: str, max_new_tokens: int = 64) -> List[str]:
+def _run_kvboost(
+    prompts: List[str],
+    model: str,
+    max_new_tokens: int = 64,
+    recompute_strategy: str = "selective",
+    chunk_boundary_window: int = 0,
+    overlap_k: int = 0,
+    sink_tokens: int = 0,
+) -> List[str]:
     from kvboost import KVBoost, GenerationMode
     import torch
 
@@ -157,6 +165,10 @@ def _run_kvboost(prompts: List[str], model: str, max_new_tokens: int = 64) -> Li
         max_cache_bytes=4_000_000_000,
         chunk_size=128,
         recompute_overlap=16,
+        recompute_strategy=recompute_strategy,
+        chunk_boundary_window=chunk_boundary_window,
+        overlap_k=overlap_k,
+        sink_tokens=sink_tokens,
     )
     outputs = []
     for prompt in prompts:
@@ -214,11 +226,6 @@ def _run_baseline(prompts: List[str], model: str, max_new_tokens: int = 64) -> L
     return outputs
 
 
-_BACKEND_RUNNERS = {
-    "kvboost": _run_kvboost,
-    "vllm_prefixcache": _run_vllm_prefixcache,
-    "baseline": _run_baseline,
-}
 
 
 def benchmark_accuracy(
@@ -227,6 +234,10 @@ def benchmark_accuracy(
     n_samples: int = 50,
     dataset_path: Optional[Path] = None,
     max_context_tokens: int = 8192,
+    kvboost_recompute_strategy: str = "selective",
+    kvboost_chunk_boundary_window: int = 0,
+    kvboost_overlap_k: int = 0,
+    kvboost_sink_tokens: int = 0,
 ) -> List[AccuracyResult]:
     """
     Run accuracy benchmark for a specific backend.
@@ -237,6 +248,10 @@ def benchmark_accuracy(
         n_samples: Number of test samples
         dataset_path: Unused; kept for API compatibility
         max_context_tokens: Max context length to test
+        kvboost_recompute_strategy: KVBoost recompute strategy ('selective', 'cacheblend', 'none')
+        kvboost_chunk_boundary_window: Adaptive boundary splitting window
+        kvboost_overlap_k: Overlapping chunk encoding tokens
+        kvboost_sink_tokens: Attention sink prefix tokens
 
     Returns:
         List of AccuracyResult objects
@@ -250,12 +265,21 @@ def benchmark_accuracy(
 
     prompts = [_format_prompt(s["context"], s["input"]) for s in samples]
 
-    runner = _BACKEND_RUNNERS.get(backend)
-    if runner is None:
-        raise ValueError(f"Unknown backend: {backend!r}")
-
     log.info("Running inference on %d samples with %s...", len(prompts), backend)
-    raw_outputs = runner(prompts, model)
+    if backend == "kvboost":
+        raw_outputs = _run_kvboost(
+            prompts, model,
+            recompute_strategy=kvboost_recompute_strategy,
+            chunk_boundary_window=kvboost_chunk_boundary_window,
+            overlap_k=kvboost_overlap_k,
+            sink_tokens=kvboost_sink_tokens,
+        )
+    elif backend == "vllm_prefixcache":
+        raw_outputs = _run_vllm_prefixcache(prompts, model)
+    elif backend == "baseline":
+        raw_outputs = _run_baseline(prompts, model)
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}")
 
     results = []
     for i, (sample, raw) in enumerate(zip(samples, raw_outputs)):

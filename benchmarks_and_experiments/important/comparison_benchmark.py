@@ -187,10 +187,22 @@ class BenchmarkRunner:
     loading the model three times per backend.
     """
 
-    def __init__(self, model_name: str, output_dir: Path = RESULTS_DIR):
+    def __init__(
+        self,
+        model_name: str,
+        output_dir: Path = RESULTS_DIR,
+        kvboost_recompute_strategy: str = "selective",
+        kvboost_chunk_boundary_window: int = 0,
+        kvboost_overlap_k: int = 0,
+        kvboost_sink_tokens: int = 0,
+    ):
         self.model_name = model_name
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True, parents=True)
+        self.kvboost_recompute_strategy = kvboost_recompute_strategy
+        self.kvboost_chunk_boundary_window = kvboost_chunk_boundary_window
+        self.kvboost_overlap_k = kvboost_overlap_k
+        self.kvboost_sink_tokens = kvboost_sink_tokens
 
     def _run_backend(
         self,
@@ -211,7 +223,13 @@ class BenchmarkRunner:
         weights_mb = 0.0
 
         if backend == "kvboost":
-            results = self._run_kvboost(samples_data, max_new_tokens, gpu_total)
+            results = self._run_kvboost(
+                samples_data, max_new_tokens, gpu_total,
+                recompute_strategy=self.kvboost_recompute_strategy,
+                chunk_boundary_window=self.kvboost_chunk_boundary_window,
+                overlap_k=self.kvboost_overlap_k,
+                sink_tokens=self.kvboost_sink_tokens,
+            )
         elif backend == "vllm_prefixcache":
             results = self._run_vllm(samples_data, max_new_tokens, gpu_total)
         elif backend == "baseline":
@@ -226,6 +244,10 @@ class BenchmarkRunner:
         samples_data: List[Dict],
         max_new_tokens: int,
         gpu_total_mb: float,
+        recompute_strategy: str = "selective",
+        chunk_boundary_window: int = 0,
+        overlap_k: int = 0,
+        sink_tokens: int = 0,
     ) -> List[BenchmarkSample]:
         import torch
         from kvboost import KVBoost, GenerationMode
@@ -235,6 +257,10 @@ class BenchmarkRunner:
             max_cache_bytes=4_000_000_000,
             chunk_size=128,
             recompute_overlap=16,
+            recompute_strategy=recompute_strategy,
+            chunk_boundary_window=chunk_boundary_window,
+            overlap_k=overlap_k,
+            sink_tokens=sink_tokens,
         )
         tokenizer = engine.tokenizer
         weights_mb = torch.cuda.memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0

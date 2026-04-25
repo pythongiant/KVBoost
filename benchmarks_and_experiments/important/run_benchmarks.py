@@ -18,17 +18,17 @@ import sys
 
 # Import benchmark modules
 try:
-    from accuracy_benchmark import benchmark_accuracy, aggregate_accuracy_results, print_accuracy_table, save_accuracy_results
+    from benchmarks_and_experiments.important.accuracy_benchmark import benchmark_accuracy, aggregate_accuracy_results, print_accuracy_table, save_accuracy_results
 except ImportError:
     benchmark_accuracy = None
 
 try:
-    from latency_benchmark import benchmark_latency, aggregate_latency_results, print_latency_table, save_latency_results
+    from benchmarks_and_experiments.important.latency_benchmark import benchmark_latency, aggregate_latency_results, print_latency_table, save_latency_results
 except ImportError:
     benchmark_latency = None
 
 try:
-    from memory_benchmark import benchmark_gpu_memory, aggregate_gpu_memory_results, print_gpu_memory_table, print_memory_breakdown, save_gpu_memory_results
+    from benchmarks_and_experiments.important.memory_benchmark import benchmark_gpu_memory, aggregate_gpu_memory_results, print_gpu_memory_table, print_memory_breakdown, save_gpu_memory_results
 except ImportError:
     benchmark_gpu_memory = None
 
@@ -44,6 +44,10 @@ def run_all_benchmarks(
     n_samples: int,
     output_dir: Path = RESULTS_DIR,
     backends: list = None,
+    kvboost_recompute_strategy: str = "selective",
+    kvboost_chunk_boundary_window: int = 0,
+    kvboost_overlap_k: int = 0,
+    kvboost_sink_tokens: int = 0,
 ) -> Dict[str, Any]:
     """Run all three benchmarks"""
     
@@ -75,8 +79,14 @@ def run_all_benchmarks(
         accuracy_results = {}
         for backend in backends:
             print(f"  [{backend}] Running...")
-            accuracy_results[backend] = benchmark_accuracy(backend, model, n_samples)
-        
+            accuracy_results[backend] = benchmark_accuracy(
+                backend, model, n_samples,
+                kvboost_recompute_strategy=kvboost_recompute_strategy,
+                kvboost_chunk_boundary_window=kvboost_chunk_boundary_window,
+                kvboost_overlap_k=kvboost_overlap_k,
+                kvboost_sink_tokens=kvboost_sink_tokens,
+            )
+
         accuracy_agg = aggregate_accuracy_results(accuracy_results)
         print_accuracy_table(accuracy_agg)
         
@@ -95,7 +105,14 @@ def run_all_benchmarks(
         for backend in backends:
             print(f"  [{backend}] Running...")
             vllm_pc = True if backend == 'vllm_prefixcache' else False
-            latency_results[backend] = benchmark_latency(backend, model, n_samples, vllm_prefix_caching=vllm_pc)
+            latency_results[backend] = benchmark_latency(
+                backend, model, n_samples,
+                vllm_prefix_caching=vllm_pc,
+                kvboost_recompute_strategy=kvboost_recompute_strategy,
+                kvboost_chunk_boundary_window=kvboost_chunk_boundary_window,
+                kvboost_overlap_k=kvboost_overlap_k,
+                kvboost_sink_tokens=kvboost_sink_tokens,
+            )
         
         latency_agg = aggregate_latency_results(latency_results)
         print_latency_table(latency_agg)
@@ -114,7 +131,13 @@ def run_all_benchmarks(
         memory_results = {}
         for backend in backends:
             print(f"  [{backend}] Running...")
-            memory_results[backend] = benchmark_gpu_memory(backend, model, n_samples)
+            memory_results[backend] = benchmark_gpu_memory(
+                backend, model, n_samples,
+                kvboost_recompute_strategy=kvboost_recompute_strategy,
+                kvboost_chunk_boundary_window=kvboost_chunk_boundary_window,
+                kvboost_overlap_k=kvboost_overlap_k,
+                kvboost_sink_tokens=kvboost_sink_tokens,
+            )
         
         memory_agg = aggregate_gpu_memory_results(memory_results)
         print_gpu_memory_table(memory_agg)
@@ -217,22 +240,50 @@ Examples:
         help=f"Output directory (default: {RESULTS_DIR})"
     )
     parser.add_argument(
+        "--recompute-strategy",
+        default="selective",
+        choices=["selective", "cacheblend", "none"],
+        help="KVBoost recompute strategy (default: selective)"
+    )
+    parser.add_argument(
+        "--chunk-boundary-window",
+        type=int,
+        default=0,
+        help="KVBoost adaptive boundary splitting window in tokens (default: 0)"
+    )
+    parser.add_argument(
+        "--overlap-k",
+        type=int,
+        default=0,
+        help="KVBoost overlapping chunk encoding tokens (default: 0)"
+    )
+    parser.add_argument(
+        "--sink-tokens",
+        type=int,
+        default=0,
+        help="KVBoost attention sink prefix tokens (default: 0)"
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging"
     )
-    
+
     args = parser.parse_args()
-    
+
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
-    
+
     # Run benchmarks
     all_results = run_all_benchmarks(
         model=args.model,
         n_samples=args.n_samples,
         output_dir=args.output_dir,
         backends=args.backends or ['kvboost', 'vllm_prefixcache', 'baseline'],
+        kvboost_recompute_strategy=args.recompute_strategy,
+        kvboost_chunk_boundary_window=args.chunk_boundary_window,
+        kvboost_overlap_k=args.overlap_k,
+        kvboost_sink_tokens=args.sink_tokens,
     )
     
     # Save unified report
