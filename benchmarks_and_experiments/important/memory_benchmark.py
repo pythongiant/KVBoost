@@ -258,6 +258,16 @@ def _peak_memory_context():
     return _PeakCtx()
 
 
+_CHECKPOINT_INTERVAL = 10
+
+
+def _atomic_checkpoint(path: Path, data: object) -> None:
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+    tmp.replace(path)
+
+
 def _measure_kvboost(
     samples: List[Dict],
     model: str,
@@ -268,6 +278,8 @@ def _measure_kvboost(
     chunk_boundary_window: int = 0,
     overlap_k: int = 0,
     sink_tokens: int = 0,
+    checkpoint: bool = True,
+    checkpoint_path: Optional[Path] = None,
 ) -> List[GPUMemoryResult]:
     import torch
     from kvboost import KVBoost, GenerationMode
@@ -284,9 +296,8 @@ def _measure_kvboost(
         sink_tokens=sink_tokens,
     )
     tokenizer = engine.tokenizer
-
-    # Baseline allocated memory = model weights
     weights_mb = _get_model_weights_mb()
+    n = len(samples)
 
     results = []
     for i, sample in enumerate(samples):
@@ -308,20 +319,14 @@ def _measure_kvboost(
         peak_mb = ctx.peak_mb
         completion_tokens = result.generated_tokens
         total_tokens = prompt_tokens + completion_tokens
-
-        # KV cache size: peak - weights; activations are temporary
         kv_and_activations_mb = max(0.0, peak_mb - weights_mb)
-        # Heuristic: activations ~= 1 forward pass worth of memory
-        # kv_cache scales with sequence length; activations are roughly constant
-        # We attribute (cached_tokens / total_tokens) fraction to KV cache
         cached_fraction = result.kv_reuse_ratio if result.kv_reuse_ratio > 0 else 0.5
         kv_cache_mb = kv_and_activations_mb * cached_fraction
         activation_mb = kv_and_activations_mb * (1 - cached_fraction)
-
         memory_efficiency = total_tokens / peak_mb if peak_mb > 0 else 0.0
 
-        results.append(GPUMemoryResult(
-            sample_id=f"{sample['task']}_{i:04d}",
+        r = GPUMemoryResult(
+            sample_id=sample.get("id", f"{sample['task']}_{i:04d}"),
             backend="kvboost",
             model=model,
             context_length=sample["approx_tokens"],
@@ -332,11 +337,18 @@ def _measure_kvboost(
             model_weights_mb=weights_mb,
             model_activation_mb=activation_mb,
             memory_efficiency=memory_efficiency,
-        ))
-        log.debug("kvboost sample %d: peak=%.1fMB kv=%.1fMB", i, peak_mb, kv_cache_mb)
+        )
+        results.append(r)
+        log.info("[kvboost memory %d/%d] peak=%.1fMB  kv=%.1fMB  reuse=%.1f%%  ctx=%d tok  eff=%.2f tok/MB",
+                 i + 1, n, peak_mb, kv_cache_mb, result.kv_reuse_ratio * 100,
+                 sample["approx_tokens"], memory_efficiency)
+        if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
+            _atomic_checkpoint(checkpoint_path, [asdict(r) for r in results])
+            log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del engine
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return results
 
 
@@ -344,6 +356,8 @@ def _measure_vllm_prefixcache(
     samples: List[Dict],
     model: str,
     max_new_tokens: int = 64,
+    checkpoint: bool = True,
+    checkpoint_path: Optional[Path] = None,
 ) -> List[GPUMemoryResult]:
     import torch
     from vllm import LLM, SamplingParams
@@ -352,8 +366,8 @@ def _measure_vllm_prefixcache(
     tokenizer = AutoTokenizer.from_pretrained(model)
     llm = LLM(model=model, enable_prefix_caching=True)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
-
     weights_mb = _get_model_weights_mb()
+    n = len(samples)
 
     results = []
     for i, sample in enumerate(samples):
@@ -367,17 +381,13 @@ def _measure_vllm_prefixcache(
         out = outputs[0]
         completion_tokens = len(out.outputs[0].token_ids)
         total_tokens = prompt_tokens + completion_tokens
-
-        # vLLM manages its own paged KV cache; estimate from peak delta
         kv_and_act_mb = max(0.0, peak_mb - weights_mb)
-        # vLLM uses paged attention; most delta is KV cache pages
         kv_cache_mb = kv_and_act_mb * 0.8
         activation_mb = kv_and_act_mb * 0.2
-
         memory_efficiency = total_tokens / peak_mb if peak_mb > 0 else 0.0
 
-        results.append(GPUMemoryResult(
-            sample_id=f"{sample['task']}_{i:04d}",
+        r = GPUMemoryResult(
+            sample_id=sample.get("id", f"{sample['task']}_{i:04d}"),
             backend="vllm_prefixcache",
             model=model,
             context_length=sample["approx_tokens"],
@@ -388,11 +398,17 @@ def _measure_vllm_prefixcache(
             model_weights_mb=weights_mb,
             model_activation_mb=activation_mb,
             memory_efficiency=memory_efficiency,
-        ))
-        log.debug("vllm sample %d: peak=%.1fMB kv=%.1fMB", i, peak_mb, kv_cache_mb)
+        )
+        results.append(r)
+        log.info("[vllm_prefixcache memory %d/%d] peak=%.1fMB  kv=%.1fMB  ctx=%d tok  eff=%.2f tok/MB",
+                 i + 1, n, peak_mb, kv_cache_mb, sample["approx_tokens"], memory_efficiency)
+        if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
+            _atomic_checkpoint(checkpoint_path, [asdict(r) for r in results])
+            log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del llm
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return results
 
 
@@ -400,6 +416,8 @@ def _measure_baseline(
     samples: List[Dict],
     model: str,
     max_new_tokens: int = 64,
+    checkpoint: bool = True,
+    checkpoint_path: Optional[Path] = None,
 ) -> List[GPUMemoryResult]:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -411,8 +429,8 @@ def _measure_baseline(
         torch_dtype=torch.float16 if device in ("cuda", "mps") else torch.float32,
     ).to(device)
     hf_model.eval()
-
     weights_mb = _get_model_weights_mb()
+    n = len(samples)
 
     results = []
     with torch.no_grad():
@@ -432,18 +450,13 @@ def _measure_baseline(
             peak_mb = ctx.peak_mb
             completion_tokens = gen_ids.shape[1] - prompt_tokens
             total_tokens = prompt_tokens + completion_tokens
-
-            # Standard HF generate: KV cache grows with sequence length
-            # Delta above weights is primarily KV cache + activations
             kv_and_act_mb = max(0.0, peak_mb - weights_mb)
-            # Roughly 60% KV cache, 40% activations for standard attention
             kv_cache_mb = kv_and_act_mb * 0.6
             activation_mb = kv_and_act_mb * 0.4
-
             memory_efficiency = total_tokens / peak_mb if peak_mb > 0 else 0.0
 
-            results.append(GPUMemoryResult(
-                sample_id=f"{sample['task']}_{i:04d}",
+            r = GPUMemoryResult(
+                sample_id=sample.get("id", f"{sample['task']}_{i:04d}"),
                 backend="baseline",
                 model=model,
                 context_length=sample["approx_tokens"],
@@ -454,8 +467,13 @@ def _measure_baseline(
                 model_weights_mb=weights_mb,
                 model_activation_mb=activation_mb,
                 memory_efficiency=memory_efficiency,
-            ))
-            log.debug("baseline sample %d: peak=%.1fMB kv=%.1fMB", i, peak_mb, kv_cache_mb)
+            )
+            results.append(r)
+            log.info("[baseline memory %d/%d] peak=%.1fMB  kv=%.1fMB  ctx=%d tok  eff=%.2f tok/MB",
+                     i + 1, n, peak_mb, kv_cache_mb, sample["approx_tokens"], memory_efficiency)
+            if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
+                _atomic_checkpoint(checkpoint_path, [asdict(r) for r in results])
+                log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del hf_model
     if torch.cuda.is_available():
@@ -502,12 +520,15 @@ def benchmark_gpu_memory(
     Returns:
         List of GPUMemoryResult objects
     """
-    log.info("Starting GPU memory benchmark for %s with %s", backend, model)
+    log.info("Starting GPU memory benchmark: backend=%s  model=%s  n=%d  max_ctx=%d",
+             backend, model, n_samples, max_context_tokens)
 
     samples = _load_longbench_samples(n_samples, max_context_tokens, model_name=model)
     if not samples:
         log.warning("No LongBench samples loaded — check dataset availability")
         return []
+
+    ckpt_path = RESULTS_DIR / f"memory_ckpt_{backend}_{model.replace('/', '_')}.json" if checkpoint else None
 
     if backend == "kvboost":
         results = _measure_kvboost(
@@ -518,21 +539,22 @@ def benchmark_gpu_memory(
             chunk_boundary_window=kvboost_chunk_boundary_window,
             overlap_k=kvboost_overlap_k,
             sink_tokens=kvboost_sink_tokens,
+            checkpoint=checkpoint,
+            checkpoint_path=ckpt_path,
         )
     elif backend == "vllm_prefixcache":
-        results = _measure_vllm_prefixcache(samples, model)
+        results = _measure_vllm_prefixcache(samples, model,
+                                             checkpoint=checkpoint, checkpoint_path=ckpt_path)
     elif backend == "baseline":
-        results = _measure_baseline(samples, model)
+        results = _measure_baseline(samples, model,
+                                    checkpoint=checkpoint, checkpoint_path=ckpt_path)
     else:
         raise ValueError(f"Unknown backend: {backend!r}")
 
-    log.info(
-        "Processed %d GPU memory samples for %s (peak_mean=%.1fMB, eff_mean=%.3f)",
-        len(results),
-        backend,
-        np.mean([r.gpu_memory_mb for r in results]) if results else 0.0,
-        np.mean([r.memory_efficiency for r in results]) if results else 0.0,
-    )
+    log.info("DONE memory %s: %d samples  avg_peak=%.1fMB  avg_eff=%.3f tok/MB",
+             backend, len(results),
+             np.mean([r.gpu_memory_mb for r in results]) if results else 0.0,
+             np.mean([r.memory_efficiency for r in results]) if results else 0.0)
     return results
 
 

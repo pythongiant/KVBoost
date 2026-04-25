@@ -230,6 +230,16 @@ def _format_prompt(context: str, question: str, choices: Optional[List[str]] = N
 
 
 
+_CHECKPOINT_INTERVAL = 10
+
+
+def _atomic_checkpoint(path: Path, data: object) -> None:
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+    tmp.replace(path)
+
+
 def _measure_kvboost(
     samples: List[Dict],
     model: str,
@@ -240,6 +250,8 @@ def _measure_kvboost(
     chunk_boundary_window: int = 0,
     overlap_k: int = 0,
     sink_tokens: int = 0,
+    checkpoint: bool = True,
+    checkpoint_path: Optional[Path] = None,
 ) -> List[LatencyResult]:
     import torch
     from kvboost import KVBoost, GenerationMode
@@ -256,7 +268,9 @@ def _measure_kvboost(
         sink_tokens=sink_tokens,
     )
     tokenizer = engine.tokenizer
+    n = len(samples)
 
+    ttft_running = []
     results = []
     for i, sample in enumerate(samples):
         prefix = _format_prompt_prefix(sample["context"])
@@ -265,7 +279,6 @@ def _measure_kvboost(
         prompt_tokens = len(tokenizer.encode(prompt))
         cacheable_prefix_len = len(tokenizer.encode(prefix, add_special_tokens=True))
 
-        # Warm GPU/caches on first sample to avoid cold-start skew
         if i == 0 and torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -283,9 +296,10 @@ def _measure_kvboost(
         total_ms = result.total_ms
         completion_tokens = result.generated_tokens
         tps = result.tokens_per_sec
+        ttft_running.append(ttft_ms)
 
-        results.append(LatencyResult(
-            sample_id=f"{sample['task']}_{i:04d}",
+        r = LatencyResult(
+            sample_id=sample.get("id", f"{sample['task']}_{i:04d}"),
             backend="kvboost",
             model=model,
             context_length=sample["approx_tokens"],
@@ -296,9 +310,14 @@ def _measure_kvboost(
             tokens_per_second=tps,
             cache_hit=False,
             cache_reuse_ratio=result.kv_reuse_ratio,
-        ))
-        log.debug("kvboost sample %d: ttft=%.1fms total=%.1fms reuse=%.1f%%",
-                  i, ttft_ms, total_ms, result.kv_reuse_ratio * 100)
+        )
+        results.append(r)
+        log.info("[kvboost latency %d/%d] ttft=%.1fms  total=%.1fms  tps=%.1f  reuse=%.1f%%  ctx=%d tok  (avg_ttft=%.1fms)",
+                 i + 1, n, ttft_ms, total_ms, tps, result.kv_reuse_ratio * 100,
+                 sample["approx_tokens"], np.mean(ttft_running))
+        if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
+            _atomic_checkpoint(checkpoint_path, [asdict(r) for r in results])
+            log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del engine
     if torch.cuda.is_available():
@@ -311,6 +330,8 @@ def _measure_vllm_prefixcache(
     model: str,
     max_new_tokens: int = 64,
     enable_prefix_caching: bool = True,
+    checkpoint: bool = True,
+    checkpoint_path: Optional[Path] = None,
 ) -> List[LatencyResult]:
     import torch
     from vllm import LLM, SamplingParams
@@ -319,6 +340,8 @@ def _measure_vllm_prefixcache(
     tokenizer = AutoTokenizer.from_pretrained(model)
     llm = LLM(model=model, enable_prefix_caching=enable_prefix_caching)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
+    n = len(samples)
+    ttft_running = []
 
     results = []
     for i, sample in enumerate(samples):
@@ -328,33 +351,22 @@ def _measure_vllm_prefixcache(
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-
         outputs = llm.generate([prompt], params)
-
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         total_ms = (time.perf_counter() - t0) * 1000
 
         out = outputs[0]
         completion_tokens = len(out.outputs[0].token_ids)
-
-        # vLLM doesn't expose per-request TTFT directly; approximate from generation metrics
-        # If prefix was cached, TTFT ≈ time to decode first new token (fast)
-        # We use the finish_reason and timing metadata when available
-        ttft_ms = getattr(out, "ttft_ms", None)
-        if ttft_ms is None:
-            # Fallback: estimate TTFT as total / completion_tokens (uniform decoding)
-            ttft_ms = total_ms / max(completion_tokens, 1)
-
+        ttft_ms = getattr(out, "ttft_ms", None) or total_ms / max(completion_tokens, 1)
         tps = completion_tokens / (total_ms / 1000) if total_ms > 0 else 0.0
-
-        # Detect cache hit from vLLM RequestOutput metadata
         num_cached = getattr(out, "num_cached_tokens", None)
         cache_hit = num_cached is not None and num_cached > 0
         cache_reuse_ratio = (num_cached / prompt_tokens) if (cache_hit and prompt_tokens > 0) else 0.0
+        ttft_running.append(ttft_ms)
 
-        results.append(LatencyResult(
-            sample_id=f"{sample['task']}_{i:04d}",
+        r = LatencyResult(
+            sample_id=sample.get("id", f"{sample['task']}_{i:04d}"),
             backend="vllm_prefixcache",
             model=model,
             context_length=sample["approx_tokens"],
@@ -365,9 +377,14 @@ def _measure_vllm_prefixcache(
             tokens_per_second=tps,
             cache_hit=cache_hit,
             cache_reuse_ratio=cache_reuse_ratio,
-        ))
-        log.debug("vllm sample %d: total=%.1fms tps=%.1f cache_hit=%s",
-                  i, total_ms, tps, cache_hit)
+        )
+        results.append(r)
+        log.info("[vllm_prefixcache latency %d/%d] ttft=%.1fms  total=%.1fms  tps=%.1f  cache_hit=%s  ctx=%d tok  (avg_ttft=%.1fms)",
+                 i + 1, n, ttft_ms, total_ms, tps, "✓" if cache_hit else "✗",
+                 sample["approx_tokens"], np.mean(ttft_running))
+        if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
+            _atomic_checkpoint(checkpoint_path, [asdict(r) for r in results])
+            log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del llm
     if torch.cuda.is_available():
@@ -379,6 +396,8 @@ def _measure_baseline(
     samples: List[Dict],
     model: str,
     max_new_tokens: int = 64,
+    checkpoint: bool = True,
+    checkpoint_path: Optional[Path] = None,
 ) -> List[LatencyResult]:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -390,6 +409,8 @@ def _measure_baseline(
         torch_dtype=torch.float16 if device in ("cuda", "mps") else torch.float32,
     ).to(device)
     hf_model.eval()
+    n = len(samples)
+    ttft_running = []
 
     results = []
     with torch.no_grad():
@@ -400,38 +421,26 @@ def _measure_baseline(
 
             if device == "cuda":
                 torch.cuda.synchronize()
-
-            # TTFT: time the first forward pass / first token generation
             t_start = time.perf_counter()
-
-            # Generate first token only to measure TTFT
-            hf_model.generate(
-                **inputs,
-                max_new_tokens=1,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
+            hf_model.generate(**inputs, max_new_tokens=1, do_sample=False,
+                               pad_token_id=tokenizer.eos_token_id)
             if device == "cuda":
                 torch.cuda.synchronize()
             ttft_ms = (time.perf_counter() - t_start) * 1000
 
-            # Full generation for total latency
             t_gen = time.perf_counter()
-            gen_ids = hf_model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
+            gen_ids = hf_model.generate(**inputs, max_new_tokens=max_new_tokens,
+                                         do_sample=False, pad_token_id=tokenizer.eos_token_id)
             if device == "cuda":
                 torch.cuda.synchronize()
             total_ms = (time.perf_counter() - t_gen) * 1000 + ttft_ms
 
             completion_tokens = gen_ids.shape[1] - prompt_tokens
             tps = completion_tokens / (total_ms / 1000) if total_ms > 0 else 0.0
+            ttft_running.append(ttft_ms)
 
-            results.append(LatencyResult(
-                sample_id=f"{sample['task']}_{i:04d}",
+            r = LatencyResult(
+                sample_id=sample.get("id", f"{sample['task']}_{i:04d}"),
                 backend="baseline",
                 model=model,
                 context_length=sample["approx_tokens"],
@@ -440,8 +449,13 @@ def _measure_baseline(
                 ttft_ms=ttft_ms,
                 total_latency_ms=total_ms,
                 tokens_per_second=tps,
-            ))
-            log.debug("baseline sample %d: ttft=%.1fms total=%.1fms", i, ttft_ms, total_ms)
+            )
+            results.append(r)
+            log.info("[baseline latency %d/%d] ttft=%.1fms  total=%.1fms  tps=%.1f  ctx=%d tok  (avg_ttft=%.1fms)",
+                     i + 1, n, ttft_ms, total_ms, tps, sample["approx_tokens"], np.mean(ttft_running))
+            if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
+                _atomic_checkpoint(checkpoint_path, [asdict(r) for r in results])
+                log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del hf_model
     if torch.cuda.is_available():
@@ -485,17 +499,16 @@ def benchmark_latency(
     Returns:
         List of LatencyResult objects
     """
-    log.info(
-        "Starting latency benchmark for %s with %s (vllm_prefix_caching=%s)",
-        backend,
-        model,
-        vllm_prefix_caching if backend == "vllm_prefixcache" else "N/A",
-    )
+    log.info("Starting latency benchmark: backend=%s  model=%s  n=%d  max_ctx=%d  vllm_pc=%s",
+             backend, model, n_samples, max_context_tokens,
+             vllm_prefix_caching if backend == "vllm_prefixcache" else "N/A")
 
     samples = _load_longbench_samples(n_samples, max_context_tokens, model_name=model)
     if not samples:
         log.warning("No LongBench samples loaded — check dataset availability")
         return []
+
+    ckpt_path = RESULTS_DIR / f"latency_ckpt_{backend}_{model.replace('/', '_')}.json" if checkpoint else None
 
     if backend == "kvboost":
         results = _measure_kvboost(
@@ -506,21 +519,23 @@ def benchmark_latency(
             chunk_boundary_window=kvboost_chunk_boundary_window,
             overlap_k=kvboost_overlap_k,
             sink_tokens=kvboost_sink_tokens,
+            checkpoint=checkpoint,
+            checkpoint_path=ckpt_path,
         )
     elif backend == "vllm_prefixcache":
-        results = _measure_vllm_prefixcache(samples, model, enable_prefix_caching=vllm_prefix_caching)
+        results = _measure_vllm_prefixcache(samples, model,
+                                             enable_prefix_caching=vllm_prefix_caching,
+                                             checkpoint=checkpoint, checkpoint_path=ckpt_path)
     elif backend == "baseline":
-        results = _measure_baseline(samples, model)
+        results = _measure_baseline(samples, model,
+                                    checkpoint=checkpoint, checkpoint_path=ckpt_path)
     else:
         raise ValueError(f"Unknown backend: {backend!r}")
 
-    log.info(
-        "Processed %d latency samples for %s (ttft_mean=%.1fms, tps_mean=%.1f)",
-        len(results),
-        backend,
-        np.mean([r.ttft_ms for r in results]) if results else 0.0,
-        np.mean([r.tokens_per_second for r in results]) if results else 0.0,
-    )
+    log.info("DONE latency %s: %d samples  avg_ttft=%.1fms  avg_tps=%.1f",
+             backend, len(results),
+             np.mean([r.ttft_ms for r in results]) if results else 0.0,
+             np.mean([r.tokens_per_second for r in results]) if results else 0.0)
     return results
 
 

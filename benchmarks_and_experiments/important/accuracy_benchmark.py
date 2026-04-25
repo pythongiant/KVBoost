@@ -311,6 +311,16 @@ def _score(gold_answers: List[str], predicted: str) -> Tuple[bool, bool, float]:
 # Backend inference helpers
 # ---------------------------------------------------------------------------
 
+_CHECKPOINT_INTERVAL = 10
+
+
+def _atomic_checkpoint(path: Path, data: object) -> None:
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+    tmp.replace(path)
+
+
 def _run_kvboost(
     samples: List[Dict],
     model: str,
@@ -321,6 +331,8 @@ def _run_kvboost(
     chunk_boundary_window: int = 0,
     overlap_k: int = 0,
     sink_tokens: int = 0,
+    checkpoint: bool = True,
+    checkpoint_path: Optional[Path] = None,
 ) -> List[str]:
     from kvboost import KVBoost, GenerationMode
     import torch
@@ -336,8 +348,9 @@ def _run_kvboost(
         overlap_k=overlap_k,
         sink_tokens=sink_tokens,
     )
+    n = len(samples)
     outputs = []
-    for sample in samples:
+    for i, sample in enumerate(samples):
         prefix = _format_prompt_prefix(sample["context"])
         suffix = _format_prompt_suffix(sample["input"], sample["choices"])
         prompt = prefix + suffix
@@ -350,6 +363,12 @@ def _run_kvboost(
             cacheable_prefix_len=cacheable_prefix_len,
         )
         outputs.append(result.output_text)
+        log.info("[kvboost accuracy %d/%d] ctx=%d tok  reuse=%.1f%%  pred=%r",
+                 i + 1, n, sample["approx_tokens"],
+                 result.kv_reuse_ratio * 100, result.output_text[:40].strip())
+        if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
+            _atomic_checkpoint(checkpoint_path, {"outputs": outputs, "n_done": i + 1})
+            log.debug("  checkpoint saved (%d/%d)", i + 1, n)
     del engine
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -359,15 +378,27 @@ def _run_kvboost(
 def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int = 64) -> List[str]:
     from vllm import LLM, SamplingParams
 
+    n = len(samples)
+    log.info("[vllm_prefixcache accuracy] submitting %d prompts ...", n)
     prompts = [_format_prompt(s["context"], s["input"], s.get("choices")) for s in samples]
     llm = LLM(model=model, enable_prefix_caching=True)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
-    outputs = llm.generate(prompts, params)
+    raw_outputs = llm.generate(prompts, params)
     del llm
-    return [o.outputs[0].text for o in outputs]
+    results = [o.outputs[0].text for o in raw_outputs]
+    for i, (sample, text) in enumerate(zip(samples, results)):
+        log.info("[vllm_prefixcache accuracy %d/%d] ctx=%d tok  pred=%r",
+                 i + 1, n, sample["approx_tokens"], text[:40].strip())
+    return results
 
 
-def _run_baseline(samples: List[Dict], model: str, max_new_tokens: int = 64) -> List[str]:
+def _run_baseline(
+    samples: List[Dict],
+    model: str,
+    max_new_tokens: int = 64,
+    checkpoint: bool = True,
+    checkpoint_path: Optional[Path] = None,
+) -> List[str]:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -378,9 +409,10 @@ def _run_baseline(samples: List[Dict], model: str, max_new_tokens: int = 64) -> 
     ).to(device)
     hf_model.eval()
 
+    n = len(samples)
     outputs = []
     with torch.no_grad():
-        for sample in samples:
+        for i, sample in enumerate(samples):
             prompt = _format_prompt(sample["context"], sample["input"], sample.get("choices"))
             inputs = tokenizer(prompt, return_tensors="pt").to(device)
             prompt_len = inputs["input_ids"].shape[1]
@@ -391,7 +423,13 @@ def _run_baseline(samples: List[Dict], model: str, max_new_tokens: int = 64) -> 
                 pad_token_id=tokenizer.eos_token_id,
             )
             new_ids = gen_ids[0][prompt_len:]
-            outputs.append(tokenizer.decode(new_ids, skip_special_tokens=True))
+            text = tokenizer.decode(new_ids, skip_special_tokens=True)
+            outputs.append(text)
+            log.info("[baseline accuracy %d/%d] ctx=%d tok  pred=%r",
+                     i + 1, n, sample["approx_tokens"], text[:40].strip())
+            if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
+                _atomic_checkpoint(checkpoint_path, {"outputs": outputs, "n_done": i + 1})
+                log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del hf_model
     if torch.cuda.is_available():
@@ -435,12 +473,15 @@ def benchmark_accuracy(
     Returns:
         List of AccuracyResult objects
     """
-    log.info("Starting accuracy benchmark for %s with %s", backend, model)
+    log.info("Starting accuracy benchmark: backend=%s  model=%s  n=%d  max_ctx=%d",
+             backend, model, n_samples, max_context_tokens)
 
     samples = _load_longbench_samples(n_samples, max_context_tokens, model_name=model)
     if not samples:
         log.warning("No samples loaded — check dataset availability")
         return []
+
+    ckpt_path = RESULTS_DIR / f"accuracy_ckpt_{backend}_{model.replace('/', '_')}.json" if checkpoint else None
 
     log.info("Running inference on %d samples with %s...", len(samples), backend)
     if backend == "kvboost":
@@ -452,19 +493,26 @@ def benchmark_accuracy(
             chunk_boundary_window=kvboost_chunk_boundary_window,
             overlap_k=kvboost_overlap_k,
             sink_tokens=kvboost_sink_tokens,
+            checkpoint=checkpoint,
+            checkpoint_path=ckpt_path,
         )
     elif backend == "vllm_prefixcache":
         raw_outputs = _run_vllm_prefixcache(samples, model)
     elif backend == "baseline":
-        raw_outputs = _run_baseline(samples, model)
+        raw_outputs = _run_baseline(samples, model,
+                                    checkpoint=checkpoint, checkpoint_path=ckpt_path)
     else:
         raise ValueError(f"Unknown backend: {backend!r}")
 
     results = []
+    n_exact = 0
+    f1_sum = 0.0
     for i, (sample, raw) in enumerate(zip(samples, raw_outputs)):
         predicted = _extract_answer(raw)
         gold_answers = sample["answers"]
         is_exact, is_f1, f1_score = _score(gold_answers, predicted)
+        n_exact += int(is_exact)
+        f1_sum += f1_score
 
         results.append(AccuracyResult(
             sample_id=sample.get("id", f"{sample['task']}_{i:04d}"),
@@ -479,13 +527,16 @@ def benchmark_accuracy(
             is_f1_match=is_f1,
             f1_score=f1_score,
         ))
+        log.info("[%s accuracy %d/%d] exact=%s  f1=%.3f  running_acc=%.1f%%  ctx=%d tok",
+                 backend, i + 1, len(samples),
+                 "✓" if is_exact else "✗", f1_score,
+                 100 * n_exact / (i + 1), sample["approx_tokens"])
 
     log.info(
-        "Processed %d accuracy samples for %s (exact=%.1f%%, F1=%.3f)",
-        len(results),
-        backend,
-        100 * sum(r.is_exact_match for r in results) / max(len(results), 1),
-        np.mean([r.f1_score for r in results]) if results else 0.0,
+        "DONE accuracy %s: %d samples  exact=%.1f%%  avg_F1=%.3f",
+        backend, len(results),
+        100 * n_exact / max(len(results), 1),
+        f1_sum / max(len(results), 1),
     )
     return results
 
