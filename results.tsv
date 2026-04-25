@@ -1,0 +1,2 @@
+experiment	commit	metric	status	description
+0	d808959	baseline	baseline	Comprehensive 3-way benchmark suite (accuracy, latency, GPU memory)

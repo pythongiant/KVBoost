@@ -35,3 +35,7 @@ cache_dir/
 
 # Sphinx docs build
 docs/build/
+
+academic-research-skills/
+
+.copilot/
