@@ -11,26 +11,18 @@ Executes all three benchmarks (accuracy, latency, GPU memory) and produces:
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any
-import sys
 
-# Import benchmark modules
-try:
-    from benchmarks_and_experiments.important.accuracy_benchmark import benchmark_accuracy, aggregate_accuracy_results, print_accuracy_table, save_accuracy_results
-except ImportError:
-    benchmark_accuracy = None
+# Ensure this file's directory is on sys.path so sibling modules import correctly
+# regardless of where the script is invoked from.
+sys.path.insert(0, str(Path(__file__).parent))
 
-try:
-    from benchmarks_and_experiments.important.latency_benchmark import benchmark_latency, aggregate_latency_results, print_latency_table, save_latency_results
-except ImportError:
-    benchmark_latency = None
-
-try:
-    from benchmarks_and_experiments.important.memory_benchmark import benchmark_gpu_memory, aggregate_gpu_memory_results, print_gpu_memory_table, print_memory_breakdown, save_gpu_memory_results
-except ImportError:
-    benchmark_gpu_memory = None
+from accuracy_benchmark import benchmark_accuracy, aggregate_accuracy_results, print_accuracy_table, save_accuracy_results
+from latency_benchmark import benchmark_latency, aggregate_latency_results, print_latency_table, save_latency_results
+from memory_benchmark import benchmark_gpu_memory, aggregate_gpu_memory_results, print_gpu_memory_table, print_memory_breakdown, save_gpu_memory_results
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
