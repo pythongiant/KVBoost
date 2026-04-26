@@ -273,6 +273,10 @@ def _measure_kvboost(
     ttft_running = []
     results = []
     for i, sample in enumerate(samples):
+        is_q1 = sample.get("id", "").endswith("_q1")
+        if is_q1:
+            engine.reset_cache()
+
         prefix = _format_prompt_prefix(sample["context"])
         suffix = _format_prompt_suffix(sample["input"], sample["choices"])
         prompt = prefix + suffix
@@ -297,6 +301,7 @@ def _measure_kvboost(
         completion_tokens = result.generated_tokens
         tps = result.tokens_per_sec
         ttft_running.append(ttft_ms)
+        query_type = "COLD" if is_q1 else "WARM"
 
         r = LatencyResult(
             sample_id=sample.get("id", f"{sample['task']}_{i:04d}"),
@@ -308,12 +313,12 @@ def _measure_kvboost(
             ttft_ms=ttft_ms,
             total_latency_ms=total_ms,
             tokens_per_second=tps,
-            cache_hit=False,
+            cache_hit=not is_q1,
             cache_reuse_ratio=result.kv_reuse_ratio,
         )
         results.append(r)
-        log.info("[kvboost latency %d/%d] ttft=%.1fms  total=%.1fms  tps=%.1f  reuse=%.1f%%  ctx=%d tok  (avg_ttft=%.1fms)",
-                 i + 1, n, ttft_ms, total_ms, tps, result.kv_reuse_ratio * 100,
+        log.info("[kvboost latency %d/%d] %s  ttft=%.1fms  total=%.1fms  tps=%.1f  reuse=%.1f%%  ctx=%d tok  (avg_ttft=%.1fms)",
+                 i + 1, n, query_type, ttft_ms, total_ms, tps, result.kv_reuse_ratio * 100,
                  sample["approx_tokens"], np.mean(ttft_running))
         if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
             _atomic_checkpoint(checkpoint_path, [asdict(r) for r in results])

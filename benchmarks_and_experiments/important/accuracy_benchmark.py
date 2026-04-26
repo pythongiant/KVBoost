@@ -351,6 +351,10 @@ def _run_kvboost(
     n = len(samples)
     outputs = []
     for i, sample in enumerate(samples):
+        is_q1 = sample.get("id", "").endswith("_q1")
+        if is_q1:
+            engine.reset_cache()
+
         prefix = _format_prompt_prefix(sample["context"])
         suffix = _format_prompt_suffix(sample["input"], sample["choices"])
         prompt = prefix + suffix
@@ -363,8 +367,9 @@ def _run_kvboost(
             cacheable_prefix_len=cacheable_prefix_len,
         )
         outputs.append(result.output_text)
-        log.info("[kvboost accuracy %d/%d] ctx=%d tok  reuse=%.1f%%  pred=%r",
-                 i + 1, n, sample["approx_tokens"],
+        query_type = "COLD" if is_q1 else "WARM"
+        log.info("[kvboost accuracy %d/%d] %s  ctx=%d tok  reuse=%.1f%%  pred=%r",
+                 i + 1, n, query_type, sample["approx_tokens"],
                  result.kv_reuse_ratio * 100, result.output_text[:40].strip())
         if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
             _atomic_checkpoint(checkpoint_path, {"outputs": outputs, "n_done": i + 1})

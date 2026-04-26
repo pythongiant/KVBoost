@@ -301,6 +301,10 @@ def _measure_kvboost(
 
     results = []
     for i, sample in enumerate(samples):
+        is_q1 = sample.get("id", "").endswith("_q1")
+        if is_q1:
+            engine.reset_cache()
+
         prefix = _format_prompt_prefix(sample["context"])
         suffix = _format_prompt_suffix(sample["input"], sample["choices"])
         prompt = prefix + suffix
@@ -324,6 +328,7 @@ def _measure_kvboost(
         kv_cache_mb = kv_and_activations_mb * cached_fraction
         activation_mb = kv_and_activations_mb * (1 - cached_fraction)
         memory_efficiency = total_tokens / peak_mb if peak_mb > 0 else 0.0
+        query_type = "COLD" if is_q1 else "WARM"
 
         r = GPUMemoryResult(
             sample_id=sample.get("id", f"{sample['task']}_{i:04d}"),
@@ -339,8 +344,8 @@ def _measure_kvboost(
             memory_efficiency=memory_efficiency,
         )
         results.append(r)
-        log.info("[kvboost memory %d/%d] peak=%.1fMB  kv=%.1fMB  reuse=%.1f%%  ctx=%d tok  eff=%.2f tok/MB",
-                 i + 1, n, peak_mb, kv_cache_mb, result.kv_reuse_ratio * 100,
+        log.info("[kvboost memory %d/%d] %s  peak=%.1fMB  kv=%.1fMB  reuse=%.1f%%  ctx=%d tok  eff=%.2f tok/MB",
+                 i + 1, n, query_type, peak_mb, kv_cache_mb, result.kv_reuse_ratio * 100,
                  sample["approx_tokens"], memory_efficiency)
         if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
             _atomic_checkpoint(checkpoint_path, [asdict(r) for r in results])
