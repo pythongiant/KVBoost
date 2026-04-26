@@ -380,13 +380,15 @@ def _run_kvboost(
     return outputs
 
 
-def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int = 64) -> List[str]:
+def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int = 64,
+                           max_context_tokens: int = 8192) -> List[str]:
     from vllm import LLM, SamplingParams
 
     n = len(samples)
     log.info("[vllm_prefixcache accuracy] submitting %d prompts ...", n)
     prompts = [_format_prompt(s["context"], s["input"], s.get("choices")) for s in samples]
-    llm = LLM(model=model, enable_prefix_caching=True)
+    llm = LLM(model=model, enable_prefix_caching=True,
+              max_model_len=max_context_tokens + 128, gpu_memory_utilization=0.95)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
     raw_outputs = llm.generate(prompts, params)
     del llm
@@ -502,7 +504,7 @@ def benchmark_accuracy(
             checkpoint_path=ckpt_path,
         )
     elif backend == "vllm_prefixcache":
-        raw_outputs = _run_vllm_prefixcache(samples, model)
+        raw_outputs = _run_vllm_prefixcache(samples, model, max_context_tokens=max_context_tokens)
     elif backend == "baseline":
         raw_outputs = _run_baseline(samples, model,
                                     checkpoint=checkpoint, checkpoint_path=ckpt_path)

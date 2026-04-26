@@ -361,6 +361,7 @@ def _measure_vllm_prefixcache(
     samples: List[Dict],
     model: str,
     max_new_tokens: int = 64,
+    max_context_tokens: int = 8192,
     checkpoint: bool = True,
     checkpoint_path: Optional[Path] = None,
 ) -> List[GPUMemoryResult]:
@@ -369,7 +370,8 @@ def _measure_vllm_prefixcache(
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model)
-    llm = LLM(model=model, enable_prefix_caching=True)
+    llm = LLM(model=model, enable_prefix_caching=True,
+              max_model_len=max_context_tokens + 128, gpu_memory_utilization=0.95)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
     weights_mb = _get_model_weights_mb()
     n = len(samples)
@@ -549,6 +551,7 @@ def benchmark_gpu_memory(
         )
     elif backend == "vllm_prefixcache":
         results = _measure_vllm_prefixcache(samples, model,
+                                             max_context_tokens=max_context_tokens,
                                              checkpoint=checkpoint, checkpoint_path=ckpt_path)
     elif backend == "baseline":
         results = _measure_baseline(samples, model,

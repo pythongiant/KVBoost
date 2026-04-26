@@ -350,7 +350,8 @@ class BenchmarkRunner:
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        llm = LLM(model=self.model_name, enable_prefix_caching=True)
+        llm = LLM(model=self.model_name, enable_prefix_caching=True,
+                  max_model_len=max_context_tokens + 128, gpu_memory_utilization=0.95)
         params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
 
         results = []
