@@ -427,8 +427,9 @@ def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int =
         torch.cuda.empty_cache()
         log.info("[vllm_prefixcache] GPU free before LLM init: %.2f GiB", torch.cuda.mem_get_info()[0] / 1e9)
 
+    _VLLM_BATCH = 32
     n = len(samples)
-    log.info("[vllm_prefixcache accuracy] submitting %d prompts ...", n)
+    log.info("[vllm_prefixcache accuracy] submitting %d prompts in batches of %d ...", n, _VLLM_BATCH)
     prompts = [_format_prompt(s["context"], s["input"], s.get("choices")) for s in samples]
     llm = LLM(model=model, enable_prefix_caching=True,
               max_model_len=max_context_tokens + 128,
@@ -436,7 +437,11 @@ def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int =
               enforce_eager=True,
               max_num_seqs=4)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
-    raw_outputs = llm.generate(prompts, params)
+    raw_outputs = []
+    for batch_start in range(0, n, _VLLM_BATCH):
+        batch = prompts[batch_start:batch_start + _VLLM_BATCH]
+        raw_outputs.extend(llm.generate(batch, params))
+        log.debug("[vllm_prefixcache accuracy] batch %d-%d done", batch_start, batch_start + len(batch))
     del llm
     gc.collect()
     if torch.cuda.is_available():
