@@ -27,6 +27,22 @@ from memory_benchmark import benchmark_gpu_memory, aggregate_gpu_memory_results,
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 
+
+def _flush_gpu():
+    """Force-release all GPU memory between backends so vLLM subprocess sees a clean device."""
+    try:
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            log.debug("GPU flush complete: %.2f GiB free",
+                      torch.cuda.mem_get_info()[0] / 1e9)
+    except Exception:
+        pass
+
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True, parents=True)
 
@@ -90,6 +106,7 @@ def run_all_benchmarks(
 
         accuracy_results = {}
         for backend in backends:
+            _flush_gpu()
             print(f"  [{backend}] Running...")
             accuracy_results[backend] = benchmark_accuracy(
                 backend, model, n_samples, **shared_kwargs,
@@ -111,6 +128,7 @@ def run_all_benchmarks(
 
         latency_results = {}
         for backend in backends:
+            _flush_gpu()
             print(f"  [{backend}] Running...")
             vllm_pc = backend == 'vllm_prefixcache'
             latency_results[backend] = benchmark_latency(
@@ -135,6 +153,7 @@ def run_all_benchmarks(
 
         memory_results = {}
         for backend in backends:
+            _flush_gpu()
             print(f"  [{backend}] Running...")
             memory_results[backend] = benchmark_gpu_memory(
                 backend, model, n_samples, **shared_kwargs,

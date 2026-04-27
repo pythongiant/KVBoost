@@ -116,10 +116,15 @@ def _load_longbench_samples(
             continue
 
         changed_files_raw = row.get("changed_files", "")
-        if isinstance(changed_files_raw, str):
-            changed_files = [f.strip() for f in changed_files_raw.replace(",", "\n").split("\n") if f.strip()]
-        elif isinstance(changed_files_raw, list):
-            changed_files = changed_files_raw
+        if isinstance(changed_files_raw, list):
+            changed_files = [str(f).strip().strip("'\"`[]") for f in changed_files_raw if str(f).strip()]
+        elif isinstance(changed_files_raw, str):
+            import ast
+            try:
+                parsed = ast.literal_eval(changed_files_raw)
+                changed_files = [str(f).strip() for f in (parsed if isinstance(parsed, list) else [parsed]) if str(f).strip()]
+            except Exception:
+                changed_files = [f.strip().strip("'\"`[]") for f in changed_files_raw.replace(",", "\n").split("\n") if f.strip().strip("'\"`[]")]
         else:
             changed_files = []
 
@@ -410,7 +415,18 @@ def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int =
                            max_context_tokens: int = 8192,
                            checkpoint: bool = True,
                            checkpoint_path: Optional[Path] = None) -> List[str]:
+    import gc
+    import torch
     from vllm import LLM, SamplingParams
+
+    # Force-release any GPU memory held by the previous backend before vLLM
+    # spawns its EngineCore subprocess, which inherits the parent CUDA context.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        free_gb = torch.cuda.mem_get_info()[0] / 1e9
+        log.info("[vllm_prefixcache] GPU free before LLM init: %.2f GiB", free_gb)
 
     n = len(samples)
     log.info("[vllm_prefixcache accuracy] submitting %d prompts ...", n)

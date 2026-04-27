@@ -85,10 +85,15 @@ def _load_longbench_samples(
             skipped_long += 1
             continue
         changed_files_raw = row.get("changed_files", "")
-        if isinstance(changed_files_raw, str):
-            changed_files = [f.strip() for f in changed_files_raw.replace(",", "\n").split("\n") if f.strip()]
-        elif isinstance(changed_files_raw, list):
-            changed_files = changed_files_raw
+        if isinstance(changed_files_raw, list):
+            changed_files = [str(f).strip().strip("'\"`[]") for f in changed_files_raw if str(f).strip()]
+        elif isinstance(changed_files_raw, str):
+            import ast
+            try:
+                parsed = ast.literal_eval(changed_files_raw)
+                changed_files = [str(f).strip() for f in (parsed if isinstance(parsed, list) else [parsed]) if str(f).strip()]
+            except Exception:
+                changed_files = [f.strip().strip("'\"`[]") for f in changed_files_raw.replace(",", "\n").split("\n") if f.strip().strip("'\"`[]")]
         else:
             changed_files = []
         if not changed_files:
@@ -376,9 +381,16 @@ def _measure_vllm_prefixcache(
     checkpoint: bool = True,
     checkpoint_path: Optional[Path] = None,
 ) -> List[GPUMemoryResult]:
+    import gc
     import torch
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        log.info("[vllm_prefixcache] GPU free before LLM init: %.2f GiB", torch.cuda.mem_get_info()[0] / 1e9)
 
     tokenizer = AutoTokenizer.from_pretrained(model)
     llm = LLM(model=model, enable_prefix_caching=True,
