@@ -10,7 +10,7 @@
   Checkpoint:         True
   KVBoost cache:      1.50 GB  recency=8 chunks
   KVBoost strategy:   cacheblend  boundary=16  overlap=16  sink=32
-  Timestamp:          2026-04-27 02:10:36
+  Timestamp:          2026-04-27 02:32:59
 ====================================================================================================
 
 
@@ -19,53 +19,48 @@
 
   [kvboost] Running...
   [vllm_prefixcache] Running...
-INFO 04-27 02:29:25 [utils.py:233] non-default args: {'max_model_len': 6128, 'enable_prefix_caching': True, 'gpu_memory_utilization': 0.85, 'max_num_seqs': 16, 'disable_log_stats': True, 'model': 'Qwen/Qwen2.5-3B'}
-INFO 04-27 02:29:27 [model.py:549] Resolved architecture: Qwen2ForCausalLM
-INFO 04-27 02:29:27 [model.py:1678] Using max model len 6128
-INFO 04-27 02:29:27 [scheduler.py:238] Chunked prefill is enabled with max_num_batched_tokens=8192.
-INFO 04-27 02:29:27 [vllm.py:790] Asynchronous scheduling is enabled.
-WARNING 04-27 02:29:30 [system_utils.py:152] We must use the `spawn` multiprocessing start method. Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. See https://docs.vllm.ai/en/latest/usage/troubleshooting.html#python-multiprocessing for more information. Reasons: CUDA is initialized
-(EngineCore pid=63673) INFO 04-27 02:29:35 [core.py:105] Initializing a V1 LLM engine (v0.19.1) with config: model='Qwen/Qwen2.5-3B', speculative_config=None, tokenizer='Qwen/Qwen2.5-3B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=6128, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=Qwen/Qwen2.5-3B, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['none'], 'splitting_ops': ['vllm::unified_attention', 'vllm::unified_attention_with_output', 'vllm::unified_mla_attention', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::gdn_attention_core', 'vllm::olmo_hybrid_gdn_full_forward', 'vllm::kda_attention', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update'], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_images_per_batch': 0, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 32, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
-(EngineCore pid=63673) INFO 04-27 02:29:36 [parallel_state.py:1400] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://192.168.1.101:56743 backend=nccl
-(EngineCore pid=63673) INFO 04-27 02:29:36 [parallel_state.py:1716] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
-(EngineCore pid=63673) INFO 04-27 02:29:36 [gpu_model_runner.py:4735] Starting to load model Qwen/Qwen2.5-3B...
-(EngineCore pid=63673) INFO 04-27 02:29:37 [cuda.py:334] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].
-(EngineCore pid=63673) INFO 04-27 02:29:37 [flash_attn.py:596] Using FlashAttention version 2
-(EngineCore pid=63673) INFO 04-27 02:29:39 [default_loader.py:384] Loading weights took 0.82 seconds
-(EngineCore pid=63673) INFO 04-27 02:29:40 [gpu_model_runner.py:4820] Model loading took 5.79 GiB memory and 3.066217 seconds
-(EngineCore pid=63673) INFO 04-27 02:29:45 [backends.py:1051] Using cache directory: /home/srihari/.cache/vllm/torch_compile_cache/c7e7a60727/rank_0_0/backbone for vLLM's torch.compile
-(EngineCore pid=63673) INFO 04-27 02:29:45 [backends.py:1111] Dynamo bytecode transform time: 5.26 s
-(EngineCore pid=63673) INFO 04-27 02:29:45 [backends.py:372] Cache the graph of compile range (1, 8192) for later use
-(EngineCore pid=63673) INFO 04-27 02:29:46 [backends.py:390] Compiling a graph for compile range (1, 8192) takes 0.95 s
-(EngineCore pid=63673) INFO 04-27 02:29:47 [decorators.py:655] saved AOT compiled function to /home/srihari/.cache/vllm/torch_compile_cache/torch_aot_compile/eacdfc289217bed554c3af0a10c618c8c40eca3cd21868855429f847f9525bfd/rank_0_0/model
-(EngineCore pid=63673) INFO 04-27 02:29:47 [monitor.py:48] torch.compile took 7.55 s in total
-(EngineCore pid=63673) INFO 04-27 02:29:47 [monitor.py:76] Initial profiling/warmup run took 0.09 s
-(EngineCore pid=63673) INFO 04-27 02:29:49 [kv_cache_utils.py:829] Overriding num_gpu_blocks=0 with num_gpu_blocks_override=32
-(EngineCore pid=63673) INFO 04-27 02:29:49 [gpu_model_runner.py:5876] Profiling CUDA graph memory: PIECEWISE=7 (largest=32), FULL=5 (largest=16)
-(EngineCore pid=63673) INFO 04-27 02:29:50 [gpu_model_runner.py:5955] Estimated CUDA graph memory: 0.10 GiB total
-(EngineCore pid=63673) INFO 04-27 02:29:51 [gpu_worker.py:436] Available KV cache memory: 0.02 GiB
-(EngineCore pid=63673) INFO 04-27 02:29:51 [gpu_worker.py:470] In v0.19, CUDA graph memory profiling will be enabled by default (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1), which more accurately accounts for CUDA graph memory during KV cache allocation. To try it now, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 and increase --gpu-memory-utilization from 0.8500 to 0.8628 to maintain the same effective KV cache size.
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108] EngineCore failed to start.
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108] Traceback (most recent call last):
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1082, in run_engine_core
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]     return func(*args, **kwargs)
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]            ^^^^^^^^^^^^^^^^^^^^^
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 848, in __init__
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]     super().__init__(
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 124, in __init__
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]     kv_cache_config = self._initialize_kv_caches(vllm_config)
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]     return func(*args, **kwargs)
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]            ^^^^^^^^^^^^^^^^^^^^^
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 258, in _initialize_kv_caches
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]     kv_cache_configs = get_kv_cache_configs(
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]                        ^^^^^^^^^^^^^^^^^^^^^
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/core/kv_cache_utils.py", line 1579, in get_kv_cache_configs
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]     _check_enough_kv_cache_memory(
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/core/kv_cache_utils.py", line 644, in _check_enough_kv_cache_memory
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108]     raise ValueError(
-(EngineCore pid=63673) ERROR 04-27 02:29:51 [core.py:1108] ValueError: To serve at least one request with the models's max seq len (6128), (0.21 GiB KV cache is needed, which is larger than the available KV cache memory (0.02 GiB). Based on the available memory, the estimated maximum model length is 480. Try increasing `gpu_memory_utilization` or decreasing `max_model_len` when initializing the engine. See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.
+INFO 04-27 02:52:17 [utils.py:233] non-default args: {'max_model_len': 6128, 'enable_prefix_caching': True, 'gpu_memory_utilization': 0.98, 'max_num_seqs': 4, 'disable_log_stats': True, 'enforce_eager': True, 'model': 'Qwen/Qwen2.5-3B'}
+INFO 04-27 02:52:20 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 04-27 02:52:20 [model.py:1678] Using max model len 6128
+INFO 04-27 02:52:20 [scheduler.py:238] Chunked prefill is enabled with max_num_batched_tokens=8192.
+INFO 04-27 02:52:20 [vllm.py:790] Asynchronous scheduling is enabled.
+WARNING 04-27 02:52:20 [vllm.py:848] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 04-27 02:52:20 [vllm.py:859] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 04-27 02:52:20 [vllm.py:1025] Cudagraph is disabled under eager mode
+INFO 04-27 02:52:20 [compilation.py:292] Enabled custom fusions: norm_quant, act_quant
+WARNING 04-27 02:52:23 [system_utils.py:152] We must use the `spawn` multiprocessing start method. Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. See https://docs.vllm.ai/en/latest/usage/troubleshooting.html#python-multiprocessing for more information. Reasons: CUDA is initialized
+(EngineCore pid=64146) INFO 04-27 02:52:27 [core.py:105] Initializing a V1 LLM engine (v0.19.1) with config: model='Qwen/Qwen2.5-3B', speculative_config=None, tokenizer='Qwen/Qwen2.5-3B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=6128, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=Qwen/Qwen2.5-3B, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_images_per_batch': 0, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
+(EngineCore pid=64146) INFO 04-27 02:52:28 [parallel_state.py:1400] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://192.168.1.101:40773 backend=nccl
+(EngineCore pid=64146) INFO 04-27 02:52:28 [parallel_state.py:1716] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108] EngineCore failed to start.
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108] Traceback (most recent call last):
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1082, in run_engine_core
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]     return func(*args, **kwargs)
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 848, in __init__
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]     super().__init__(
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 114, in __init__
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]     self.model_executor = executor_class(vllm_config)
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]     return func(*args, **kwargs)
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/executor/abstract.py", line 103, in __init__
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]     self._init_executor()
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/executor/uniproc_executor.py", line 47, in _init_executor
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]     self.driver_worker.init_device()
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/worker/worker_base.py", line 312, in init_device
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]     self.worker.init_device()  # type: ignore
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]     ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]     return func(*args, **kwargs)
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 283, in init_device
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]     self.requested_memory = request_memory(init_snapshot, self.cache_config)
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]   File "/home/srihari/kvboost/.env/lib/python3.12/site-packages/vllm/v1/worker/utils.py", line 413, in request_memory
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108]     raise ValueError(
+(EngineCore pid=64146) ERROR 04-27 02:52:28 [core.py:1108] ValueError: Free memory on device cuda:0 (7.37/7.62 GiB) on startup is less than desired GPU memory utilization (0.98, 7.47 GiB). Decrease GPU memory utilization or reduce GPU memory used by other processes.
