@@ -353,7 +353,7 @@ class BenchmarkRunner:
 
         tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         llm = LLM(model=self.model_name, enable_prefix_caching=True,
-                  max_model_len=max_context_tokens + 128,
+                  max_model_len=max_context_tokens + 512,
                   gpu_memory_utilization=0.95,
                   enforce_eager=True,
                   max_num_seqs=1)

@@ -435,7 +435,7 @@ def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int =
     log.info("[vllm_prefixcache accuracy] submitting %d prompts in batches of %d ...", n, _VLLM_BATCH)
     prompts = [_format_prompt(s["context"], s["input"], s.get("choices")) for s in samples]
     llm = LLM(model=model, enable_prefix_caching=True,
-              max_model_len=max_context_tokens + 128,
+              max_model_len=max_context_tokens + 512,
               gpu_memory_utilization=gpu_memory_utilization,
               enforce_eager=enforce_eager,
               max_num_seqs=max_num_seqs)

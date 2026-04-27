@@ -397,7 +397,7 @@ def _measure_vllm_prefixcache(
 
     tokenizer = AutoTokenizer.from_pretrained(model)
     llm = LLM(model=model, enable_prefix_caching=True,
-              max_model_len=max_context_tokens + 128,
+              max_model_len=max_context_tokens + 512,
               gpu_memory_utilization=gpu_memory_utilization,
               enforce_eager=enforce_eager,
               max_num_seqs=max_num_seqs)
