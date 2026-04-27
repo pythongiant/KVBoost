@@ -6,6 +6,7 @@ Measures Time-To-First-Token (TTFT) and end-to-end latency.
 For vLLM: enable_prefix_caching=True enables KV cache reuse across requests.
 """
 
+import gc
 import json
 import logging
 import time
@@ -355,7 +356,6 @@ def _measure_vllm_prefixcache(
     checkpoint: bool = True,
     checkpoint_path: Optional[Path] = None,
 ) -> List[LatencyResult]:
-    import gc
     import torch
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
@@ -369,7 +369,7 @@ def _measure_vllm_prefixcache(
     tokenizer = AutoTokenizer.from_pretrained(model)
     llm = LLM(model=model, enable_prefix_caching=enable_prefix_caching,
               max_model_len=max_context_tokens + 128,
-              gpu_memory_utilization=0.98,
+              gpu_memory_utilization=0.95,
               enforce_eager=True,
               max_num_seqs=4)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
@@ -431,7 +431,9 @@ def _measure_vllm_prefixcache(
             log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del llm
+    gc.collect()
     if torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
     return results
 

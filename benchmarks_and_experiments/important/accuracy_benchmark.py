@@ -5,6 +5,7 @@ Accuracy Benchmark: KVBoost vs vLLM (prefix-caching) vs Baseline
 Tests exact match accuracy on LongBench long-context QA tasks.
 """
 
+import gc
 import json
 import logging
 import time
@@ -415,7 +416,6 @@ def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int =
                            max_context_tokens: int = 8192,
                            checkpoint: bool = True,
                            checkpoint_path: Optional[Path] = None) -> List[str]:
-    import gc
     import torch
     from vllm import LLM, SamplingParams
 
@@ -425,20 +425,23 @@ def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int =
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        free_gb = torch.cuda.mem_get_info()[0] / 1e9
-        log.info("[vllm_prefixcache] GPU free before LLM init: %.2f GiB", free_gb)
+        log.info("[vllm_prefixcache] GPU free before LLM init: %.2f GiB", torch.cuda.mem_get_info()[0] / 1e9)
 
     n = len(samples)
     log.info("[vllm_prefixcache accuracy] submitting %d prompts ...", n)
     prompts = [_format_prompt(s["context"], s["input"], s.get("choices")) for s in samples]
     llm = LLM(model=model, enable_prefix_caching=True,
               max_model_len=max_context_tokens + 128,
-              gpu_memory_utilization=0.98,
+              gpu_memory_utilization=0.95,
               enforce_eager=True,
               max_num_seqs=4)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
     raw_outputs = llm.generate(prompts, params)
     del llm
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
     results = [o.outputs[0].text for o in raw_outputs]
     ckpt_samples = []
     n_correct = 0
