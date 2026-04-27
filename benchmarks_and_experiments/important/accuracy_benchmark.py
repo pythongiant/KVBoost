@@ -433,8 +433,9 @@ def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int =
     prompts = [_format_prompt(s["context"], s["input"], s.get("choices")) for s in samples]
     llm = LLM(model=model, enable_prefix_caching=True,
               max_model_len=max_context_tokens + 128,
-              gpu_memory_utilization=0.85,
-              max_num_seqs=16)
+              gpu_memory_utilization=0.98,
+              enforce_eager=True,
+              max_num_seqs=4)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
     raw_outputs = llm.generate(prompts, params)
     del llm
