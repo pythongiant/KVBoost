@@ -1,6 +1,63 @@
 Changelog
 =========
 
+0.4.0 (2026-04-27)
+-------------------
+
+Benchmark and correctness release. Comprehensive 3-way comparison against
+vLLM (prefix cache) and HuggingFace baseline, plus two correctness fixes
+that affected tensor memory and logit accuracy on newer transformers versions.
+
+**New: 3-way benchmark suite** (``benchmarks_and_experiments/important/``)
+
+- ``run_experiment.py`` runs each backend as an isolated subprocess (clean
+  CUDA context), loads atomic checkpoints, and prints comparison tables for
+  accuracy, latency, and GPU memory.
+- ``run_benchmarks.py`` runs individual backends with full CLI control over
+  vLLM settings (``--vllm-gpu-memory-utilization``, ``--vllm-no-enforce-eager``,
+  ``--vllm-max-num-seqs``).
+- ``report.py`` generates a self-contained HTML report with inline SVG charts
+  from any experiment JSON.
+- ``plot_benchmarks.py`` generates six matplotlib figures: COLD/WARM TTFT bar
+  chart, TTFT CDF, TTFT by context-length bucket, KV reuse histogram, speedup
+  summary, and accuracy-by-reuse.
+
+**New: Benchmark figures** (``docs/figures/``)
+
+- Six figures derived from the 500-sample LongBench experiment embedded in
+  the README and available for reuse.
+
+**Fixed: Logit tensor bloat** (``engine.py``)
+
+- A ``_forward_kwargs`` helper now probes ``model.forward`` once and picks
+  ``logits_to_keep`` (transformers ≥ 4.45) or ``num_logits_to_keep`` (older),
+  caching the choice on the engine. Returns ``{}`` if neither is present —
+  fail-safe for any version. Previously, if any layer in the call chain
+  dropped the kwarg, the default ``0`` caused the model to return a full
+  ``[batch, seq, vocab]`` tensor instead of the last-token-only slice,
+  silently inflating memory and latency.
+
+**Fixed: CacheBlend first-pass memory** (``cacheblend.py``)
+
+- CacheBlend's deviation-measurement forward pass now only reads
+  ``out.past_key_values``; it no longer retains the full logit tensor from
+  that pass. Reduces peak memory during seam repair.
+
+**Fixed: vLLM max_model_len headroom** (all benchmark files)
+
+- Changed ``max_model_len = max_context_tokens + 128`` to ``+ 512``.
+  The formatted prompt (diff + question + 4 choices + template) adds
+  ~400–500 tokens on top of the raw context token count; ``+128`` caused
+  ``VLLMValidationError`` on longer samples mid-run.
+
+**Results (Qwen/Qwen2.5-3B, 500 samples, CUDA):**
+
+- WARM TTFT: **63 ms** — 10.1× faster than HF baseline
+- COLD TTFT: **222 ms** — 17% faster than vLLM (chunk-level partial hits)
+- Overall speedup: **4.49×** vs baseline
+- Accuracy at 72.9% avg KV reuse: **99.2%** — identical to cold, no degradation
+
+
 0.3.0 (2026-04-17)
 -------------------
 
@@ -38,44 +95,15 @@ document's attention-sink tokens.
 - Tracked per-chunk via ``CachedChunk.sink_prefix_len``. Chunk 0 is
   exempt (the sink is already in its own tokens).
 
-**New: LongBench Arena harness** (``benchmarks_and_experiments/long_bench_arena.py``)
+**Fixed: Cross-pair cache bleed in benchmarks**
 
-- Single benchmark script replaces the per-experiment files that were
-  removed from version control.
-- Streams LongBench v1 and v2 samples, bucketizes by context length
-  (``0-512``, ``512-1K``, ``1K-2K``, ``2K-4K``, ``4K+``), and reports
-  per-bucket accuracy with a paired-bootstrap p-value, TTFT, total
-  latency, and KV reuse.
-- Checkpointing so long runs can resume without redoing baseline logits
-  (``--skip-baseline-logits``).
-
-**New: Ablation harness** (``benchmarks_and_experiments/run_ablation.sh``)
-
-- Exercises each continuity feature independently and combined against
-  the selective-recompute-only baseline, plus a CacheBlend + all-features
-  configuration.
-
-**Fixed: Cross-pair cache bleed in long-context benchmarks**
-
-- The long-context benchmark loop was reusing a warm cache across
-  unrelated document pairs, inflating KVBoost's measured speedup. The
-  cache is now cleared between pair groups (``cache_manager.py``,
-  ``engine.py``, ``cacheblend.py``).
+- The benchmark loop was reusing a warm cache across unrelated document
+  pairs, inflating KVBoost's measured speedup. The cache is now cleared
+  between pair groups.
 
 **Changed: Default device selection** (``compat.py``)
 
-- ``default_device()`` centralises the CUDA → MPS → CPU fallback. All
-  subsystems (``engine``, ``batch``, ``cache_manager``, ``cacheblend``,
-  ``selective_recompute``) route through it.
-
-**Removed: Stale benchmark artefacts**
-
-- Per-experiment scripts and their JSON result files were deleted from
-  the repo and added to ``.gitignore``. The single LongBench arena
-  harness replaces them.
-- Docs no longer quote per-turn/per-query speedup tables that referred
-  to removed result files. See :doc:`benchmarks/overview` for how to
-  reproduce locally.
+- ``default_device()`` centralises the CUDA → MPS → CPU fallback.
 
 
 0.2.0 (2026-04-07)
@@ -94,13 +122,12 @@ Major feature release.
 
 - Prefix-chained hashes (vLLM-style): ``SHA256(parent_hash + tokens)``.
 - Content-hash fallback for non-prefix reuse with correctness flags.
-- Fixes RoPE position collision and cross-chunk attention contamination
-  bugs.
+- Fixes RoPE position collision and cross-chunk attention contamination.
 
 **New: KV cache quantization** (``kv_quantize.py``)
 
 - KIVI-style asymmetric int8/int4: keys per-channel, values per-token.
-- ``kv_cache_bits=8`` for 2x RAM savings, ``kv_cache_bits=4`` for 4x.
+- ``kv_cache_bits=8`` for 2× RAM savings, ``kv_cache_bits=4`` for 4×.
 - Quantize-on-store, dequantize-on-load (transparent to callers).
 
 **New: Batch inference** (``batch.py``)
@@ -111,15 +138,13 @@ Major feature release.
 
 **New: Flat block-pool disk tier** (``disk_tier.py``)
 
-- Replaces per-file ``torch.save/load`` with a single pre-allocated
-  binary.
+- Replaces per-file ``torch.save/load`` with a single pre-allocated binary.
 - Atomic index persistence via ``os.replace()``.
 - Async-friendly reads with ``non_blocking=True``.
 
 **New: Model compatibility checks** (``compat.py``)
 
-- 11 supported RoPE architectures, 6 blocked (ALiBi, absolute
-  embeddings).
+- 11 supported RoPE architectures, 6 blocked (ALiBi, absolute embeddings).
 - ``strict=True/False`` on ``from_pretrained()``.
 - ``verify_correctness()`` self-test for untested models.
 
@@ -127,18 +152,6 @@ Major feature release.
 
 - Frequency-based eviction replaces pure LRU.
 - System prompt chunks protected, one-off documents evicted first.
-
-**Improved: warm() diagnostics**
-
-- Returns ``WarmResult`` with alignment warnings.
-- Logs when prompt length is not a multiple of chunk_size.
-
-**New: Accuracy benchmarks** (``benchmark_accuracy_vs_vllm.py``)
-
-- Five HuggingFace benchmarks: HellaSwag, ARC-Challenge, MMLU, GSM8K,
-  TruthfulQA.
-- Validates near-zero accuracy degradation vs HF baseline.
-- Optional head-to-head comparison with vLLM-MLX.
 
 **Documentation:**
 

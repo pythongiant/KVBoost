@@ -12,7 +12,7 @@ To install a specific version:
 
 .. code-block:: bash
 
-   pip install kvboost==0.3.0
+   pip install kvboost==0.4.0
 
 From Source
 -----------
@@ -29,7 +29,7 @@ Verify Installation
 .. code-block:: python
 
    import kvboost
-   print(kvboost.__version__)  # 0.3.0
+   print(kvboost.__version__)  # 0.4.0
 
 Requirements
 ------------
@@ -45,24 +45,11 @@ platform-specific builds required.
 Optional Dependencies
 ---------------------
 
-For running benchmarks against vLLM-MLX:
+For running the 3-way benchmark suite (KVBoost vs vLLM vs HF baseline):
 
 .. code-block:: bash
 
-   pip install vllm-mlx
-
-For running benchmarks against MLX LLM:
-
-.. code-block:: bash
-
-   pip install mlx-lm
-
-For the LongBench Arena harness and accuracy benchmarks (HellaSwag, ARC,
-MMLU, GSM8K, TruthfulQA, LongBench v1/v2):
-
-.. code-block:: bash
-
-   pip install datasets
+   pip install vllm datasets
 
 For documentation development:
 

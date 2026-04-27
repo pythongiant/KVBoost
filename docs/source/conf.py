@@ -3,7 +3,7 @@
 project = "KVBoost"
 copyright = "2025, Srihari Unnikrishnan"
 author = "Srihari Unnikrishnan"
-release = "0.1.0"
+release = "0.4.0"
 
 extensions = [
     "sphinx.ext.autodoc",

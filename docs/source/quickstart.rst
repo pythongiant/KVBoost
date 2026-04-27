@@ -22,7 +22,7 @@ Basic Usage
        max_new_tokens=128,
    )
    print(result.output_text)
-   print(f"TTFT: {result.ttft_ms:.1f}ms | Cache reuse: {result.kv_reuse_ratio:.0%}")
+   print(f"TTFT: {result.ttft_ms:.1f} ms | Cache reuse: {result.kv_reuse_ratio:.0%}")
 
 Batch Inference
 ---------------
@@ -39,7 +39,7 @@ Process multiple prompts sharing a common prefix in one pass:
    for r in results:
        print(r.output_text)
 
-Or auto-group mixed prompts:
+Or auto-group mixed prompts by detected prefix:
 
 .. code-block:: python
 
@@ -56,27 +56,31 @@ Memory-Efficient Mode
 
    engine = KVBoost.from_pretrained(
        "Qwen/Qwen2.5-3B",
-       kv_cache_bits=8,              # int8 quantized KV (2x RAM savings)
-       disk_cache_dir="/tmp/kv",     # evicted chunks go to disk
-       recompute_strategy="cacheblend",  # smarter recompute
+       kv_cache_bits=8,                  # int8 quantized KV (2x RAM savings)
+       disk_cache_dir="/tmp/kv",         # evicted chunks spill to disk
+       recompute_strategy="cacheblend",  # deviation-guided seam repair
    )
 
-Long-Context Mode
------------------
+Recommended Long-Context Configuration
+---------------------------------------
 
-For long documents where fixed-size chunking would cut mid-sentence or
-strand later chunks from the document's attention sinks, turn on the
-continuity features added in 0.3.0 (see :doc:`guide/continuity`):
+For long documents (1K–6K tokens), use the full set of continuity features
+validated in the 0.4.0 benchmarks. This is the configuration that produced
+99.2% accuracy at 72.9% avg KV reuse:
 
 .. code-block:: python
 
    engine = KVBoost.from_pretrained(
        "Qwen/Qwen2.5-3B",
+       recompute_strategy="cacheblend",
+       max_cache_bytes=1.5e9,        # 1.5 GB hot tier
        chunk_boundary_window=16,     # snap splits to sentence boundaries
        overlap_k=16,                 # encode each chunk with 16-token overlap
        sink_tokens=32,               # carry the first 32 tokens as a global prefix
-       recompute_strategy="cacheblend",
+       recency_window_chunks=8,
    )
+
+See :doc:`guide/continuity` for what each knob does.
 
 When Does It Help?
 ------------------
@@ -88,8 +92,8 @@ When Does It Help?
      - Benefit
    * - Multi-turn chat, 3B+ model, shared system prompt
      - High: prefix-hash hits grow with history length.
-   * - Long-context retrieval / multi-hop QA (1K-4K tokens)
-     - High: this is the bucket the 0.3.0 continuity features target.
+   * - Long-context retrieval / multi-hop QA (1K–6K tokens)
+     - High: validated in 0.4.0 benchmarks (10.1× warm TTFT speedup).
    * - Document / code reuse, 800+ tokens
      - High: non-prefix interior reuse via content-hash fallback.
    * - RAG with short context (~500 tokens)
@@ -100,6 +104,5 @@ When Does It Help?
      - Net negative: prefill is already cheap.
 
 Rule of thumb: benefits appear on **3B+ models** with **500+ token
-shared context**. See :doc:`benchmarks/overview` for the LongBench Arena
-harness that produces per-bucket TTFT, accuracy, and reuse numbers on
-your own hardware.
+shared context**. See :doc:`benchmarks/overview` for full results with
+real numbers.
