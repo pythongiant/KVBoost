@@ -370,15 +370,35 @@ def _run_kvboost(
         text = result.output_text
         predicted = _extract_answer(text)
         gold = sample["answers"][0] if sample.get("answers") else ""
-        outputs.append(text)
-        ckpt_samples.append({"id": sample.get("id", ""), "gold": gold, "predicted": predicted, "correct": predicted == gold})
+        correct = predicted == gold
         query_type = "COLD" if is_q1 else "WARM"
-        log.info("[kvboost accuracy %d/%d] %s  ctx=%d tok  reuse=%.1f%%  gold=%s  pred=%s  %s",
+        outputs.append(text)
+        ckpt_samples.append({
+            "i": i,
+            "id": sample.get("id", ""),
+            "pair_group": sample.get("pair_group"),
+            "query_type": query_type,
+            "repo": sample.get("repo", ""),
+            "context_tokens": sample["approx_tokens"],
+            "choices": sample.get("choices", []),
+            "question": sample.get("input", ""),
+            "gold": gold,
+            "raw_output": text,
+            "predicted": predicted,
+            "correct": correct,
+            "kv_reuse_pct": round(result.kv_reuse_ratio * 100, 2),
+        })
+        running_acc = sum(s["correct"] for s in ckpt_samples) / len(ckpt_samples)
+        log.info("[kvboost accuracy %d/%d] %s  ctx=%d tok  reuse=%.1f%%  gold=%s  pred=%s  %s  running=%.1f%%",
                  i + 1, n, query_type, sample["approx_tokens"],
                  result.kv_reuse_ratio * 100, gold, predicted,
-                 "✓" if predicted == gold else "✗")
+                 "✓" if correct else "✗", running_acc * 100)
         if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
-            _atomic_checkpoint(checkpoint_path, {"outputs": outputs, "samples": ckpt_samples, "n_done": i + 1})
+            _atomic_checkpoint(checkpoint_path, {
+                "n_done": i + 1, "n_total": n,
+                "running_accuracy": running_acc,
+                "samples": ckpt_samples,
+            })
             log.debug("  checkpoint saved (%d/%d)", i + 1, n)
     del engine
     if torch.cuda.is_available():
@@ -387,7 +407,9 @@ def _run_kvboost(
 
 
 def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int = 4,
-                           max_context_tokens: int = 8192) -> List[str]:
+                           max_context_tokens: int = 8192,
+                           checkpoint: bool = True,
+                           checkpoint_path: Optional[Path] = None) -> List[str]:
     from vllm import LLM, SamplingParams
 
     n = len(samples)
@@ -401,12 +423,36 @@ def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int =
     raw_outputs = llm.generate(prompts, params)
     del llm
     results = [o.outputs[0].text for o in raw_outputs]
+    ckpt_samples = []
+    n_correct = 0
     for i, (sample, text) in enumerate(zip(samples, results)):
         predicted = _extract_answer(text)
         gold = sample["answers"][0] if sample.get("answers") else ""
-        log.info("[vllm_prefixcache accuracy %d/%d] ctx=%d tok  gold=%s  pred=%s  %s",
+        correct = predicted == gold
+        n_correct += int(correct)
+        ckpt_samples.append({
+            "i": i,
+            "id": sample.get("id", ""),
+            "pair_group": sample.get("pair_group"),
+            "query_type": "COLD" if sample.get("id", "").endswith("_q1") else "WARM",
+            "repo": sample.get("repo", ""),
+            "context_tokens": sample["approx_tokens"],
+            "choices": sample.get("choices", []),
+            "question": sample.get("input", ""),
+            "gold": gold,
+            "raw_output": text,
+            "predicted": predicted,
+            "correct": correct,
+        })
+        log.info("[vllm_prefixcache accuracy %d/%d] ctx=%d tok  gold=%s  pred=%s  %s  running=%.1f%%",
                  i + 1, n, sample["approx_tokens"], gold, predicted,
-                 "✓" if predicted == gold else "✗")
+                 "✓" if correct else "✗", 100 * n_correct / (i + 1))
+    if checkpoint and checkpoint_path:
+        _atomic_checkpoint(checkpoint_path, {
+            "n_done": n, "n_total": n,
+            "running_accuracy": n_correct / n if n else 0,
+            "samples": ckpt_samples,
+        })
     return results
 
 
@@ -445,13 +491,32 @@ def _run_baseline(
             text = tokenizer.decode(new_ids, skip_special_tokens=True)
             predicted = _extract_answer(text)
             gold = sample["answers"][0] if sample.get("answers") else ""
+            correct = predicted == gold
             outputs.append(text)
-            ckpt_samples.append({"id": sample.get("id", ""), "gold": gold, "predicted": predicted, "correct": predicted == gold})
-            log.info("[baseline accuracy %d/%d] ctx=%d tok  gold=%s  pred=%s  %s",
+            ckpt_samples.append({
+                "i": i,
+                "id": sample.get("id", ""),
+                "pair_group": sample.get("pair_group"),
+                "query_type": "COLD" if sample.get("id", "").endswith("_q1") else "WARM",
+                "repo": sample.get("repo", ""),
+                "context_tokens": sample["approx_tokens"],
+                "choices": sample.get("choices", []),
+                "question": sample.get("input", ""),
+                "gold": gold,
+                "raw_output": text,
+                "predicted": predicted,
+                "correct": correct,
+            })
+            running_acc = sum(s["correct"] for s in ckpt_samples) / len(ckpt_samples)
+            log.info("[baseline accuracy %d/%d] ctx=%d tok  gold=%s  pred=%s  %s  running=%.1f%%",
                      i + 1, n, sample["approx_tokens"], gold, predicted,
-                     "✓" if predicted == gold else "✗")
+                     "✓" if correct else "✗", running_acc * 100)
             if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
-                _atomic_checkpoint(checkpoint_path, {"outputs": outputs, "samples": ckpt_samples, "n_done": i + 1})
+                _atomic_checkpoint(checkpoint_path, {
+                    "n_done": i + 1, "n_total": n,
+                    "running_accuracy": running_acc,
+                    "samples": ckpt_samples,
+                })
                 log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del hf_model
@@ -520,7 +585,9 @@ def benchmark_accuracy(
             checkpoint_path=ckpt_path,
         )
     elif backend == "vllm_prefixcache":
-        raw_outputs = _run_vllm_prefixcache(samples, model, max_context_tokens=max_context_tokens)
+        raw_outputs = _run_vllm_prefixcache(samples, model,
+                                             max_context_tokens=max_context_tokens,
+                                             checkpoint=checkpoint, checkpoint_path=ckpt_path)
     elif backend == "baseline":
         raw_outputs = _run_baseline(samples, model,
                                     checkpoint=checkpoint, checkpoint_path=ckpt_path)
