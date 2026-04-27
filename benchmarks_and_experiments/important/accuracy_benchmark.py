@@ -435,7 +435,7 @@ def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int =
               max_model_len=max_context_tokens + 128,
               gpu_memory_utilization=0.95,
               enforce_eager=True,
-              max_num_seqs=4)
+              max_num_seqs=1)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
     raw_outputs = []
     for batch_start in range(0, n, _VLLM_BATCH):

@@ -11,8 +11,12 @@ Executes all three benchmarks (accuracy, latency, GPU memory) and produces:
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
+
+# Reduce CUDA memory fragmentation — must be set before any CUDA allocation.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 from datetime import datetime
 from typing import Dict, Any
 
