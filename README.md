@@ -204,6 +204,8 @@ KVBoost config: `cacheblend` strategy, 1.5 GB cache, recency window 8, boundary 
 
 ### Latency — Time to First Token
 
+![COLD vs WARM TTFT](docs/figures/cold_warm_ttft.png)
+
 | Backend | TTFT mean | TTFT p95 | COLD mean | WARM mean | Throughput | vs Baseline |
 |---|---|---|---|---|---|---|
 | **KVBoost** | **142 ms** | 506 ms | 222 ms | **63 ms** | 11.7 tok/s | **4.49×** |
@@ -215,7 +217,19 @@ COLD = first query in a pair (no cached KVs). WARM = second query after the diff
 KVBoost WARM TTFT is **3.5× faster than its own COLD** and **10.1× faster than Baseline**.
 Both caching backends reach nearly identical WARM latency (~62–63 ms); KVBoost has a lower overall mean because its COLD path (222 ms) is faster than vLLM's (269 ms) due to chunk-level partial cache hits on first access.
 
+![Speedup vs Baseline](docs/figures/speedup_summary.png)
+
+![TTFT CDF](docs/figures/ttft_cdf.png)
+
+The CDF shows that KVBoost's advantage is consistent across percentiles, not just at the mean — even the p95 warm latency (101 ms) is far below the baseline median (440 ms).
+
+![TTFT by Context Length](docs/figures/ttft_by_bucket.png)
+
+KVBoost's chunk-level partial cache hits let it outperform vLLM on COLD queries at every context-length bucket, because even a first-time request can hit cached chunks from earlier requests with overlapping text.
+
 ### Accuracy
+
+![Accuracy vs KV Reuse](docs/figures/accuracy_vs_reuse.png)
 
 | Backend | Overall | COLD | WARM | Avg KV reuse (warm) |
 |---|---|---|---|---|
@@ -224,9 +238,11 @@ Both caching backends reach nearly identical WARM latency (~62–63 ms); KVBoost
 | Baseline (HF) | 99.1% | 99.2% | 99.0% | — |
 
 Cold accuracy spread across backends is **0.2 pp**, confirming all three backends process identical inputs.
-KVBoost WARM accuracy matches COLD exactly (99.2%) despite 72.9% average KV reuse — the CacheBlend seam repair produces no measurable quality degradation.
+KVBoost WARM accuracy matches COLD exactly (99.2%) despite 72.9% average KV reuse — the CacheBlend seam repair produces no measurable quality degradation. The accuracy-by-reuse chart confirms this holds even at the 80–100% reuse bucket.
 
 ### KV Reuse Distribution (KVBoost, warm queries only)
+
+![KV Reuse Distribution](docs/figures/kv_reuse_distribution.png)
 
 | Reuse bucket | Share of warm queries |
 |---|---|
