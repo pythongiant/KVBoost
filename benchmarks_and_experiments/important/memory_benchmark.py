@@ -348,7 +348,18 @@ def _measure_kvboost(
                  i + 1, n, query_type, peak_mb, kv_cache_mb, result.kv_reuse_ratio * 100,
                  sample["approx_tokens"], memory_efficiency)
         if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
-            _atomic_checkpoint(checkpoint_path, [asdict(r) for r in results])
+            _atomic_checkpoint(checkpoint_path, {
+                "n_done": i + 1, "n_total": n,
+                "avg_peak_mb": round(float(np.mean([r2.gpu_memory_mb for r2 in results])), 2),
+                "samples": [{
+                    **asdict(r2),
+                    "pair_group": samples[j].get("pair_group"),
+                    "query_type": "COLD" if samples[j].get("id", "").endswith("_q1") else "WARM",
+                    "repo": samples[j].get("repo", ""),
+                    "choices": samples[j].get("choices", []),
+                    "question": samples[j].get("input", ""),
+                } for j, r2 in enumerate(results)],
+            })
             log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del engine
@@ -412,7 +423,18 @@ def _measure_vllm_prefixcache(
         log.info("[vllm_prefixcache memory %d/%d] peak=%.1fMB  kv=%.1fMB  ctx=%d tok  eff=%.2f tok/MB",
                  i + 1, n, peak_mb, kv_cache_mb, sample["approx_tokens"], memory_efficiency)
         if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
-            _atomic_checkpoint(checkpoint_path, [asdict(r) for r in results])
+            _atomic_checkpoint(checkpoint_path, {
+                "n_done": i + 1, "n_total": n,
+                "avg_peak_mb": round(float(np.mean([r2.gpu_memory_mb for r2 in results])), 2),
+                "samples": [{
+                    **asdict(r2),
+                    "pair_group": samples[j].get("pair_group"),
+                    "query_type": "COLD" if samples[j].get("id", "").endswith("_q1") else "WARM",
+                    "repo": samples[j].get("repo", ""),
+                    "choices": samples[j].get("choices", []),
+                    "question": samples[j].get("input", ""),
+                } for j, r2 in enumerate(results)],
+            })
             log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del llm
@@ -481,7 +503,18 @@ def _measure_baseline(
             log.info("[baseline memory %d/%d] peak=%.1fMB  kv=%.1fMB  ctx=%d tok  eff=%.2f tok/MB",
                      i + 1, n, peak_mb, kv_cache_mb, sample["approx_tokens"], memory_efficiency)
             if checkpoint and checkpoint_path and (i + 1) % _CHECKPOINT_INTERVAL == 0:
-                _atomic_checkpoint(checkpoint_path, [asdict(r) for r in results])
+                _atomic_checkpoint(checkpoint_path, {
+                    "n_done": i + 1, "n_total": n,
+                    "avg_peak_mb": round(float(np.mean([r2.gpu_memory_mb for r2 in results])), 2),
+                    "samples": [{
+                        **asdict(r2),
+                        "pair_group": samples[j].get("pair_group"),
+                        "query_type": "COLD" if samples[j].get("id", "").endswith("_q1") else "WARM",
+                        "repo": samples[j].get("repo", ""),
+                        "choices": samples[j].get("choices", []),
+                        "question": samples[j].get("input", ""),
+                    } for j, r2 in enumerate(results)],
+                })
                 log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del hf_model
