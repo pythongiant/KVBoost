@@ -414,6 +414,9 @@ def _run_kvboost(
 
 def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int = 4,
                            max_context_tokens: int = 8192,
+                           gpu_memory_utilization: float = 0.95,
+                           enforce_eager: bool = True,
+                           max_num_seqs: int = 1,
                            checkpoint: bool = True,
                            checkpoint_path: Optional[Path] = None) -> List[str]:
     import torch
@@ -433,9 +436,9 @@ def _run_vllm_prefixcache(samples: List[Dict], model: str, max_new_tokens: int =
     prompts = [_format_prompt(s["context"], s["input"], s.get("choices")) for s in samples]
     llm = LLM(model=model, enable_prefix_caching=True,
               max_model_len=max_context_tokens + 128,
-              gpu_memory_utilization=0.95,
-              enforce_eager=True,
-              max_num_seqs=1)
+              gpu_memory_utilization=gpu_memory_utilization,
+              enforce_eager=enforce_eager,
+              max_num_seqs=max_num_seqs)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
     raw_outputs = []
     for batch_start in range(0, n, _VLLM_BATCH):
@@ -545,6 +548,7 @@ def _run_baseline(
                 log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del hf_model
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return outputs
@@ -565,6 +569,9 @@ def benchmark_accuracy(
     kvboost_chunk_boundary_window: int = 0,
     kvboost_overlap_k: int = 0,
     kvboost_sink_tokens: int = 0,
+    vllm_gpu_memory_utilization: float = 0.95,
+    vllm_enforce_eager: bool = True,
+    vllm_max_num_seqs: int = 1,
 ) -> List[AccuracyResult]:
     """
     Run accuracy benchmark for a specific backend.
@@ -612,6 +619,9 @@ def benchmark_accuracy(
     elif backend == "vllm_prefixcache":
         raw_outputs = _run_vllm_prefixcache(samples, model,
                                              max_context_tokens=max_context_tokens,
+                                             gpu_memory_utilization=vllm_gpu_memory_utilization,
+                                             enforce_eager=vllm_enforce_eager,
+                                             max_num_seqs=vllm_max_num_seqs,
                                              checkpoint=checkpoint, checkpoint_path=ckpt_path)
     elif backend == "baseline":
         raw_outputs = _run_baseline(samples, model,

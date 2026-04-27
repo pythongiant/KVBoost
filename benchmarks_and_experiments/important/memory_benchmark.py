@@ -379,6 +379,9 @@ def _measure_vllm_prefixcache(
     model: str,
     max_new_tokens: int = 64,
     max_context_tokens: int = 8192,
+    gpu_memory_utilization: float = 0.95,
+    enforce_eager: bool = True,
+    max_num_seqs: int = 1,
     checkpoint: bool = True,
     checkpoint_path: Optional[Path] = None,
 ) -> List[GPUMemoryResult]:
@@ -395,9 +398,9 @@ def _measure_vllm_prefixcache(
     tokenizer = AutoTokenizer.from_pretrained(model)
     llm = LLM(model=model, enable_prefix_caching=True,
               max_model_len=max_context_tokens + 128,
-              gpu_memory_utilization=0.95,
-              enforce_eager=True,
-              max_num_seqs=1)
+              gpu_memory_utilization=gpu_memory_utilization,
+              enforce_eager=enforce_eager,
+              max_num_seqs=max_num_seqs)
     params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
     weights_mb = _get_model_weights_mb()
     n = len(samples)
@@ -533,6 +536,7 @@ def _measure_baseline(
                 log.debug("  checkpoint saved (%d/%d)", i + 1, n)
 
     del hf_model
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return results
@@ -551,6 +555,9 @@ def benchmark_gpu_memory(
     kvboost_chunk_boundary_window: int = 0,
     kvboost_overlap_k: int = 0,
     kvboost_sink_tokens: int = 0,
+    vllm_gpu_memory_utilization: float = 0.95,
+    vllm_enforce_eager: bool = True,
+    vllm_max_num_seqs: int = 1,
 ) -> List[GPUMemoryResult]:
     """
     Run GPU memory benchmark for a specific backend.
@@ -602,6 +609,9 @@ def benchmark_gpu_memory(
     elif backend == "vllm_prefixcache":
         results = _measure_vllm_prefixcache(samples, model,
                                              max_context_tokens=max_context_tokens,
+                                             gpu_memory_utilization=vllm_gpu_memory_utilization,
+                                             enforce_eager=vllm_enforce_eager,
+                                             max_num_seqs=vllm_max_num_seqs,
                                              checkpoint=checkpoint, checkpoint_path=ckpt_path)
     elif backend == "baseline":
         results = _measure_baseline(samples, model,

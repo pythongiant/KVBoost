@@ -64,6 +64,9 @@ def run_all_benchmarks(
     kvboost_chunk_boundary_window: int = 0,
     kvboost_overlap_k: int = 0,
     kvboost_sink_tokens: int = 0,
+    vllm_gpu_memory_utilization: float = 0.95,
+    vllm_enforce_eager: bool = True,
+    vllm_max_num_seqs: int = 1,
 ) -> Dict[str, Any]:
     """Run all three benchmarks"""
 
@@ -81,6 +84,7 @@ def run_all_benchmarks(
     print(f"  Checkpoint:         {checkpoint}")
     print(f"  KVBoost cache:      {kvboost_max_cache_bytes/1e9:.2f} GB  recency={kvboost_recency_window_chunks} chunks")
     print(f"  KVBoost strategy:   {kvboost_recompute_strategy}  boundary={kvboost_chunk_boundary_window}  overlap={kvboost_overlap_k}  sink={kvboost_sink_tokens}")
+    print(f"  vLLM settings:      gpu_mem={vllm_gpu_memory_utilization}  enforce_eager={vllm_enforce_eager}  max_num_seqs={vllm_max_num_seqs}")
     print(f"  Timestamp:          {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*100}\n")
 
@@ -101,6 +105,9 @@ def run_all_benchmarks(
         kvboost_overlap_k=kvboost_overlap_k,
         kvboost_sink_tokens=kvboost_sink_tokens,
         checkpoint=checkpoint,
+        vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+        vllm_enforce_eager=vllm_enforce_eager,
+        vllm_max_num_seqs=vllm_max_num_seqs,
     )
 
     # === ACCURACY BENCHMARK ===
@@ -311,6 +318,23 @@ Examples:
         help="KVBoost attention sink prefix tokens (default: 0)"
     )
     parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.95,
+        help="vLLM GPU memory utilization fraction (default: 0.95)"
+    )
+    parser.add_argument(
+        "--vllm-no-enforce-eager",
+        action="store_true",
+        help="Disable enforce_eager for vLLM (enables CUDA graph capture)"
+    )
+    parser.add_argument(
+        "--vllm-max-num-seqs",
+        type=int,
+        default=1,
+        help="vLLM max sequences in flight (default: 1)"
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging"
@@ -335,6 +359,9 @@ Examples:
         kvboost_chunk_boundary_window=args.chunk_boundary_window,
         kvboost_overlap_k=args.overlap_k,
         kvboost_sink_tokens=args.sink_tokens,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_enforce_eager=not args.vllm_no_enforce_eager,
+        vllm_max_num_seqs=args.vllm_max_num_seqs,
     )
     
     # Save unified report

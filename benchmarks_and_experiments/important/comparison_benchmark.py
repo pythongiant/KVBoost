@@ -11,6 +11,7 @@ All results saved to JSON with human-readable table output.
 """
 
 import argparse
+import gc
 import json
 import time
 import logging
@@ -335,6 +336,7 @@ class BenchmarkRunner:
             ))
 
         del engine
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return results
@@ -403,6 +405,7 @@ class BenchmarkRunner:
             ))
 
         del llm
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return results
@@ -489,6 +492,7 @@ class BenchmarkRunner:
                 ))
 
         del hf_model
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return results
