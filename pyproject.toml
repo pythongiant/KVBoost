@@ -36,6 +36,9 @@ dev = [
     "pytest>=7.0",
     "ruff>=0.1.0",
 ]
+cuda = [
+    "ninja>=1.11",
+]
 docs = [
     "sphinx>=7.0",
     "furo>=2024.0",

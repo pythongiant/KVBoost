@@ -100,6 +100,9 @@ class KVCacheManager:
                 max_chunks=max_chunks * 2,  # cold tier can hold more than hot
             )
 
+        # Eviction callbacks: called with chunk_id when a chunk is evicted
+        self._eviction_callbacks: list = []
+
         # Stats
         self.hits = 0
         self.misses = 0
@@ -110,6 +113,10 @@ class KVCacheManager:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def register_eviction_callback(self, callback) -> None:
+        """Register a callable(chunk_id: str) invoked whenever a chunk is evicted."""
+        self._eviction_callbacks.append(callback)
 
     def store(self, chunk: CachedChunk) -> None:
         """
@@ -545,6 +552,12 @@ class KVCacheManager:
         if self._bytes_used < 0:
             self._bytes_used = 0
         self.evictions += 1
+
+        for cb in self._eviction_callbacks:
+            try:
+                cb(victim_id)
+            except Exception:
+                log.exception("Error in eviction callback for chunk %s", victim_id[:8])
 
     @staticmethod
     def _move_kv(kv: PastKVType, device: str) -> PastKVType:

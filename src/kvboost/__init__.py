@@ -33,17 +33,32 @@ from .kv_quantize import quantize_kv, dequantize_kv, QuantizedKV
 from .disk_tier import DiskTier
 from .batch import find_common_chunk_prefix, broadcast_kv, group_by_prefix
 from .compat import SUPPORTED_ARCHITECTURES, UNSUPPORTED_ARCHITECTURES, check_model_compatibility, default_device
+from .flash_attn_ext import install_flash_attention, uninstall_flash_attention, flash_attention_available, get_tier as get_flash_attn_tier
+from .cpu_paged import CPUPagedEngine, BlockAllocator, paged_attention_fwd, ChunkBlockMapper
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
+    # Core engine
     "KVBoost",
     "GenerationMode",
     "GenerationResult",
     "RecomputeStrategy",
+    # CPU paged engine
+    "CPUPagedEngine",
+    "BlockAllocator",
+    "paged_attention_fwd",
+    "ChunkBlockMapper",
+    # Flash attention
+    "install_flash_attention",
+    "uninstall_flash_attention",
+    "flash_attention_available",
+    "get_flash_attn_tier",
+    # Data structures
     "CachedChunk",
     "AssembledPrompt",
     "WarmResult",
+    # Sub-systems
     "KVCacheManager",
     "ChunkRegistry",
     "ChunkStrategy",
@@ -51,9 +66,11 @@ __all__ = [
     "AssemblyMode",
     "SelectiveRecompute",
     "CacheBlendRecompute",
+    # Compat
     "SUPPORTED_ARCHITECTURES",
     "UNSUPPORTED_ARCHITECTURES",
     "check_model_compatibility",
+    # Quantization
     "quantize_kv",
     "dequantize_kv",
     "QuantizedKV",

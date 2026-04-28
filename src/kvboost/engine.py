@@ -140,6 +140,10 @@ class InferenceEngine:
             device="cpu",
         )
 
+        # Install flash attention (no-op if kernel not available)
+        from .flash_attn_ext import install_flash_attention
+        self._flash_attn_patched = install_flash_attention(self.model)
+
     # ------------------------------------------------------------------
     # Factory
     # ------------------------------------------------------------------
