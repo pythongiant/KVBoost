@@ -16,7 +16,7 @@ strategies (selective recompute and CacheBlend) that preserve full output qualit
    result = engine.generate("You are a helpful assistant...\n\nHello!")
    print(f"{result.output_text}  ({result.ttft_ms:.0f} ms, {result.kv_reuse_ratio:.0%} reuse)")
 
-**Benchmarked on Qwen/Qwen2.5-3B — 500 LongBench samples, vs vLLM prefix cache and HF baseline:**
+**Benchmarked on Qwen/Qwen2.5-3B — 500 bug-localization samples (JetBrains-Research/lca-bug-localization), vs vLLM prefix cache and HF baseline:**
 
 - WARM TTFT: **63 ms** — 10.1× faster than HF baseline
 - COLD TTFT: **222 ms** — 17% faster than vLLM (chunk-level partial hits on first access)

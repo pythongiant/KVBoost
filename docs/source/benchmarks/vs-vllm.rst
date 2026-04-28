@@ -9,8 +9,9 @@ Methodology
 -----------
 
 **Dataset:** 500 bug-localization samples from
-`LongBench <https://github.com/THUDM/LongBench>`_ (multi-file code diff +
-question + 4 choices). Max context: 6 000 tokens. Each sample appears twice —
+`JetBrains-Research/lca-bug-localization <https://huggingface.co/datasets/JetBrains-Research/lca-bug-localization>`_
+(multi-file code diff + question + 4 choices). Max context: 6 000 tokens.
+Each sample appears twice —
 once as a COLD query (fresh cache) and once as a WARM query (diff prefix
 cached from the COLD pass).
 

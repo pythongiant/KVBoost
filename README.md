@@ -197,7 +197,7 @@ Full docs: [kvboost.readthedocs.io](https://kvboost.readthedocs.io/en/latest/)
 
 ## Benchmarks
 
-Results on **Qwen/Qwen2.5-3B**, **500 bug-localization samples** (LongBench, max 6 000 context tokens).
+Results on **Qwen/Qwen2.5-3B**, **500 bug-localization samples** ([JetBrains-Research/lca-bug-localization](https://huggingface.co/datasets/JetBrains-Research/lca-bug-localization), max 6 000 context tokens).
 Each backend ran in an isolated process for a clean GPU state. Accuracy measured as exact-match on 4-choice multiple-choice questions.
 
 KVBoost config: `cacheblend` strategy, 1.5 GB cache, recency window 8, boundary window 16, overlap-k 16, sink tokens 32.

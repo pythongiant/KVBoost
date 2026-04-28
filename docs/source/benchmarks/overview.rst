@@ -3,7 +3,8 @@ Benchmarks
 
 0.4.0 includes a comprehensive 3-way benchmark suite comparing KVBoost,
 vLLM (prefix cache), and the HuggingFace baseline on **500 bug-localization
-samples from LongBench** (Qwen/Qwen2.5-3B, max 6 000 context tokens).
+samples from** `JetBrains-Research/lca-bug-localization <https://huggingface.co/datasets/JetBrains-Research/lca-bug-localization>`_
+(Qwen/Qwen2.5-3B, max 6 000 context tokens).
 
 Each backend ran in an **isolated subprocess** for a clean GPU state.
 Accuracy is measured as exact-match on 4-choice multiple-choice questions.

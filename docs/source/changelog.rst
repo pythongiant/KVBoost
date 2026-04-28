@@ -24,7 +24,7 @@ that affected tensor memory and logit accuracy on newer transformers versions.
 
 **New: Benchmark figures** (``docs/figures/``)
 
-- Six figures derived from the 500-sample LongBench experiment embedded in
+- Six figures derived from the 500-sample lca-bug-localization experiment embedded in
   the README and available for reuse.
 
 **Fixed: Logit tensor bloat** (``engine.py``)
