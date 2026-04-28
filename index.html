@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KVBoost — The LLM Inference Tax Nobody Talks About</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 19px;
+  line-height: 1.85;
+  color: #111;
+  background: #fff;
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 4rem 2rem 6rem;
+}
+h1 { font-size: 2.3rem; line-height: 1.2; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 0.7rem; }
+h2 { font-size: 1.3rem; font-weight: 700; margin: 2.8rem 0 0.9rem; letter-spacing: -0.2px; }
+.subtitle { font-size: 1.05rem; color: #666; font-style: italic; margin-bottom: 1.5rem; }
+.byline { font-size: 0.87rem; color: #bbb; border-bottom: 1px solid #eee; padding-bottom: 2rem; margin-bottom: 2.8rem; }
+p { margin-bottom: 1.3rem; }
+a { color: #111; }
+code { font-family: 'SFMono-Regular', 'Consolas', monospace; font-size: 0.82em; background: #f4f4f2; padding: 0.15em 0.4em; border-radius: 3px; }
+ul { margin-bottom: 1.3rem; padding-left: 1.5rem; }
+li { margin-bottom: 0.5rem; }
+figure { margin: 2.8rem -0.5rem; background: #fafaf8; border: 1px solid #eee; border-radius: 10px; padding: 1.5rem 1rem 0.8rem; }
+figcaption { font-family: system-ui, -apple-system, sans-serif; font-size: 0.82rem; color: #999; text-align: center; margin-top: 1rem; font-style: italic; line-height: 1.45; }
+.stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin: 2.2rem 0; }
+.stat { background: #f8f8f6; border: 1px solid #eee; border-radius: 8px; padding: 1.2rem; }
+.stat-n { font-family: system-ui, -apple-system, sans-serif; font-size: 1.9rem; font-weight: 700; color: #111; line-height: 1; }
+.stat-l { font-family: system-ui, -apple-system, sans-serif; font-size: 0.77rem; color: #aaa; margin-top: 0.4rem; line-height: 1.4; }
+.chart-wrap { position: relative; width: 100%; height: 200px; }
+hr { border: none; border-top: 1px solid #eee; margin: 2.8rem 0; }
+</style>
+</head>
+<body>
+
+<h1>The LLM inference tax nobody talks about</h1>
+<p class="subtitle">Every request recomputes everything. I built an open-source fix for the cases prefix caching misses.</p>
+<p class="byline">Srihari Unnikrishnan &middot; Independent research &middot; 2026</p>
+
+<p>Every LLM request at your company recomputes everything. System prompt, retrieved documents, few-shot examples &mdash; the model reads them fresh, every time. Doesn't matter if those exact tokens showed up in the last million requests. No memory. Full price.</p>
+
+<p>The industry has a partial answer: prefix caching. If requests share a leading prefix token-for-token, vLLM and SGLang will skip that recomputation. It works well when your shared content always sits at the very front. It does nothing when a retrieved document shows up at position 200, or when a system prompt gets shuffled by dynamic context injection, or when two users share common boilerplate that happens not to be the very first tokens.</p>
+
+<p>I got tired of paying the tax where prefix caching doesn't apply. So I built KVBoost. Source: <a href="https://github.com/pythongiant/kvboost">github.com/pythongiant/kvboost</a>, MIT licensed, open for contributors.</p>
+
+<h2>The idea</h2>
+
+<p>Split the prompt into 128-token chunks. Give each chunk two hash keys &mdash; one encoding content plus positional context (for exact reuse), one encoding content alone (for approximate reuse regardless of where it appears in the prompt). When a request arrives, check both stores before touching the GPU for those tokens.</p>
+
+<!-- FIGURE 1: Chunk comparison -->
+<figure>
+<svg width="100%" viewBox="0 0 680 210" role="img" xmlns="http://www.w3.org/2000/svg">
+  <title>Chunk-level KV cache reuse: prefix caching vs KVBoost</title>
+  <desc>Left shows prefix caching failing after a mid-prompt miss. Right shows KVBoost reusing non-contiguous chunks.</desc>
+
+  <!-- Section labels -->
+  <text x="170" y="22" text-anchor="middle" font-size="13" font-weight="500" fill="#555" font-family="system-ui, sans-serif">Prefix caching</text>
+  <text x="510" y="22" text-anchor="middle" font-size="13" font-weight="500" fill="#555" font-family="system-ui, sans-serif">KVBoost</text>
+
+  <!-- Divider -->
+  <line x1="340" y1="10" x2="340" y2="200" stroke="#e8e8e8" stroke-width="1"/>
+
+  <!-- LEFT side: prefix caching -->
+  <!-- C1: teal hit -->
+  <rect x="42" y="45" width="58" height="42" rx="4" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/>
+  <text x="71" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#085041" font-family="system-ui, sans-serif">C1</text>
+  <text x="71" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#0F6E56" font-family="system-ui, sans-serif">hit</text>
+  <!-- C2: teal hit -->
+  <rect x="108" y="45" width="58" height="42" rx="4" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/>
+  <text x="137" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#085041" font-family="system-ui, sans-serif">C2</text>
+  <text x="137" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#0F6E56" font-family="system-ui, sans-serif">hit</text>
+  <!-- C3: gray miss -->
+  <rect x="174" y="45" width="58" height="42" rx="4" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+  <text x="203" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#444441" font-family="system-ui, sans-serif">C3</text>
+  <text x="203" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#888780" font-family="system-ui, sans-serif">miss</text>
+  <!-- C4: blocked -->
+  <rect x="240" y="45" width="58" height="42" rx="4" fill="#F1EFE8" stroke="#D3D1C7" stroke-width="0.5"/>
+  <text x="269" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#888780" font-family="system-ui, sans-serif">C4</text>
+  <text x="269" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#B4B2A9" font-family="system-ui, sans-serif">blocked</text>
+
+  <!-- Red break marker between C2 and C3 -->
+  <line x1="171" y1="45" x2="171" y2="87" stroke="#E24B4A" stroke-width="1.2" stroke-dasharray="3 2"/>
+  <text x="102" y="108" text-anchor="middle" font-size="10" fill="#E24B4A" font-family="system-ui, sans-serif">miss breaks</text>
+  <text x="102" y="121" text-anchor="middle" font-size="10" fill="#E24B4A" font-family="system-ui, sans-serif">the chain</text>
+  <text x="247" y="108" text-anchor="middle" font-size="10" fill="#B4B2A9" font-family="system-ui, sans-serif">C4 blocked even</text>
+  <text x="247" y="121" text-anchor="middle" font-size="10" fill="#B4B2A9" font-family="system-ui, sans-serif">if cached elsewhere</text>
+
+  <!-- Left result -->
+  <text x="170" y="162" text-anchor="middle" font-size="12" font-weight="500" fill="#444" font-family="system-ui, sans-serif">2 / 4 chunks reused</text>
+
+  <!-- RIGHT side: KVBoost -->
+  <!-- C1: exact hit -->
+  <rect x="382" y="45" width="58" height="42" rx="4" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/>
+  <text x="411" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#085041" font-family="system-ui, sans-serif">C1</text>
+  <text x="411" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#0F6E56" font-family="system-ui, sans-serif">hit</text>
+  <!-- C2: miss -->
+  <rect x="448" y="45" width="58" height="42" rx="4" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+  <text x="477" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#444441" font-family="system-ui, sans-serif">C2</text>
+  <text x="477" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#888780" font-family="system-ui, sans-serif">miss</text>
+  <!-- C3: exact hit despite gap -->
+  <rect x="514" y="45" width="58" height="42" rx="4" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/>
+  <text x="543" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#085041" font-family="system-ui, sans-serif">C3</text>
+  <text x="543" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#0F6E56" font-family="system-ui, sans-serif">hit</text>
+  <!-- C4: approximate hit -->
+  <rect x="580" y="45" width="58" height="42" rx="4" fill="#EEEDFE" stroke="#7F77DD" stroke-width="0.5"/>
+  <text x="609" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#26215C" font-family="system-ui, sans-serif">C4</text>
+  <text x="609" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#534AB7" font-family="system-ui, sans-serif">&#x2248; hit</text>
+
+  <!-- Right annotations -->
+  <text x="510" y="108" text-anchor="middle" font-size="10" fill="#0F6E56" font-family="system-ui, sans-serif">gap doesn&#39;t block</text>
+  <text x="510" y="121" text-anchor="middle" font-size="10" fill="#0F6E56" font-family="system-ui, sans-serif">subsequent chunks</text>
+
+  <!-- Right result -->
+  <text x="510" y="162" text-anchor="middle" font-size="12" font-weight="500" fill="#444" font-family="system-ui, sans-serif">3 / 4 chunks reused</text>
+
+  <!-- Legend -->
+  <rect x="178" y="186" width="11" height="11" rx="2" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/>
+  <text x="193" y="195" font-size="10" fill="#888" font-family="system-ui, sans-serif">Exact hit</text>
+  <rect x="265" y="186" width="11" height="11" rx="2" fill="#EEEDFE" stroke="#7F77DD" stroke-width="0.5"/>
+  <text x="280" y="195" font-size="10" fill="#888" font-family="system-ui, sans-serif">Approx hit</text>
+  <rect x="360" y="186" width="11" height="11" rx="2" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+  <text x="375" y="195" font-size="10" fill="#888" font-family="system-ui, sans-serif">Miss / blocked</text>
+</svg>
+<figcaption>Figure 1. Prefix caching (left) fails when a miss appears mid-prompt — all subsequent chunks are blocked even if their content is cached elsewhere. KVBoost (right) reuses any matching chunk regardless of position, including approximate content matches (C4).</figcaption>
+</figure>
+
+<p>The result: 4.49&times; mean time-to-first-token speedup over full recomputation, and 16% faster than vLLM prefix caching, on 1,000 samples from a bug-localization benchmark using Qwen2.5-3B. Exact-match accuracy: 99.2% vs 99.1% for both baselines.</p>
+
+<div class="stats-row">
+  <div class="stat">
+    <div class="stat-n">4.49&times;</div>
+    <div class="stat-l">speedup vs. full recompute (mean TTFT)</div>
+  </div>
+  <div class="stat">
+    <div class="stat-n">16%</div>
+    <div class="stat-l">faster than vLLM prefix caching</div>
+  </div>
+  <div class="stat">
+    <div class="stat-n">99.2%</div>
+    <div class="stat-l">exact-match accuracy, vs 99.1% baseline</div>
+  </div>
+</div>
+
+<h2>The hard part</h2>
+
+<p>Two problems nearly killed this.</p>
+
+<p>The first is attention seams. When you stitch cached chunks together, boundary tokens attended to a different preceding context when they were originally encoded. Reusing those KV tensors verbatim produces silent attention errors &mdash; the kind that don't crash, don't appear in logs, and quietly degrade output quality.</p>
+
+<p>I implemented two repair strategies. The spatial one (SelectiveRecompute) re-encodes the last 16 tokens before each seam. The deviation-guided one (CacheBlendRecompute, adapted from the CacheBlend paper) does a cheap probe pass, measures per-token cosine deviation, and recomputes only the tokens that actually changed &mdash; about 15% of the prompt. The deviation-guided approach catches mid-chunk errors the spatial window misses entirely, and it's mandatory for any approximate content match.</p>
+
+<!-- FIGURE 2: Seam repair -->
+<figure>
+<svg width="100%" viewBox="0 0 680 188" role="img" xmlns="http://www.w3.org/2000/svg">
+  <title>Seam error and repair at chunk boundaries</title>
+  <desc>Two cached chunks joined at a seam have incorrect KV tensors near the boundary. The repair window spans both sides of the seam and is re-encoded with full context.</desc>
+
+  <text x="340" y="20" text-anchor="middle" font-size="12" fill="#999" font-family="system-ui, sans-serif" font-style="italic">Assembling two cached chunks creates seam error at the boundary</text>
+
+  <!-- C1 block -->
+  <rect x="130" y="52" width="200" height="58" rx="6" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/>
+  <text x="230" y="76" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#085041" font-family="system-ui, sans-serif">C1</text>
+  <text x="230" y="94" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0F6E56" font-family="system-ui, sans-serif">cached KV tensors</text>
+
+  <!-- C2 block -->
+  <rect x="350" y="52" width="200" height="58" rx="6" fill="#E6F1FB" stroke="#378ADD" stroke-width="0.5"/>
+  <text x="450" y="76" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53" font-family="system-ui, sans-serif">C2</text>
+  <text x="450" y="94" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5" font-family="system-ui, sans-serif">cached KV tensors</text>
+
+  <!-- Seam dashed line -->
+  <line x1="340" y1="35" x2="340" y2="128" stroke="#E24B4A" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="340" y="30" text-anchor="middle" font-size="10" fill="#E24B4A" font-family="system-ui, sans-serif">seam</text>
+
+  <!-- Repair window (drawn on top so it overlays both chunks) -->
+  <rect x="258" y="47" width="164" height="68" rx="5" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5" fill-opacity="0.88"/>
+  <text x="340" y="72" text-anchor="middle" dominant-baseline="central" font-size="12" font-weight="500" fill="#633806" font-family="system-ui, sans-serif">repair window</text>
+  <text x="340" y="90" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#854F0B" font-family="system-ui, sans-serif">re-encoded with full context</text>
+
+  <!-- Bracket below repair window -->
+  <line x1="258" y1="121" x2="422" y2="121" stroke="#EF9F27" stroke-width="0.8"/>
+  <line x1="258" y1="116" x2="258" y2="121" stroke="#EF9F27" stroke-width="0.8"/>
+  <line x1="422" y1="116" x2="422" y2="121" stroke="#EF9F27" stroke-width="0.8"/>
+
+  <!-- Strategy labels -->
+  <text x="340" y="140" text-anchor="middle" font-size="11" fill="#666" font-family="system-ui, sans-serif">SelectiveRecompute: fixed 16-token boundary window</text>
+  <text x="340" y="158" text-anchor="middle" font-size="11" fill="#666" font-family="system-ui, sans-serif">CacheBlendRecompute: top ~15% of tokens by cosine deviation</text>
+  <text x="340" y="176" text-anchor="middle" font-size="10" fill="#aaa" font-family="system-ui, sans-serif">Both strategies correct attention context before the main forward pass</text>
+</svg>
+<figcaption>Figure 2. The repair window straddles each chunk seam, spanning portions of both cached chunks. KVBoost patches only the tokens that actually deviate from what a full-context forward pass would produce.</figcaption>
+</figure>
+
+<p>The second problem is RoPE position collisions. Key vectors carry their positional encoding baked in. A chunk cached at positions 0&ndash;128 is wrong if reused at positions 512&ndash;640. The dual-hash scheme handles this: the prefix hash encodes content plus position context (exact reuse, no correction needed), while the content hash encodes content alone (approximate reuse, mandatory deviation repair). Two lookup tiers, two different trust levels.</p>
+
+<h2>What&rsquo;s in the repo</h2>
+
+<p>Beyond the core caching engine, a few things make this production-usable rather than a research toy.</p>
+
+<p>Asymmetric KIVI-style quantization cuts cache memory by about half (int8) or 4&times; (int4) with negligible quality impact. It uses per-channel quantization for keys and per-token quantization for values, which matches how outliers actually distribute across those tensors.</p>
+
+<p>Importance-weighted LRU eviction scores chunks by their &ell;2 key norm before deciding what to evict. A system prompt with high attention signal outlives filler tokens under memory pressure, rather than being evicted purely by recency.</p>
+
+<p>An optional disk-tier overflow stores cold chunks as memory-mapped files. Retrieval takes 10&ndash;50ms per chunk, compared to 100&ndash;500ms for GPU recompute. Not free, but substantially cheaper.</p>
+
+<p>Adaptive chunk boundary splitting nudges split points toward punctuation so seams fall at natural linguistic breaks. Batch generation loads the shared chunk prefix once across a batch and broadcasts it zero-copy via <code>torch.Tensor.expand</code>. The API is two methods: <code>warm(text)</code> pre-loads documents into cache, <code>generate(prompt)</code> uses it.</p>
+
+<p>Compatibility covers Qwen2, LLaMA, Mistral, Mixtral, Gemma, Phi, and anything else using RoPE with HuggingFace&rsquo;s <code>past_key_values</code> interface. ALiBi and learned absolute embeddings are not supported &mdash; they require different position correction mechanisms that aren&rsquo;t implemented yet.</p>
+
+<h2>The numbers, honestly</h2>
+
+<!-- FIGURE 3: TTFT chart -->
+<figure>
+<div class="chart-wrap">
+  <canvas id="ttftChart" role="img" aria-label="Horizontal bar chart comparing mean time-to-first-token: KVBoost 142ms, vLLM prefix cache 165ms, full recompute 639ms">Full recompute: 639ms, vLLM prefix cache: 165ms, KVBoost: 142ms</canvas>
+</div>
+<figcaption>Figure 3. Mean time-to-first-token across 1,000 samples (Qwen2.5-3B, RTX 4060). KVBoost&rsquo;s advantage over vLLM is largest at short context lengths (1.53&times; in the 0&ndash;500 token bucket) and narrows as context grows.</figcaption>
+</figure>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+(function() {
+  var ctx = document.getElementById('ttftChart');
+  if (!ctx) return;
+  new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: ['Full recompute', 'vLLM prefix cache', 'KVBoost'],
+      datasets: [{
+        label: 'Mean TTFT (ms)',
+        data: [639, 165, 142],
+        backgroundColor: ['#D3D1C7', '#85B7EB', '#5DCAA5'],
+        borderColor: ['#888780', '#378ADD', '#1D9E75'],
+        borderWidth: 0.5,
+        borderRadius: 4,
+        barThickness: 36,
+      }]
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: function(ctx) { return ' ' + ctx.parsed.x + ' ms'; }
+          }
+        }
+      },
+      scales: {
+        x: {
+          title: { display: true, text: 'Mean time to first token (ms)', font: { size: 11, family: 'system-ui' }, color: '#999' },
+          grid: { color: '#f0f0ee' },
+          ticks: { color: '#888', font: { size: 11, family: 'system-ui' } }
+        },
+        y: {
+          grid: { display: false },
+          ticks: { color: '#444', font: { size: 12, family: 'system-ui' } }
+        }
+      }
+    }
+  });
+})();
+</script>
+
+<p>The 4.49&times; speedup is real on this workload. The 16% advantage over vLLM reflects two things: KVBoost avoids PagedAttention&rsquo;s per-page overhead, and its repair strategy means it can safely reuse chunks that prefix caching would have to leave alone.</p>
+
+<p>The accuracy numbers are clean. Seam repair doesn&rsquo;t hurt quality on bug localization. What I haven&rsquo;t tested: long-form generation, code completion, multi-document summarization. Those benchmarks would tell a more complete story. I haven&rsquo;t run them yet, and the benchmark suite in the repo is there if you want to.</p>
+
+<p>Two known rough edges: single-GPU only (multi-GPU tensor parallelism isn&rsquo;t implemented), and for very long cached contexts (over 8K tokens) the CacheBlend probe pass itself gets expensive &mdash; a threshold-based activation would fix it, but it&rsquo;s not shipped yet.</p>
+
+<h2>Who should care</h2>
+
+<p>RAG pipelines are the obvious case. Every retrieved document chunk is a cache candidate. Pre-warm the document store once; pay for encoding amortized across thousands of queries instead of per-query. Multi-turn chat benefits similarly &mdash; system prompts and early conversation turns get cached and reused across users sharing the same context.</p>
+
+<p>As context windows grow from 128K to 1M tokens, the cost of recomputing shared content scales quadratically. Prefix caching handles that cost only when your architecture happens to front-load all shared content. Most production architectures don&rsquo;t.</p>
+
+<p>The core idea &mdash; that where content appears in a prompt shouldn&rsquo;t determine whether its KV tensors can be reused &mdash; sounds obvious in retrospect. Making it work without quality regression means solving the position encoding problem and the attention seam problem together. I think KVBoost is the first open-source implementation that does both in a single usable package.</p>
+
+<hr>
+
+<h2>Come build this</h2>
+
+<p>The repo is at <a href="https://github.com/pythongiant/kvboost">github.com/pythongiant/kvboost</a>, MIT licensed. Issues are open. Benchmark suite and experiment scripts are in <code>benchmarks_and_experiments/important/</code>.</p>
+
+<p>Things I&rsquo;m actively looking for help with:</p>
+<ul>
+  <li>Broader benchmark coverage: long-form generation, code completion, summarization, multilingual tasks</li>
+  <li>Multi-GPU support: cache shard coordination across tensor-parallel deployments</li>
+  <li>Integration adapters: LangChain/LlamaIndex middleware, OpenAI-compatible API wrapper</li>
+  <li>Threshold-based probe activation: skip the CacheBlend probe when cache hit rate is below a configurable floor</li>
+  <li>ALiBi position correction: extending the dual-hash scheme to models that use ALiBi instead of RoPE</li>
+</ul>
+
+<p>If the problem interests you &mdash; whether that means opening a PR, stress-testing the benchmarks on a different model or task, or just asking hard questions about the architecture &mdash; find me on GitHub.</p>
+
+</body>
+</html>
