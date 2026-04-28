@@ -64,6 +64,102 @@ Requirements: Python ≥ 3.9, PyTorch ≥ 2.1, Transformers ≥ 4.38.
 
 ---
 
+## Flash Attention (CUDA)
+
+KVBoost ships a custom **FlashAttention-2 CUDA kernel** that replaces the default O(N²) attention during KV encoding. It is optional — the library falls back gracefully if the extension is not built.
+
+### Installation
+
+**CPU / MPS only** (default install, no kernel):
+
+```bash
+pip install kvboost
+# or from source:
+pip install -e .
+```
+
+**With CUDA kernel** (Ampere, Ada, Hopper, Volta, Turing):
+
+```bash
+# Requires: CUDA toolkit ≥ 11.8, ninja (for fast compilation)
+pip install kvboost[cuda]
+# or from source:
+FORCE_CUDA=1 pip install -e ".[cuda]"
+```
+
+The extension is compiled the first time you run `pip install`. Ninja is used automatically if available (much faster than the default `make` backend):
+
+```bash
+pip install ninja  # recommended
+```
+
+### What it does
+
+The kernel implements tiled FlashAttention-2 with online softmax, reducing HBM memory traffic from O(N²) to O(N) during KV encoding. It is applied automatically to every attention module inside the loaded model — no code changes needed.
+
+Supported:
+
+| Property | Values |
+|---|---|
+| Dtypes | `float16`, `bfloat16` |
+| Head dimensions | 64, 96, 128 |
+| Sequence lengths | any (no power-of-2 requirement) |
+| Causal masking | yes (skips future K/V tiles entirely) |
+| GPU architectures | Volta (sm_70), Turing (sm_75), Ampere (sm_80/86), Ada (sm_89), Hopper (sm_90) |
+
+Falls back to `torch.nn.functional.scaled_dot_product_attention` (which uses cuDNN FlashAttention on Ampere+) when the custom kernel is not compiled, and to vanilla SDPA on CPU/MPS.
+
+### Checking which tier is active
+
+```python
+from kvboost import flash_attention_available, get_flash_attn_tier
+
+print(get_flash_attn_tier())
+# "kvboost_cuda"  — custom kernel compiled and loaded
+# "torch_flash"   — torch SDPA flash path (cuDNN)
+# "vanilla"       — standard SDPA (CPU/MPS or no flash support)
+
+print(flash_attention_available())  # True if either accelerated tier is active
+```
+
+### Manual control
+
+```python
+from kvboost import install_flash_attention, uninstall_flash_attention
+
+# Already called automatically by KVBoost.__init__ —
+# only needed if you want to patch a model you loaded yourself:
+n_patched = install_flash_attention(model)
+print(f"Patched {n_patched} attention modules")
+
+# Restore original attention (useful for ablation / debugging):
+uninstall_flash_attention(model)
+```
+
+### CPU paged attention
+
+For CPU-only deployments, KVBoost provides `CPUPagedEngine` — a drop-in replacement that manages KV tensors in a fixed block pool (PagedAttention-style) instead of growing contiguous tensors. Shared prefixes across requests share physical blocks via copy-on-write, eliminating redundant memory allocation.
+
+```python
+from kvboost import CPUPagedEngine
+
+engine = CPUPagedEngine.from_pretrained(
+    "Qwen/Qwen2.5-3B",
+    max_cache_bytes=4_000_000_000,
+    block_size=16,   # tokens per physical block
+    num_blocks=8192, # total blocks in the pre-allocated pool
+)
+engine.warm("System prompt ...")
+result = engine.generate("System prompt ...\n\nUser question", max_new_tokens=256)
+
+print(engine.paged_stats())
+# {'block_utilization': 0.12, 'free_blocks': 7168, 'used_blocks': 1024, ...}
+```
+
+`CPUPagedEngine` inherits all of KVBoost's chunk hashing, recompute strategies, and KV quantization — only the decode loop changes.
+
+---
+
 ## How it works
 
 The core idea is one sentence: **split the prompt into fixed-size chunks,
@@ -263,6 +359,129 @@ KVBoost WARM accuracy matches COLD exactly (99.2%) despite 72.9% average KV reus
 
 KVBoost warm queries use ~29 MB less peak memory than cold queries, as cached chunks skip the full prefill activation spike.
 vLLM peak memory is managed internally by its engine and is not tracked via `torch.cuda.max_memory_allocated`.
+
+---
+
+## Inference server
+
+KVBoost ships an OpenAI-compatible inference server with async prefix-grouped batching. Any client that speaks the OpenAI API works against it without modification.
+
+### Installation
+
+```bash
+pip install 'kvboost[server]'
+```
+
+### Start the server
+
+```bash
+# Minimum
+kvboost-server --model Qwen/Qwen2.5-3B
+
+# Production config
+kvboost-server \
+    --model Qwen/Qwen2.5-3B \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --max-cache-bytes 4e9 \
+    --recompute-strategy cacheblend \
+    --kv-cache-bits 8 \
+    --batch-window-ms 20 \
+    --max-batch-size 8 \
+    --warm "You are a helpful assistant."
+
+# CPU-only with paged attention backend
+kvboost-server \
+    --model Qwen/Qwen2.5-3B \
+    --backend cpu-paged \
+    --block-size 16 \
+    --num-blocks 8192
+```
+
+Or via Python:
+
+```bash
+python -m kvboost.server --model Qwen/Qwen2.5-3B
+```
+
+### Use with any OpenAI client
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="kvboost")
+
+# Chat completion
+response = client.chat.completions.create(
+    model="Qwen/Qwen2.5-3B",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Explain KV caching in one sentence."},
+    ],
+    max_tokens=128,
+)
+print(response.choices[0].message.content)
+
+# Text completion (streaming)
+for chunk in client.completions.create(
+    model="Qwen/Qwen2.5-3B",
+    prompt="The capital of France is",
+    max_tokens=32,
+    stream=True,
+):
+    print(chunk.choices[0].text, end="", flush=True)
+```
+
+Works with LangChain, LlamaIndex, and any other OpenAI-compatible framework.
+
+### Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness probe |
+| `GET` | `/v1/models` | List loaded model |
+| `POST` | `/v1/completions` | Text completion |
+| `POST` | `/v1/chat/completions` | Chat completion |
+| `GET` | `/v1/stats` | Queue, cache, and throughput diagnostics |
+| `POST` | `/v1/warm` | Pre-warm KV cache with a prefix string |
+
+All completion endpoints support `stream=true` (Server-Sent Events, same format as OpenAI).
+
+### How batching works
+
+```
+Client A ──┐                    ┌── result A
+Client B ──┤  BatchQueue        │
+Client C ──┤  (20 ms window)    ├── result B
+Client D ──┘  prefix grouping   └── result C, D (shared prefix → single batch)
+```
+
+1. Requests arrive at the FastAPI handler and are enqueued immediately (non-blocking).
+2. The `BatchQueue` collects requests for `--batch-window-ms` (default 20 ms).
+3. At the end of the window, requests are grouped by the hash of their first 3 prefix chunks. Requests sharing a prefix are dispatched as a single batch.
+4. The `EngineWorker` calls `engine.generate_batch()` for each batch group — shared prefix KV is loaded once and broadcast (zero-copy) across the batch.
+5. Results are resolved back to each caller's `asyncio.Future`.
+
+Back-pressure: if the queue exceeds `--max-queue-size`, new requests receive HTTP 503. Requests not completed within 120 s receive HTTP 504.
+
+### Server options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--model` | required | HuggingFace model name or local path |
+| `--host` | `0.0.0.0` | Bind address |
+| `--port` | `8000` | Port |
+| `--device` | auto | `cuda` \| `mps` \| `cpu` |
+| `--dtype` | `float16` | Model weight dtype |
+| `--backend` | `default` | `default` (GPU/CPU) or `cpu-paged` |
+| `--max-cache-bytes` | `2e9` | KV cache memory budget |
+| `--recompute-strategy` | `cacheblend` | `selective` \| `cacheblend` \| `none` |
+| `--kv-cache-bits` | `16` | `16` (off) \| `8` \| `4` |
+| `--batch-window-ms` | `20` | Request collection window |
+| `--max-batch-size` | `8` | Max requests per batch |
+| `--max-queue-size` | `256` | Queue capacity before 503 |
+| `--warm` | — | Pre-warm text (loaded before accepting traffic) |
+| `--workers` | `1` | Engine thread-pool size (keep 1 for GPU) |
 
 ---
 

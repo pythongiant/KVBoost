@@ -47,6 +47,7 @@ from ..engine import InferenceEngine, GenerationMode, GenerationResult, Recomput
 from ..models import AssembledPrompt, CachedChunk, PastKVType, WarmResult
 from ..cache_manager import KVCacheManager
 from ..compat import last_logit_only, default_device
+from ..flash_attn_ext import install_paged_attention, uninstall_paged_attention
 from .block_allocator import BlockAllocator
 from .paged_attn_cpu import paged_attention_fwd, append_kv_to_blocks
 from .chunk_to_blocks import ChunkBlockMapper
@@ -350,63 +351,61 @@ class CPUPagedEngine(InferenceEngine):
         do_sample: bool,
     ) -> Tuple[int, List[int], int]:
         """
-        One decode step using paged K/V.
+        One decode step using true paged attention.
 
-        For each layer:
-          1. Run Q/K/V projections for the single new token (no past_kv).
-          2. Append new K/V to block pool.
-          3. Run paged_attention_fwd using full block table for context.
-          4. Run output projection + feed forward (remainder of transformer).
+        Installs the paged attention interceptor onto every attention module
+        so that each layer's SDPA call:
+          1. Writes the newly projected K/V token into the block pool.
+          2. Reads the full K/V history from the pool (no contiguous tensor).
+          3. Computes attention via paged_attention_fwd and returns the result.
 
-        In practice this requires hooking into the per-layer forward.  Here
-        we implement a simplified version that runs a full model forward for
-        logit computation and then syncs the K/V into the pool.
+        model.forward() is called with NO past_key_values — the block pool
+        is the sole source of KV context, accessed mid-layer by the interceptor.
         """
         input_ids = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
-        pos_ids = torch.tensor([[position]], dtype=torch.long, device=self.device)
+        pos_ids   = torch.tensor([[position]],  dtype=torch.long, device=self.device)
 
-        # We need the KV from the full context for correct attention.
-        # Reconstruct past_kv from the block pool for this step.
-        past_kv_from_pool = self._read_kv_from_pool(block_table, seq_len_in_pool)
-        past_kv_dev = tuple(
-            (k.to(self.device), v.to(self.device))
-            for k, v in past_kv_from_pool
-        )
+        # Shared mutable state threaded through all layer interceptors.
+        # All layers share the same block_table pointer; each layer writes its
+        # new K/V to the same slot offset (seq_len_in_pool) then increments it.
+        # To avoid double-advancing seq_len across layers we track which layer
+        # last advanced it — only layer 0's write drives the pointer forward;
+        # subsequent layers write to the same slot without re-advancing.
+        state: Dict = {
+            "allocator":   self.allocator,
+            "block_table": list(block_table),
+            "seq_len":     seq_len_in_pool,
+            # Track the slot we want every layer to write into.
+            # _make_paged_sdpa advances state["seq_len"] on every call, but
+            # we only want it advanced once (after the last layer).  We fix
+            # this by resetting seq_len to seq_len_in_pool before each layer
+            # and capturing the post-write value only from the final layer.
+            "_write_slot": seq_len_in_pool,
+            "_layer_count": 0,
+            "_num_layers":  self._num_layers,
+        }
 
-        with torch.no_grad(), last_logit_only(self.model):
-            out = self.model(
-                input_ids=input_ids,
-                past_key_values=self._as_cache(past_kv_dev),
-                position_ids=pos_ids,
-                use_cache=True,
-            )
+        install_paged_attention(self.model, state)
+        try:
+            with torch.no_grad(), last_logit_only(self.model):
+                out = self.model(
+                    input_ids=input_ids,
+                    position_ids=pos_ids,
+                    use_cache=False,   # KV managed by pool, not HF cache
+                )
+        finally:
+            uninstall_paged_attention(self.model)
 
-        new_kv = self._normalize_past_kv(out.past_key_values)
-        block_table, seq_len_in_pool = self._append_new_kv_to_pool(
-            new_kv, block_table, seq_len_in_pool,
-            skip_prefix_len=seq_len_in_pool,
-        )
+        # After all layers have run, state["block_table"] and state["seq_len"]
+        # reflect the pool after writing this token.  But _make_paged_sdpa
+        # increments seq_len once per layer; we only want it incremented once
+        # total (one new token slot).  Use _write_slot + 1 as the canonical
+        # new seq_len.
+        new_block_table = state["block_table"]
+        new_seq_len     = state["_write_slot"] + 1
 
         next_token = self._sample(out.logits[:, -1, :], temperature, do_sample)
-        return next_token, block_table, seq_len_in_pool
-
-    def _read_kv_from_pool(
-        self, block_table: List[int], seq_len: int
-    ) -> PastKVType:
-        """Reconstruct HF past_key_values from the block pool."""
-        layers = []
-        for layer_idx in range(self._num_layers):
-            if not block_table or seq_len == 0:
-                empty = torch.zeros(
-                    1, self._num_kv_heads, 0, self._head_dim,
-                    dtype=torch.float16,
-                )
-                layers.append((empty, empty))
-                continue
-            K, V = self.allocator.read_kv(layer_idx, block_table, seq_len)
-            # K, V: [num_kv_heads, seq_len, head_dim] → [1, num_kv_heads, seq_len, head_dim]
-            layers.append((K.unsqueeze(0), V.unsqueeze(0)))
-        return tuple(layers)
+        return next_token, new_block_table, new_seq_len
 
     def _load_past_kv_into_pool(
         self, past_kv: PastKVType, seq_len: int
