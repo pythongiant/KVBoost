@@ -191,6 +191,8 @@ class ShareGPTRunner:
         overlap_k: int = 16,
         sink_tokens: int = 32,
         max_new_tokens: int = 128,
+        max_cache_bytes: float = None,
+        recency_window_chunks: int = None,
     ):
         from kvboost import KVBoost, GenerationMode
         from kvboost.flash_attn_ext import get_tier
@@ -203,14 +205,20 @@ class ShareGPTRunner:
             f"(strategy={recompute_strategy}, boundary_window={chunk_boundary_window}, "
             f"overlap_k={overlap_k}, sink_tokens={sink_tokens})"
         )
-        self.engine = KVBoost.from_pretrained(
-            model_name,
+        kvboost_kwargs = dict(
             chunk_size=chunk_size,
             recompute_overlap=16,
             recompute_strategy=recompute_strategy,
             chunk_boundary_window=chunk_boundary_window,
             overlap_k=overlap_k,
             sink_tokens=sink_tokens,
+            max_cache_bytes=int(max_cache_bytes) if max_cache_bytes is not None else None,
+        )
+        if recency_window_chunks is not None:
+            kvboost_kwargs["recency_window_chunks"] = recency_window_chunks
+        self.engine = KVBoost.from_pretrained(
+            model_name,
+            **kvboost_kwargs,
         )
         flash_tier = get_tier()
         log.info(f"  Engine ready on {self.engine.device} | flash_attn tier: {flash_tier}")
@@ -610,6 +618,14 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=128,
                         help="Max tokens to generate per turn (default: 128)")
     parser.add_argument("--chunk-size", type=int, default=128)
+    parser.add_argument("--max-cache-bytes", type=float, default=None,
+                        help="KV cache size cap in bytes (e.g. 1.5e9 for 1.5 GB)")
+    parser.add_argument("--recency-window-chunks", type=int, default=None,
+                        help="Number of recent chunks to keep in cache")
+    parser.add_argument("--n-samples", type=int, default=None,
+                        help="Alias for --n-conversations (overrides if set)")
+    parser.add_argument("--max-context-tokens", type=int, default=None,
+                        help="Drop conversations whose total token count exceeds this")
 
     # KVBoost tuning — defaults are the best-performing config
     parser.add_argument("--recompute-strategy", default="cacheblend",
@@ -626,6 +642,10 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
+
+    # --n-samples is a convenience alias for --n-conversations
+    if args.n_samples is not None:
+        args.n_conversations = args.n_samples
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -650,6 +670,8 @@ def main():
         overlap_k=args.overlap_k,
         sink_tokens=args.sink_tokens,
         max_new_tokens=args.max_new_tokens,
+        max_cache_bytes=args.max_cache_bytes,
+        recency_window_chunks=args.recency_window_chunks,
     )
 
     conversations = load_sharegpt(
@@ -663,6 +685,23 @@ def main():
     if not conversations:
         log.error("No conversations loaded after filtering.")
         sys.exit(1)
+
+    if args.max_context_tokens is not None:
+        before = len(conversations)
+        conversations = [
+            c for c in conversations
+            if sum(
+                len(runner.tokenizer.encode(t["value"]))
+                for t in c["turns"]
+            ) <= args.max_context_tokens
+        ]
+        log.info(
+            f"max_context_tokens={args.max_context_tokens}: "
+            f"{before} → {len(conversations)} conversations"
+        )
+        if not conversations:
+            log.error("No conversations remain after max_context_tokens filter.")
+            sys.exit(1)
 
     results = replay_conversations(
         runner=runner,

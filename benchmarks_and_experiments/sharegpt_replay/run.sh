@@ -26,9 +26,13 @@ python "${SCRIPT_DIR}/run_sharegpt.py" \
     --chunk-boundary-window 16 \
     --overlap-k 16 \
     --sink-tokens 32 \
-    --n-conversations 1000 \
+    --max-cache-bytes 1.5e9 \
+    --recency-window-chunks 8 \
+    --n-samples 500 \
+    --max-context-tokens 6000 \
     --min-turns 3 \
     --max-turns 8 \
+    --model meta-llama/Llama-3.2-3B \
     --max-new-tokens 128 \
     --output "${SCRIPT_DIR}/results/sharegpt_replay.json" \
     ${EXTRA_ARGS}
