@@ -32,6 +32,7 @@ python "${SCRIPT_DIR}/run_sharegpt_vllm.py" \
     --model Qwen/Qwen2.5-3B \
     --max-new-tokens 128 \
     --gpu-memory-utilization 0.90 \
+    --max-model-len 8192 \
     --output "${SCRIPT_DIR}/results/vllm_sharegpt_replay.json" \
     ${EXTRA_ARGS}
 
