@@ -1,0 +1,100 @@
+{
+  "benchmark": "sharegpt_replay",
+  "dataset": "Aeala/ShareGPT_Vicuna_unfiltered",
+  "model": "Qwen/Qwen2.5-3B",
+  "config": {
+    "n_conversations": 500,
+    "min_turns": 3,
+    "max_turns": 8,
+    "recompute_strategy": "cacheblend",
+    "chunk_boundary_window": 16,
+    "overlap_k": 16,
+    "sink_tokens": 32,
+    "max_new_tokens": 128,
+    "chunk_size": 128
+  },
+  "metrics": {
+    "n_conversations": 500,
+    "n_turns_total": 2485,
+    "overall": {
+      "baseline_ttft_p50": 31.441965023986995,
+      "baseline_ttft_p90": 85.3303000156302,
+      "baseline_ttft_p99": 140.51260450854866,
+      "kvboost_ttft_p50": 20.14662799774669,
+      "kvboost_ttft_p90": 23.616348387440667,
+      "kvboost_ttft_p99": 29.343109403271175,
+      "speedup_mean": 1.9765091914005701,
+      "speedup_p50": 1.5507088016436197,
+      "speedup_p90": 3.7664522005261984,
+      "avg_kv_reuse_ratio": 0.8609089567107798,
+      "baseline_throughput_rps": 0.272,
+      "kvboost_throughput_rps": 0.278
+    },
+    "by_turn": {
+      "0": {
+        "n": 500,
+        "avg_baseline_ttft_ms": 18.7943974515656,
+        "avg_kvboost_ttft_ms": 17.370541016513016,
+        "avg_reuse_ratio": 0.35723193174578843,
+        "avg_history_tokens": 54.264,
+        "speedup": 1.081969607837719
+      },
+      "1": {
+        "n": 500,
+        "avg_baseline_ttft_ms": 23.09757105819881,
+        "avg_kvboost_ttft_ms": 19.9061880147201,
+        "avg_reuse_ratio": 0.968601879489766,
+        "avg_history_tokens": 205.734,
+        "speedup": 1.1603211544630627
+      },
+      "2": {
+        "n": 500,
+        "avg_baseline_ttft_ms": 35.153463536989875,
+        "avg_kvboost_ttft_ms": 20.576443160593044,
+        "avg_reuse_ratio": 0.9920553100392594,
+        "avg_history_tokens": 370.886,
+        "speedup": 1.7084324663221677
+      },
+      "3": {
+        "n": 383,
+        "avg_baseline_ttft_ms": 48.87130653911803,
+        "avg_kvboost_ttft_ms": 21.33657085401062,
+        "avg_reuse_ratio": 0.9944404106610404,
+        "avg_history_tokens": 531.6892950391644,
+        "speedup": 2.2904948913068535
+      },
+      "4": {
+        "n": 265,
+        "avg_baseline_ttft_ms": 63.685951897883264,
+        "avg_kvboost_ttft_ms": 22.536999755648825,
+        "avg_reuse_ratio": 0.9955872144807391,
+        "avg_history_tokens": 689.5924528301887,
+        "speedup": 2.8258398450716844
+      },
+      "5": {
+        "n": 172,
+        "avg_baseline_ttft_ms": 82.42795168612352,
+        "avg_kvboost_ttft_ms": 23.623207656613843,
+        "avg_reuse_ratio": 0.9963926688982081,
+        "avg_history_tokens": 826.2383720930233,
+        "speedup": 3.489278546939665
+      },
+      "6": {
+        "n": 106,
+        "avg_baseline_ttft_ms": 102.81819582066744,
+        "avg_kvboost_ttft_ms": 24.59102148109968,
+        "avg_reuse_ratio": 0.9959307182733962,
+        "avg_history_tokens": 963.6698113207547,
+        "speedup": 4.18112748588716
+      },
+      "7": {
+        "n": 59,
+        "avg_baseline_ttft_ms": 121.62426686243911,
+        "avg_kvboost_ttft_ms": 26.50090313360679,
+        "avg_reuse_ratio": 0.9960120759463525,
+        "avg_history_tokens": 1114.1016949152543,
+        "speedup": 4.589438565518275
+      }
+    }
+  }
+}
