@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import logging
@@ -175,6 +176,12 @@ def load_sharegpt(
 # ── vLLM runner ───────────────────────────────────────────────────
 
 class VLLMRunner:
+    """
+    Uses AsyncLLMEngine + token streaming to measure true TTFT:
+    wall-clock time from request submission to the first token chunk
+    arriving in the async generator, before decode begins.
+    """
+
     def __init__(
         self,
         model_name: str,
@@ -184,7 +191,7 @@ class VLLMRunner:
         tensor_parallel_size: int = 1,
         enable_prefix_caching: bool = True,
     ):
-        from vllm import LLM, SamplingParams
+        from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
         from transformers import AutoTokenizer
 
         self.SamplingParams = SamplingParams
@@ -194,22 +201,25 @@ class VLLMRunner:
         log.info(
             f"Loading model: {model_name} "
             f"(prefix_caching={enable_prefix_caching}, "
-            f"gpu_mem_util={gpu_memory_utilization})"
+            f"gpu_mem_util={gpu_memory_utilization}, async=True)"
         )
 
-        llm_kwargs = dict(
+        engine_args = AsyncEngineArgs(
             model=model_name,
             gpu_memory_utilization=gpu_memory_utilization,
             tensor_parallel_size=tensor_parallel_size,
             enable_prefix_caching=enable_prefix_caching,
             trust_remote_code=True,
+            max_model_len=max_model_len,
+            disable_log_requests=True,
         )
-        if max_model_len is not None:
-            llm_kwargs["max_model_len"] = max_model_len
-
-        self.llm = LLM(**llm_kwargs)
+        self.engine = AsyncLLMEngine.from_engine_args(engine_args)
         self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        log.info("  Engine ready.")
+        self._request_counter = 0
+        # Persistent event loop — reused for every run_turn() call so the
+        # AsyncLLMEngine's internal tasks stay alive between requests.
+        self._loop = asyncio.new_event_loop()
+        log.info("  Async engine ready.")
 
     @property
     def tokenizer(self):
@@ -219,45 +229,63 @@ class VLLMRunner:
         return len(self._tokenizer.encode(text, add_special_tokens=True))
 
     def run_turn(self, prompt: str) -> dict:
+        """Sync wrapper — runs the async coroutine on the persistent event loop."""
+        return self._loop.run_until_complete(self._run_turn_async(prompt))
+
+    async def _run_turn_async(self, prompt: str) -> dict:
         """
-        Run one turn. Returns a dict with ttft_ms, total_ms,
-        output_text, prompt_tokens, cached_tokens, cache_hit_ratio.
+        Stream tokens from AsyncLLMEngine.
+        TTFT = wall time from generate() call to the first non-empty output chunk.
+        total_ms = wall time to the final chunk (prefill + full decode).
         """
-        params = self.SamplingParams(
-            max_tokens=self.max_new_tokens,
-            temperature=0.0,
-        )
+        from vllm import SamplingParams
 
-        t0 = time.perf_counter()
-        outputs = self.llm.generate([prompt], params, use_tqdm=False)
-        t1 = time.perf_counter()
+        self._request_counter += 1
+        request_id = f"req-{self._request_counter}"
 
-        out = outputs[0]
-        total_ms = (t1 - t0) * 1000
+        params = SamplingParams(max_tokens=self.max_new_tokens, temperature=0.0)
 
-        # vLLM RequestMetrics: first_token_time and first_scheduled_time
-        metrics = out.metrics
-        if metrics is not None and metrics.first_token_time is not None:
-            ttft_ms = (metrics.first_token_time - metrics.first_scheduled_time) * 1000
-        else:
-            # Fallback: approximate TTFT as total time (single-token latency)
+        t_submit = time.perf_counter()
+        ttft_ms: Optional[float] = None
+        output_text = ""
+        final_output = None
+
+        async for output in self.engine.generate(prompt, params, request_id=request_id):
+            if ttft_ms is None and output.outputs and output.outputs[0].text:
+                ttft_ms = (time.perf_counter() - t_submit) * 1000
+            final_output = output
+
+        total_ms = (time.perf_counter() - t_submit) * 1000
+
+        # If the model returned no text at all, TTFT = total_ms (pathological)
+        if ttft_ms is None:
             ttft_ms = total_ms
 
-        prompt_tokens = len(out.prompt_token_ids) if out.prompt_token_ids else self.count_tokens(prompt)
+        if final_output is not None and final_output.outputs:
+            output_text = final_output.outputs[0].text
 
-        # Number of tokens served from the prefix cache
+        # Prompt token count
+        if final_output is not None and final_output.prompt_token_ids:
+            prompt_tokens = len(final_output.prompt_token_ids)
+        else:
+            prompt_tokens = self.count_tokens(prompt)
+
+        # Cached tokens — available on RequestMetrics in vLLM v0.4+
         cached_tokens = 0
-        if hasattr(out, "num_cached_tokens") and out.num_cached_tokens is not None:
-            cached_tokens = out.num_cached_tokens
-        elif metrics is not None and hasattr(metrics, "num_cached_tokens"):
-            cached_tokens = metrics.num_cached_tokens or 0
+        if final_output is not None and final_output.metrics is not None:
+            m = final_output.metrics
+            for attr in ("num_cached_tokens", "num_prefix_cache_tokens", "cache_hit_tokens"):
+                val = getattr(m, attr, None)
+                if val is not None:
+                    cached_tokens = int(val)
+                    break
 
         cache_hit_ratio = cached_tokens / max(prompt_tokens, 1)
 
         return {
             "ttft_ms": ttft_ms,
             "total_ms": total_ms,
-            "output_text": out.outputs[0].text if out.outputs else "",
+            "output_text": output_text,
             "prompt_tokens": prompt_tokens,
             "cached_tokens": cached_tokens,
             "cache_hit_ratio": cache_hit_ratio,
@@ -779,6 +807,8 @@ def main():
     if ck_path.exists():
         ck_path.unlink()
         log.info("Checkpoint cleaned up")
+
+    runner._loop.close()
 
 
 if __name__ == "__main__":
