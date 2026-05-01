@@ -211,9 +211,11 @@ class VLLMRunner:
             enable_prefix_caching=enable_prefix_caching,
             trust_remote_code=True,
             max_model_len=max_model_len,
-            disable_log_requests=True,
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+        # Silence vLLM's per-request INFO lines
+        logging.getLogger("vllm.engine.async_llm_engine").setLevel(logging.WARNING)
+        logging.getLogger("vllm.core.scheduler").setLevel(logging.WARNING)
         self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self._request_counter = 0
         # Persistent event loop — reused for every run_turn() call so the
