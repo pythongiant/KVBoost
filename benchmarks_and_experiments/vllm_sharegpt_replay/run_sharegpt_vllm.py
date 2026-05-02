@@ -184,6 +184,8 @@ class VLLMRunner:
     arriving in the async generator.
     """
 
+    # vLLM v1 RequestMetrics has no cached-token field; these are tried in case
+    # a future/different version adds one.
     _CACHED_TOKEN_ATTRS = (
         "num_cached_tokens",
         "num_prefix_cache_tokens",
@@ -257,19 +259,27 @@ class VLLMRunner:
         params = self.SamplingParams(max_tokens=self.max_new_tokens, temperature=0.0)
 
         t0 = time.perf_counter()
-        ttft_ms: Optional[float] = None
+        wall_ttft_ms: Optional[float] = None
         final_output = None
         first_chunk_seen = False
 
         async for output in self.engine.generate(prompt, params, request_id=request_id):
             if not first_chunk_seen:
-                ttft_ms = (time.perf_counter() - t0) * 1000
+                wall_ttft_ms = (time.perf_counter() - t0) * 1000
                 first_chunk_seen = True
             final_output = output
 
         total_ms = (time.perf_counter() - t0) * 1000
-        if ttft_ms is None:
-            ttft_ms = total_ms
+
+        # Prefer RequestMetrics.first_token_latency (engine-side measurement,
+        # excludes Python/asyncio overhead) over our wall-clock stamp.
+        ttft_ms = wall_ttft_ms or total_ms
+        if final_output is not None:
+            m = getattr(final_output, "metrics", None)
+            if m is not None:
+                ftl = getattr(m, "first_token_latency", None)
+                if ftl is not None and ftl > 0:
+                    ttft_ms = ftl * 1000  # seconds → ms
 
         output_text = self._get_output_text(final_output)
         prompt_tokens = self._get_prompt_tokens(final_output, prompt)
@@ -326,18 +336,7 @@ class VLLMRunner:
 
         metrics = getattr(final_output, "metrics", None)
         if metrics is None:
-            if self._request_counter == 1:
-                log.warning("RequestMetrics is None on first request — cached_tokens will be 0")
             return 0
-
-        # Dump all fields on the very first request so we can see what's available
-        if self._request_counter == 1:
-            all_attrs = {
-                a: getattr(metrics, a, None)
-                for a in dir(metrics)
-                if not a.startswith("_")
-            }
-            log.info("RequestMetrics fields on first request: %s", all_attrs)
 
         if self._cached_tokens_attr:
             return int(getattr(metrics, self._cached_tokens_attr, 0) or 0)
@@ -349,6 +348,8 @@ class VLLMRunner:
                 log.info("Discovered cached-token field at runtime: %s", attr)
                 return int(value)
 
+        # vLLM v1 RequestMetrics does not expose a cached-token count.
+        # Cache effectiveness is visible in the flat TTFT curve instead.
         return 0
 
     def close(self) -> None:
