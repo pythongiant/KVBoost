@@ -36,6 +36,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
+import dataclasses
 
 import numpy as np
 
@@ -175,12 +176,20 @@ def load_sharegpt(
 
 # ── vLLM runner ───────────────────────────────────────────────────
 
+
 class VLLMRunner:
     """
     Uses AsyncLLMEngine + token streaming to measure true TTFT:
     wall-clock time from request submission to the first token chunk
-    arriving in the async generator, before decode begins.
+    arriving in the async generator.
     """
+
+    _CACHED_TOKEN_ATTRS = (
+        "num_cached_tokens",
+        "num_prefix_cache_tokens",
+        "cache_hit_tokens",
+        "num_computed_tokens",
+    )
 
     def __init__(
         self,
@@ -190,18 +199,20 @@ class VLLMRunner:
         max_model_len: Optional[int] = None,
         tensor_parallel_size: int = 1,
         enable_prefix_caching: bool = True,
-    ):
-        from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
+    ) -> None:
+        from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
         from transformers import AutoTokenizer
 
-        self.SamplingParams = SamplingParams
+        self.model_name = model_name
         self.max_new_tokens = max_new_tokens
         self.enable_prefix_caching = enable_prefix_caching
+        self.SamplingParams = SamplingParams
 
         log.info(
-            f"Loading model: {model_name} "
-            f"(prefix_caching={enable_prefix_caching}, "
-            f"gpu_mem_util={gpu_memory_utilization}, async=True)"
+            "Loading model=%s prefix_caching=%s gpu_mem_util=%.2f async=True",
+            model_name,
+            enable_prefix_caching,
+            gpu_memory_utilization,
         )
 
         engine_args = AsyncEngineArgs(
@@ -213,51 +224,21 @@ class VLLMRunner:
             max_model_len=max_model_len,
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
-        # Silence vLLM's per-request INFO lines
+
         logging.getLogger("vllm.engine.async_llm_engine").setLevel(logging.WARNING)
         logging.getLogger("vllm.core.scheduler").setLevel(logging.WARNING)
-        self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=True
+        )
+
         self._request_counter = 0
-        # Persistent event loop — reused for every run_turn() call so the
-        # AsyncLLMEngine's internal tasks stay alive between requests.
         self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
 
-        # Discover the correct cached-token field name for this vLLM version.
-        # We probe RequestMetrics at import time so we fail fast and loudly.
-        self._cached_tokens_attr: Optional[str] = None
-        try:
-            from vllm.engine.metrics_types import RequestMetrics as _RM
-        except ImportError:
-            try:
-                from vllm.outputs import RequestOutput as _RO
-                # Fall back: inspect a dummy metrics object later
-                _RM = None
-            except ImportError:
-                _RM = None
+        self._cached_tokens_attr = self._discover_cached_token_attr()
 
-        if _RM is not None:
-            for attr in ("num_cached_tokens", "num_prefix_cache_tokens",
-                         "cache_hit_tokens", "num_computed_tokens"):
-                if hasattr(_RM, attr) or (
-                    hasattr(_RM, "__dataclass_fields__") and
-                    attr in _RM.__dataclass_fields__
-                ):
-                    self._cached_tokens_attr = attr
-                    log.info(f"  Cached-token field: RequestMetrics.{attr}")
-                    break
-            if self._cached_tokens_attr is None:
-                import dataclasses
-                try:
-                    all_fields = [f.name for f in dataclasses.fields(_RM)]
-                    log.warning(
-                        f"  No known cached-token field found on RequestMetrics. "
-                        f"Available fields: {all_fields}. "
-                        f"cache_hit_ratio will be 0 — update _CACHED_TOKEN_ATTRS."
-                    )
-                except Exception:
-                    pass
-
-        log.info("  Async engine ready.")
+        log.info("Async engine ready.")
 
     @property
     def tokenizer(self):
@@ -267,72 +248,32 @@ class VLLMRunner:
         return len(self._tokenizer.encode(text, add_special_tokens=True))
 
     def run_turn(self, prompt: str) -> dict:
-        """Sync wrapper — runs the async coroutine on the persistent event loop."""
         return self._loop.run_until_complete(self._run_turn_async(prompt))
 
     async def _run_turn_async(self, prompt: str) -> dict:
-        """
-        Stream tokens from AsyncLLMEngine.
-        TTFT = wall time from generate() call to the first non-empty output chunk.
-        total_ms = wall time to the final chunk (prefill + full decode).
-        """
-        from vllm import SamplingParams
-
         self._request_counter += 1
         request_id = f"req-{self._request_counter}"
 
-        params = SamplingParams(max_tokens=self.max_new_tokens, temperature=0.0)
+        params = self.SamplingParams(max_tokens=self.max_new_tokens, temperature=0.0)
 
-        t_submit = time.perf_counter()
+        t0 = time.perf_counter()
         ttft_ms: Optional[float] = None
-        output_text = ""
         final_output = None
+        first_chunk_seen = False
 
         async for output in self.engine.generate(prompt, params, request_id=request_id):
-            if ttft_ms is None and output.outputs and output.outputs[0].text:
-                ttft_ms = (time.perf_counter() - t_submit) * 1000
+            if not first_chunk_seen:
+                ttft_ms = (time.perf_counter() - t0) * 1000
+                first_chunk_seen = True
             final_output = output
 
-        total_ms = (time.perf_counter() - t_submit) * 1000
-
-        # If the model returned no text at all, TTFT = total_ms (pathological)
+        total_ms = (time.perf_counter() - t0) * 1000
         if ttft_ms is None:
             ttft_ms = total_ms
 
-        if final_output is not None and final_output.outputs:
-            output_text = final_output.outputs[0].text
-
-        # Prompt token count
-        if final_output is not None and final_output.prompt_token_ids:
-            prompt_tokens = len(final_output.prompt_token_ids)
-        else:
-            prompt_tokens = self.count_tokens(prompt)
-
-        # Cached tokens — field name varies by vLLM version
-        cached_tokens = 0
-        if final_output is not None and final_output.metrics is not None:
-            m = final_output.metrics
-            if self._cached_tokens_attr is not None:
-                cached_tokens = int(getattr(m, self._cached_tokens_attr, 0) or 0)
-            else:
-                # Runtime fallback: try all known names, log what's available once
-                for attr in ("num_cached_tokens", "num_prefix_cache_tokens",
-                             "cache_hit_tokens", "num_computed_tokens"):
-                    val = getattr(m, attr, None)
-                    if val is not None:
-                        cached_tokens = int(val)
-                        self._cached_tokens_attr = attr
-                        log.info(f"  Discovered cached-token field at runtime: {attr}")
-                        break
-                else:
-                    if self._request_counter == 1:
-                        log.warning(
-                            f"  cache_hit_ratio will be 0 — RequestMetrics has no "
-                            f"known cached-token field. Fields present: "
-                            f"{[a for a in dir(m) if not a.startswith('_')]}"
-                        )
-
-        cache_hit_ratio = cached_tokens / max(prompt_tokens, 1)
+        output_text = self._get_output_text(final_output)
+        prompt_tokens = self._get_prompt_tokens(final_output, prompt)
+        cached_tokens = self._get_cached_tokens(final_output)
 
         return {
             "ttft_ms": ttft_ms,
@@ -340,9 +281,74 @@ class VLLMRunner:
             "output_text": output_text,
             "prompt_tokens": prompt_tokens,
             "cached_tokens": cached_tokens,
-            "cache_hit_ratio": cache_hit_ratio,
+            "cache_hit_ratio": cached_tokens / max(prompt_tokens, 1),
         }
 
+    def _discover_cached_token_attr(self) -> Optional[str]:
+        try:
+            from vllm.engine.metrics_types import RequestMetrics as RM
+        except ImportError:
+            return None
+
+        fields = set()
+        if hasattr(RM, "__dataclass_fields__"):
+            fields.update(RM.__dataclass_fields__.keys())
+
+        try:
+            fields.update(f.name for f in dataclasses.fields(RM))
+        except Exception:
+            pass
+
+        for attr in self._CACHED_TOKEN_ATTRS:
+            if attr in fields or hasattr(RM, attr):
+                log.info("Cached-token field: RequestMetrics.%s", attr)
+                return attr
+
+        log.warning(
+            "No cached-token field found on RequestMetrics. Fields: %s",
+            sorted(fields) if fields else "unknown",
+        )
+        return None
+
+    def _get_output_text(self, final_output) -> str:
+        if final_output and getattr(final_output, "outputs", None):
+            return final_output.outputs[0].text or ""
+        return ""
+
+    def _get_prompt_tokens(self, final_output, prompt: str) -> int:
+        if final_output and getattr(final_output, "prompt_token_ids", None):
+            return len(final_output.prompt_token_ids)
+        return self.count_tokens(prompt)
+
+    def _get_cached_tokens(self, final_output) -> int:
+        if not final_output:
+            return 0
+
+        metrics = getattr(final_output, "metrics", None)
+        if metrics is None:
+            return 0
+
+        if self._cached_tokens_attr:
+            return int(getattr(metrics, self._cached_tokens_attr, 0) or 0)
+
+        for attr in self._CACHED_TOKEN_ATTRS:
+            value = getattr(metrics, attr, None)
+            if value is not None:
+                self._cached_tokens_attr = attr
+                log.info("Discovered cached-token field at runtime: %s", attr)
+                return int(value)
+
+        return 0
+
+    def close(self) -> None:
+        if not self._loop.is_closed():
+            self._loop.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
 
 # ── Checkpoint helpers ────────────────────────────────────────────
 
