@@ -326,7 +326,18 @@ class VLLMRunner:
 
         metrics = getattr(final_output, "metrics", None)
         if metrics is None:
+            if self._request_counter == 1:
+                log.warning("RequestMetrics is None on first request — cached_tokens will be 0")
             return 0
+
+        # Dump all fields on the very first request so we can see what's available
+        if self._request_counter == 1:
+            all_attrs = {
+                a: getattr(metrics, a, None)
+                for a in dir(metrics)
+                if not a.startswith("_")
+            }
+            log.info("RequestMetrics fields on first request: %s", all_attrs)
 
         if self._cached_tokens_attr:
             return int(getattr(metrics, self._cached_tokens_attr, 0) or 0)
