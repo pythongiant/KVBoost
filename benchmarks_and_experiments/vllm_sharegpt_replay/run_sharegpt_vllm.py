@@ -221,6 +221,42 @@ class VLLMRunner:
         # Persistent event loop — reused for every run_turn() call so the
         # AsyncLLMEngine's internal tasks stay alive between requests.
         self._loop = asyncio.new_event_loop()
+
+        # Discover the correct cached-token field name for this vLLM version.
+        # We probe RequestMetrics at import time so we fail fast and loudly.
+        self._cached_tokens_attr: Optional[str] = None
+        try:
+            from vllm.engine.metrics_types import RequestMetrics as _RM
+        except ImportError:
+            try:
+                from vllm.outputs import RequestOutput as _RO
+                # Fall back: inspect a dummy metrics object later
+                _RM = None
+            except ImportError:
+                _RM = None
+
+        if _RM is not None:
+            for attr in ("num_cached_tokens", "num_prefix_cache_tokens",
+                         "cache_hit_tokens", "num_computed_tokens"):
+                if hasattr(_RM, attr) or (
+                    hasattr(_RM, "__dataclass_fields__") and
+                    attr in _RM.__dataclass_fields__
+                ):
+                    self._cached_tokens_attr = attr
+                    log.info(f"  Cached-token field: RequestMetrics.{attr}")
+                    break
+            if self._cached_tokens_attr is None:
+                import dataclasses
+                try:
+                    all_fields = [f.name for f in dataclasses.fields(_RM)]
+                    log.warning(
+                        f"  No known cached-token field found on RequestMetrics. "
+                        f"Available fields: {all_fields}. "
+                        f"cache_hit_ratio will be 0 — update _CACHED_TOKEN_ATTRS."
+                    )
+                except Exception:
+                    pass
+
         log.info("  Async engine ready.")
 
     @property
@@ -272,15 +308,29 @@ class VLLMRunner:
         else:
             prompt_tokens = self.count_tokens(prompt)
 
-        # Cached tokens — available on RequestMetrics in vLLM v0.4+
+        # Cached tokens — field name varies by vLLM version
         cached_tokens = 0
         if final_output is not None and final_output.metrics is not None:
             m = final_output.metrics
-            for attr in ("num_cached_tokens", "num_prefix_cache_tokens", "cache_hit_tokens"):
-                val = getattr(m, attr, None)
-                if val is not None:
-                    cached_tokens = int(val)
-                    break
+            if self._cached_tokens_attr is not None:
+                cached_tokens = int(getattr(m, self._cached_tokens_attr, 0) or 0)
+            else:
+                # Runtime fallback: try all known names, log what's available once
+                for attr in ("num_cached_tokens", "num_prefix_cache_tokens",
+                             "cache_hit_tokens", "num_computed_tokens"):
+                    val = getattr(m, attr, None)
+                    if val is not None:
+                        cached_tokens = int(val)
+                        self._cached_tokens_attr = attr
+                        log.info(f"  Discovered cached-token field at runtime: {attr}")
+                        break
+                else:
+                    if self._request_counter == 1:
+                        log.warning(
+                            f"  cache_hit_ratio will be 0 — RequestMetrics has no "
+                            f"known cached-token field. Fields present: "
+                            f"{[a for a in dir(m) if not a.startswith('_')]}"
+                        )
 
         cache_hit_ratio = cached_tokens / max(prompt_tokens, 1)
 
