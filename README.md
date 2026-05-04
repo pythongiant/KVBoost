@@ -298,6 +298,106 @@ Each backend ran in an isolated process for a clean GPU state. Accuracy measured
 
 KVBoost config: `cacheblend` strategy, 1.5 GB cache, recency window 8, boundary window 16, overlap-k 16, sink tokens 32.
 
+
+---
+
+## ShareGPT Multi-Turn Replay — KVBoost vs vLLM Prefix Cache
+
+**Methodology**: 500 real ShareGPT conversations replayed turn-by-turn on
+`Qwen/Qwen2.5-3B` (RTX 4060 Laptop, 8 GB VRAM). History accumulates naturally
+across turns — exactly as a real user session would. Both backends generate up
+to 128 new tokens per turn.
+
+- **KVBoost**: `cacheblend` recompute strategy, chunk=128, boundary_window=16, overlap_k=16, sink_tokens=32
+- **vLLM**: prefix caching enabled (`enable_prefix_caching=True`), `max_model_len=8192`, `gpu_memory_utilization=0.90`
+
+> **Note on vLLM TTFT**: vLLM's `RequestMetrics.first_token_time` is `None` in
+> offline/sync mode, so the reported TTFT falls back to total generation time
+> (prefill + decode). These numbers are **not** comparable to KVBoost's true
+> TTFT and are included here for cache-hit-ratio completeness only. A proper
+> vLLM TTFT comparison requires the async `AsyncLLMEngine` with streaming.
+
+### Overall Summary
+
+| Metric | KVBoost | vLLM (prefix cache) |
+|---|---|---|
+| Conversations | 500 | 500 |
+| Total turns | 2 485 | 2 521 |
+| TTFT p50 (ms) | **20.1** | 3 328 †|
+| TTFT p90 (ms) | **23.6** | 3 350 †|
+| TTFT p99 (ms) | **29.3** | 3 409 †|
+| Avg cache hit ratio | **86.1%** | 70.6% |
+| Throughput (rps) | 0.278 | **0.319** |
+
+† vLLM TTFT = total generation time (first_token_time unavailable in sync mode).
+
+### TTFT vs Turn Number (KVBoost only — true TTFT)
+
+| Turn | N | Avg ctx tokens | Baseline TTFT | KVBoost TTFT | Speedup | KV reuse |
+|---|---|---|---|---|---|---|
+| 1 | 500 |  54 | 18.8 ms | 17.4 ms | 1.08× | 35.7% |
+| 2 | 500 | 206 | 23.1 ms | 19.9 ms | 1.16× | 96.9% |
+| 3 | 500 | 371 | 35.2 ms | 20.6 ms | 1.71× | 99.2% |
+| 4 | 383 | 532 | 48.9 ms | 21.3 ms | 2.29× | 99.4% |
+| 5 | 265 | 690 | 63.7 ms | 22.5 ms | 2.83× | 99.6% |
+| 6 | 172 | 826 | 82.4 ms | 23.6 ms | 3.49× | 99.6% |
+| 7 | 106 | 964 | 102.8 ms | 24.6 ms | 4.18× | 99.6% |
+| 8 |  59 | 1114 | 121.6 ms | 26.5 ms | **4.59×** | 99.6% |
+
+KVBoost TTFT stays essentially flat (~17–27 ms) as context grows. Baseline
+TTFT scales linearly with history length.
+
+### Cache Hit Rate vs Turn Number
+
+| Turn | KVBoost KV reuse | vLLM prefix cache hit |
+|---|---|---|
+| 1 (cold) | 35.7% | 0.0% |
+| 2 | 96.9% | 76.3% |
+| 3 | 99.2% | 88.3% |
+| 4 | 99.4% | 91.9% |
+| 5 | 99.6% | 93.7% |
+| 6 | 99.6% | 95.2% |
+| 7 | 99.6% | 95.5% |
+| 8 | 99.6% | 95.9% |
+
+KVBoost achieves higher cache reuse from turn 2 onward because it operates at
+chunk granularity with a boundary-alignment window, recovering cache hits even
+when the prefix is not byte-identical. vLLM prefix caching requires an exact
+token-level prefix match, so new assistant tokens from the previous turn reduce
+the matchable prefix length.
+
+### Key Takeaways
+
+1. **TTFT scaling**: KVBoost TTFT grows only 9 ms from turn 1 to turn 8
+   (+52%) while the baseline grows 103 ms (+547%). At turn 8, KVBoost is
+   **4.6× faster** than its own no-cache baseline.
+
+2. **Cache hit rate**: KVBoost stabilises at ≥99% reuse after turn 2; vLLM
+   prefix cache reaches ~96% at turn 8, starting lower because exact-prefix
+   matching misses tokens changed by generation.
+
+3. **Throughput parity**: Both backends achieve similar throughput (~0.28–0.32
+   rps) on this single-GPU setup — the difference is dominated by generation
+   decode time, not TTFT.
+
+4. **vLLM TTFT caveat**: The vLLM numbers require async streaming to measure
+   true TTFT. The current sync fallback measures total latency, making direct
+   TTFT comparison misleading.
+
+### Plots
+
+| KVBoost | vLLM |
+|---|---|
+| `sharegpt_replay/results/sharegpt_ttft_vs_turn.png` | `vllm_sharegpt_replay/results/vllm_sharegpt_ttft_vs_turn.png` |
+
+To regenerate plots from saved JSON:
+```bash
+python sharegpt_replay/plot_results.py
+python vllm_sharegpt_replay/plot_results.py
+```
+
+---
+
 ### Latency — Time to First Token
 
 ![COLD vs WARM TTFT](docs/figures/cold_warm_ttft.png)

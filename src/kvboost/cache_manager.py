@@ -19,7 +19,10 @@ Eviction policy: hard byte budget with recency window + importance-based evictio
 
   - max_cache_bytes is required and enforced on every store().
   - The most-recently-stored `recency_window_chunks` are pinned (never evicted).
-  - When budget is exceeded, chunks outside the window are evicted lowest
+  - Chunks whose content_hash appears in `pinned_content_hashes` are also pinned
+    unconditionally, regardless of recency. Use pin_content() for system prompts
+    or other chunks that must survive across long conversations.
+  - When budget is exceeded, chunks outside both pin sets are evicted lowest
     importance first (ties → LRU). Pruned = evicted: a dropped chunk is
     gone entirely and becomes a cache miss on next lookup (recomputed on demand).
 """
@@ -100,6 +103,10 @@ class KVCacheManager:
                 max_chunks=max_chunks * 2,  # cold tier can hold more than hot
             )
 
+        # Content hashes that are permanently pinned (never evicted).
+        # Use pin_content() / unpin_content() to manage. Typical use: system prompts.
+        self._pinned_content_hashes: set = set()
+
         # Eviction callbacks: called with chunk_id when a chunk is evicted
         self._eviction_callbacks: list = []
 
@@ -117,6 +124,19 @@ class KVCacheManager:
     def register_eviction_callback(self, callback) -> None:
         """Register a callable(chunk_id: str) invoked whenever a chunk is evicted."""
         self._eviction_callbacks.append(callback)
+
+    def pin_content(self, content_hash: str) -> None:
+        """Permanently pin all chunks with this content_hash against eviction.
+
+        Pinned chunks are excluded from eviction candidates regardless of their
+        recency, importance, or frequency. Intended for system prompts or other
+        content that must survive across arbitrarily long conversations.
+        """
+        self._pinned_content_hashes.add(content_hash)
+
+    def unpin_content(self, content_hash: str) -> None:
+        """Remove a content_hash from the permanent pin set."""
+        self._pinned_content_hashes.discard(content_hash)
 
     def store(self, chunk: CachedChunk) -> None:
         """
@@ -476,15 +496,22 @@ class KVCacheManager:
 
     def _pinned_keys(self) -> set:
         """
-        The most-recently-stored `recency_window_chunks` keys. These are
-        NEVER evicted: they represent the model's hard sliding window of
-        "guaranteed to survive" context. Returned as a set for O(1) lookup.
+        Keys that are NEVER evicted. Two sources:
+          1. The most-recently-stored `recency_window_chunks` keys (sliding window).
+          2. Any chunk whose content_hash is in `_pinned_content_hashes`.
         """
-        if self.recency_window_chunks <= 0 or not self._hot:
-            return set()
-        # _hot is an OrderedDict in insertion order; last N keys = window.
-        all_keys = list(self._hot.keys())
-        return set(all_keys[-self.recency_window_chunks:])
+        pinned: set = set()
+
+        if self.recency_window_chunks > 0 and self._hot:
+            all_keys = list(self._hot.keys())
+            pinned.update(all_keys[-self.recency_window_chunks:])
+
+        if self._pinned_content_hashes:
+            for key, chunk in self._hot.items():
+                if chunk.content_hash in self._pinned_content_hashes:
+                    pinned.add(key)
+
+        return pinned
 
     def _evict_until_fits(self, incoming_bytes: int) -> None:
         """

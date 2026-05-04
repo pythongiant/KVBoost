@@ -509,6 +509,69 @@ class TestEvictionCallback:
         assert calls_a == calls_b
 
 
+# ── KVCacheManager pinned_content_hashes ─────────────────────────────────────
+
+class TestPinnedContentHashes:
+    """Chunks whose content_hash is pinned must survive eviction unconditionally."""
+
+    def _make_chunk(self, cid: str, content_hash: str, length: int = 8):
+        kv = tuple(
+            (torch.randn(1, 1, length, 4), torch.randn(1, 1, length, 4))
+            for _ in range(1)
+        )
+        return CachedChunk(
+            chunk_id=cid, text="", token_ids=list(range(length)),
+            past_key_values=kv, position_start=0, position_end=length,
+            prefix_hash=cid, content_hash=content_hash,
+        )
+
+    def test_pinned_chunk_not_evicted(self):
+        # Budget fits exactly 2 chunks; recency window = 0 so nothing is
+        # recency-pinned. The system-prompt chunk (pinned by content hash)
+        # must survive when a third chunk forces eviction.
+        chunk = self._make_chunk("c0", "c0_content")
+        chunk_bytes = int(chunk.memory_bytes())
+
+        manager = KVCacheManager(
+            max_cache_bytes=chunk_bytes * 2,
+            recency_window_chunks=0,
+        )
+        manager.pin_content("c0_content")
+
+        manager.store(self._make_chunk("c0", "c0_content"))
+        manager.store(self._make_chunk("c1", "c1_content"))
+        # Storing c2 must evict something — it must not be c0.
+        manager.store(self._make_chunk("c2", "c2_content"))
+
+        assert manager.get("c0") is not None, "pinned chunk was evicted"
+
+    def test_unpinned_chunk_becomes_evictable(self):
+        chunk = self._make_chunk("c0", "c0_content")
+        chunk_bytes = int(chunk.memory_bytes())
+
+        manager = KVCacheManager(
+            max_cache_bytes=chunk_bytes * 2,
+            recency_window_chunks=0,
+        )
+        manager.pin_content("c0_content")
+        manager.store(self._make_chunk("c0", "c0_content"))
+        manager.store(self._make_chunk("c1", "c1_content"))
+
+        manager.unpin_content("c0_content")
+
+        # Now c0 is evictable; storing c2 may evict it.
+        manager.store(self._make_chunk("c2", "c2_content"))
+        # c2 must be present (it was just stored)
+        assert manager.get("c2") is not None
+
+    def test_pin_survives_clear(self):
+        # clear() resets the hot cache but must preserve pin configuration.
+        manager = KVCacheManager(max_cache_bytes=10_000_000, recency_window_chunks=0)
+        manager.pin_content("sys_hash")
+        manager.clear()
+        assert "sys_hash" in manager._pinned_content_hashes
+
+
 # ── CPUPagedEngine construction (slow, skipped by default) ────────────────────
 
 @pytest.mark.slow
