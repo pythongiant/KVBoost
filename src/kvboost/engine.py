@@ -29,7 +29,7 @@ import enum
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -212,23 +212,35 @@ class InferenceEngine:
         temperature: float = 1.0,
         do_sample: bool = False,
         cacheable_prefix_len: Optional[int] = None,
+        on_token: Optional[Callable[[int], None]] = None,
     ) -> GenerationResult:
         """
         cacheable_prefix_len: if set, only the first N prompt tokens are
         eligible for chunk caching on store. The suffix still goes through
         fresh prefill each call, so per-query tails (question/choices)
         cannot leak KV state into future queries that share the prefix.
+
+        on_token: if set, called from the worker thread with each freshly
+        sampled token id as decoding progresses. Used by the server's
+        streaming path to emit SSE chunks token-by-token.
         """
         token_ids = self._encode(prompt)
 
         if mode == GenerationMode.BASELINE:
-            return self._generate_baseline(prompt, token_ids, max_new_tokens, temperature, do_sample)
+            return self._generate_baseline(
+                prompt, token_ids, max_new_tokens, temperature, do_sample,
+                on_token=on_token,
+            )
         elif mode == GenerationMode.PREFIX_CACHE:
-            return self._generate_prefix_cache(prompt, token_ids, max_new_tokens, temperature, do_sample)
+            return self._generate_prefix_cache(
+                prompt, token_ids, max_new_tokens, temperature, do_sample,
+                on_token=on_token,
+            )
         elif mode == GenerationMode.CHUNK_KV_REUSE:
             return self._generate_chunk_reuse(
                 prompt, token_ids, max_new_tokens, temperature, do_sample,
                 cacheable_prefix_len=cacheable_prefix_len,
+                on_token=on_token,
             )
         raise ValueError(f"Unknown mode {mode}")
 
@@ -520,6 +532,7 @@ class InferenceEngine:
         max_new_tokens: int,
         temperature: float,
         do_sample: bool,
+        on_token: Optional[Callable[[int], None]] = None,
     ) -> GenerationResult:
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
         t0 = time.perf_counter()
@@ -546,6 +559,8 @@ class InferenceEngine:
                 past = self._normalize_past_kv(out.past_key_values)
                 next_token = self._sample(out.logits[:, -1, :], temperature, do_sample)
                 generated.append(next_token)
+                if on_token is not None:
+                    on_token(next_token)
                 if next_token == self.tokenizer.eos_token_id:
                     break
                 cur_ids = torch.tensor([[next_token]], dtype=torch.long, device=self.device)
@@ -577,6 +592,7 @@ class InferenceEngine:
         max_new_tokens: int,
         temperature: float,
         do_sample: bool,
+        on_token: Optional[Callable[[int], None]] = None,
     ) -> GenerationResult:
         """Standard prefix caching: reuse contiguous leading chunks."""
         splits = self._split_tokens(token_ids)
@@ -586,7 +602,8 @@ class InferenceEngine:
         live_ids = token_ids[covered:]
         return self._decode_with_kv(
             prompt, token_ids, merged_kv, covered, live_ids,
-            max_new_tokens, temperature, do_sample, mode_name="prefix_cache"
+            max_new_tokens, temperature, do_sample, mode_name="prefix_cache",
+            on_token=on_token,
         )
 
     def _generate_chunk_reuse(
@@ -597,6 +614,7 @@ class InferenceEngine:
         temperature: float,
         do_sample: bool,
         cacheable_prefix_len: Optional[int] = None,
+        on_token: Optional[Callable[[int], None]] = None,
     ) -> GenerationResult:
         """Full chunk-level KV reuse + recompute (strategy-dependent)."""
         splits = self._split_tokens(token_ids)
@@ -625,6 +643,7 @@ class InferenceEngine:
             mode_name="chunk_kv_reuse",
             hit_ratio=assembled.cache_hit_ratio,
             cacheable_prefix_len=cacheable_prefix_len,
+            on_token=on_token,
         )
 
     # ------------------------------------------------------------------
@@ -644,6 +663,7 @@ class InferenceEngine:
         mode_name: str,
         hit_ratio: Optional[float] = None,
         cacheable_prefix_len: Optional[int] = None,
+        on_token: Optional[Callable[[int], None]] = None,
     ) -> GenerationResult:
         t0 = time.perf_counter()
         first_token_time = None
@@ -678,6 +698,8 @@ class InferenceEngine:
             past_kv = self._normalize_past_kv(out.past_key_values)
             next_token = self._sample(out.logits[:, -1, :], temperature, do_sample)
             generated.append(next_token)
+            if on_token is not None:
+                on_token(next_token)
             if next_token == self.tokenizer.eos_token_id:
                 pass  # let loop handle
         else:
@@ -707,6 +729,8 @@ class InferenceEngine:
             past_kv = self._normalize_past_kv(out.past_key_values)
             next_token = self._sample(out.logits[:, -1, :], temperature, do_sample)
             generated.append(next_token)
+            if on_token is not None:
+                on_token(next_token)
 
         # ----- autoregressive decode ------------------------------------
         cur_pos = cached_len + len(live_ids)
@@ -725,6 +749,8 @@ class InferenceEngine:
             past_kv = self._normalize_past_kv(out.past_key_values)
             next_token = self._sample(out.logits[:, -1, :], temperature, do_sample)
             generated.append(next_token)
+            if on_token is not None:
+                on_token(next_token)
             cur_pos += 1
 
         t1 = time.perf_counter()

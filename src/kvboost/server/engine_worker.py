@@ -32,7 +32,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 
 from ..engine import InferenceEngine, GenerationResult
 from ..batch import group_by_prefix
@@ -112,7 +112,7 @@ class EngineWorker:
         do_sample: bool,
         stream: bool,
         model_name: str,
-        timeout_s: float = 120.0,
+        timeout_s: float = 600.0,
     ) -> GenerationResult:
         """
         Submit a single generation request.  Returns when the result is ready.
@@ -128,6 +128,52 @@ class EngineWorker:
             model_name=model_name,
         )
         return await asyncio.wait_for(fut, timeout=timeout_s)
+
+    async def stream_generate(
+        self,
+        request_id: str,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        do_sample: bool,
+        model_name: str,
+    ) -> AsyncIterator[Tuple[str, Any]]:
+        """
+        Token-by-token streaming. Bypasses the batch queue — streaming
+        requests run as singletons through the executor.
+
+        Yields ("token", token_id) per generated token, then exactly one
+        ("done", GenerationResult) on success, or ("error", Exception) on
+        failure. Consumers should stop iterating after the terminal event.
+        """
+        token_q: asyncio.Queue = asyncio.Queue()
+        loop = self.loop
+
+        def _on_token(tok: int) -> None:
+            # Called from the worker thread — hand off to the loop.
+            loop.call_soon_threadsafe(token_q.put_nowait, ("token", tok))
+
+        def _run() -> None:
+            try:
+                result = self.engine.generate(
+                    prompt=prompt,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                    on_token=_on_token,
+                )
+                loop.call_soon_threadsafe(token_q.put_nowait, ("done", result))
+            except Exception as exc:
+                log.exception("Streaming generation failed for %s", request_id)
+                loop.call_soon_threadsafe(token_q.put_nowait, ("error", exc))
+
+        loop.run_in_executor(self._executor, _run)
+
+        while True:
+            kind, payload = await token_q.get()
+            yield kind, payload
+            if kind in ("done", "error"):
+                return
 
     async def warm(self, text: str) -> None:
         """Warm the KV cache with a prefix string (runs in worker thread)."""

@@ -271,7 +271,11 @@ async def _stream_completions(
                 model_name=model_name,
             )
         except Exception as exc:
-            error_chunk = json.dumps({"error": str(exc)})
+            error_chunk = json.dumps({"error": {
+            "message": str(exc) or exc.__class__.__name__,
+            "type": "server_error",
+            "code": 500,
+        }})
             yield f"data: {error_chunk}\n\n"
             return
 
@@ -296,25 +300,18 @@ async def _stream_chat(
     worker: EngineWorker,
     model_name: str,
 ) -> AsyncGenerator[str, None]:
-    """SSE generator for /v1/chat/completions with stream=True."""
+    """SSE generator for /v1/chat/completions with stream=True.
+
+    Emits real token-by-token deltas. The engine invokes an on_token
+    callback per generated token; we incrementally detokenize by decoding
+    the running token list and emitting whatever new text appeared since
+    the previous decode. This handles BPE merges and multi-byte UTF-8
+    boundaries correctly without producing partial/garbled chars.
+    """
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    tokenizer = worker.engine.tokenizer
 
-    try:
-        result = await worker.generate(
-            request_id=request_id,
-            prompt=prompt,
-            max_tokens=req.max_tokens,
-            temperature=req.temperature,
-            do_sample=req.do_sample,
-            stream=True,
-            model_name=model_name,
-        )
-    except Exception as exc:
-        error_chunk = json.dumps({"error": str(exc)})
-        yield f"data: {error_chunk}\n\n"
-        return
-
-    # Role delta (first chunk)
+    # Role delta first — tells the client a response is starting.
     role_chunk = ChatCompletionChunk(
         id=request_id,
         model=model_name,
@@ -326,26 +323,67 @@ async def _stream_chat(
     )
     yield f"data: {role_chunk.model_dump_json()}\n\n"
 
-    # Content delta
-    content_chunk = ChatCompletionChunk(
-        id=request_id,
-        model=model_name,
-        choices=[{
-            "index": 0,
-            "delta": {"content": result.output_text},
-            "finish_reason": None,
-        }],
-    )
-    yield f"data: {content_chunk.model_dump_json()}\n\n"
+    all_tokens: list[int] = []
+    prev_text: str = ""
+    final_result = None
 
-    # Stop chunk
+    try:
+        async for kind, payload in worker.stream_generate(
+            request_id=request_id,
+            prompt=prompt,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            do_sample=req.do_sample,
+            model_name=model_name,
+        ):
+            if kind == "token":
+                all_tokens.append(payload)
+                cur_text = tokenizer.decode(all_tokens, skip_special_tokens=True)
+                delta = cur_text[len(prev_text):]
+                if not delta:
+                    # Multi-byte char not yet complete — wait for next token.
+                    continue
+                prev_text = cur_text
+                content_chunk = ChatCompletionChunk(
+                    id=request_id,
+                    model=model_name,
+                    choices=[{
+                        "index": 0,
+                        "delta": {"content": delta},
+                        "finish_reason": None,
+                    }],
+                )
+                yield f"data: {content_chunk.model_dump_json()}\n\n"
+            elif kind == "done":
+                final_result = payload
+            elif kind == "error":
+                error_chunk = json.dumps({"error": {
+                    "message": str(payload) or payload.__class__.__name__,
+                    "type": "server_error",
+                    "code": 500,
+                }})
+                yield f"data: {error_chunk}\n\n"
+                return
+    except Exception as exc:
+        error_chunk = json.dumps({"error": {
+            "message": str(exc) or exc.__class__.__name__,
+            "type": "server_error",
+            "code": 500,
+        }})
+        yield f"data: {error_chunk}\n\n"
+        return
+
+    finish_reason = "stop"
+    if final_result is not None and final_result.generated_tokens >= req.max_tokens:
+        finish_reason = "length"
+
     stop_chunk = ChatCompletionChunk(
         id=request_id,
         model=model_name,
         choices=[{
             "index": 0,
             "delta": {},
-            "finish_reason": "stop" if result.generated_tokens < req.max_tokens else "length",
+            "finish_reason": finish_reason,
         }],
     )
     yield f"data: {stop_chunk.model_dump_json()}\n\n"
