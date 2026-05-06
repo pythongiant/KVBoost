@@ -45,7 +45,6 @@ OpenAI client example
 from __future__ import annotations
 
 import argparse
-import asyncio
 import logging
 import sys
 
@@ -138,11 +137,15 @@ def load_engine(args):
         )
     else:
         from ..engine import InferenceEngine
-        device = args.device
+        from ..compat import default_device
+        device = args.device or default_device()
+        # Load directly onto the target device. Avoid device_map="auto" because
+        # accelerate may offload modules to CPU/disk, after which InferenceEngine's
+        # subsequent model.to(device) call fails ("can't move offloaded modules").
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
             torch_dtype=torch_dtype,
-            device_map=device or "auto",
+            device_map=device,
         )
         engine = InferenceEngine(
             model=model,
@@ -178,15 +181,13 @@ def main():
 
     engine = load_engine(args)
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     from .engine_worker import EngineWorker
     from .app import build_app
 
+    # Don't pre-create a loop here — uvicorn will create its own. EngineWorker
+    # captures the running loop in start() (the FastAPI startup hook).
     worker = EngineWorker(
         engine=engine,
-        loop=loop,
         max_workers=args.workers,
         batch_window_ms=args.batch_window_ms,
         max_batch_size=args.max_batch_size,
@@ -206,7 +207,6 @@ def main():
         app,
         host=args.host,
         port=args.port,
-        loop="none",  # use our own event loop
         log_level=args.log_level,
     )
 

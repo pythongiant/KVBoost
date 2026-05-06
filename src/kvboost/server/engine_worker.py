@@ -49,24 +49,27 @@ class EngineWorker:
     Parameters
     ----------
     engine      : a fully initialised InferenceEngine (or subclass)
-    loop        : the asyncio event loop FastAPI is running on
     max_workers : thread-pool size (default 1 — model is not thread-safe)
     batch_window_ms  : collection window for the BatchQueue
     max_batch_size   : max requests per batch dispatch
     max_queue_size   : queue capacity before 503
+
+    The event loop is captured automatically when ``start()`` is awaited,
+    so the worker binds to whichever loop FastAPI/uvicorn is actually
+    running on.
     """
 
     def __init__(
         self,
         engine: InferenceEngine,
-        loop: asyncio.AbstractEventLoop,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
         max_workers: int = 1,
         batch_window_ms: float = 20.0,
         max_batch_size: int = 8,
         max_queue_size: int = 256,
     ) -> None:
         self.engine = engine
-        self.loop = loop
+        self.loop = loop  # may be overridden in start() with the running loop
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="kvboost-worker",
@@ -86,6 +89,10 @@ class EngineWorker:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
+        # Bind to the actual running loop (uvicorn creates its own when
+        # started with loop="none"). Doing this lazily avoids cross-loop
+        # Future errors if a stale loop was passed at construction time.
+        self.loop = asyncio.get_running_loop()
         await self.queue.start()
         log.info("EngineWorker started (model=%s)", self._model_name)
 

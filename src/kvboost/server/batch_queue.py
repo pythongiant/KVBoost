@@ -190,7 +190,7 @@ class BatchQueue:
         while self._running:
             # Wait for at least one request
             try:
-                first = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                first = await asyncio.wait_for(self._queue.get(), timeout=10.0)
             except asyncio.TimeoutError:
                 continue
 
