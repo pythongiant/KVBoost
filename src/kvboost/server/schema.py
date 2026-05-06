@@ -99,10 +99,24 @@ class CompletionChunk(BaseModel):
 
 # ── /v1/chat/completions ──────────────────────────────────────────────────────
 
+class ContentPart(BaseModel):
+    type: str
+    text: Optional[str] = None
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: str
+    content: Union[str, List[ContentPart]]
     name: Optional[str] = None
+
+    @field_validator("content")
+    @classmethod
+    def flatten_content(cls, v):
+        # Accept OpenAI's multimodal parts format and flatten text parts.
+        # Non-text parts (images, etc.) are dropped — this server is text-only.
+        if isinstance(v, list):
+            return "".join(p.text for p in v if p.type == "text" and p.text)
+        return v
 
 
 class ChatCompletionRequest(BaseModel):
