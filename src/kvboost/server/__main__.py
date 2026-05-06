@@ -63,6 +63,10 @@ def parse_args():
 
     # Model
     p.add_argument("--model", required=True, help="HuggingFace model name or local path")
+    p.add_argument("--gguf-file", default=None,
+                   help="GGUF filename inside --model repo (e.g. 'Qwen3-8B-Q4_K_M.gguf'). "
+                        "When set, transformers loads weights+tokenizer from the GGUF blob "
+                        "(dequantized to --dtype in memory).")
     p.add_argument("--model-name", default=None, help="Override model id shown in /v1/models")
     p.add_argument("--device", default=None, help="Device: cuda | mps | cpu (auto-detected if omitted)")
     p.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"],
@@ -120,9 +124,14 @@ def load_engine(args):
     torch_dtype = dtype_map[args.dtype]
 
     log.info("Loading model %s ...", args.model)
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if args.gguf_file:
+        log.info("Using GGUF file: %s", args.gguf_file)
+    gguf_kwargs = {"gguf_file": args.gguf_file} if args.gguf_file else {}
+    tokenizer = AutoTokenizer.from_pretrained(args.model, **gguf_kwargs)
 
     if args.backend == "cpu-paged":
+        if args.gguf_file:
+            raise SystemExit("--gguf-file is not supported with --backend cpu-paged.")
         from ..cpu_paged import CPUPagedEngine
         engine = CPUPagedEngine.from_pretrained(
             args.model,
@@ -146,6 +155,7 @@ def load_engine(args):
             args.model,
             torch_dtype=torch_dtype,
             device_map=device,
+            **gguf_kwargs,
         )
         engine = InferenceEngine(
             model=model,
