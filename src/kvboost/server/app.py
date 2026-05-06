@@ -54,6 +54,15 @@ from .schema import (
 from .engine_worker import EngineWorker
 
 log = logging.getLogger(__name__)
+io_log = logging.getLogger("kvboost.server.io")
+
+
+def _truncate(text: str, limit: int = 500) -> str:
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…<+{len(text) - limit} chars>"
 
 
 def build_app(worker: EngineWorker, model_name: Optional[str] = None) -> FastAPI:
@@ -79,6 +88,31 @@ def build_app(worker: EngineWorker, model_name: Optional[str] = None) -> FastAPI
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # ── Request/response access log ───────────────────────────────────────────
+
+    @app.middleware("http")
+    async def _log_io(request: Request, call_next):
+        req_id = uuid.uuid4().hex[:8]
+        start = time.perf_counter()
+        client = f"{request.client.host}:{request.client.port}" if request.client else "-"
+        io_log.info(
+            "REQ  id=%s %s %s client=%s",
+            req_id, request.method, request.url.path, client,
+        )
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            io_log.exception("ERR  id=%s %s %s elapsed=%.1fms",
+                             req_id, request.method, request.url.path, elapsed_ms)
+            raise
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        io_log.info(
+            "RES  id=%s %s %s status=%d elapsed=%.1fms",
+            req_id, request.method, request.url.path, response.status_code, elapsed_ms,
+        )
+        return response
 
     # ── Startup / shutdown ────────────────────────────────────────────────────
 
@@ -117,7 +151,9 @@ def build_app(worker: EngineWorker, model_name: Optional[str] = None) -> FastAPI
         text = body.get("text", "")
         if not text:
             raise HTTPException(status_code=400, detail="Field 'text' is required.")
+        io_log.info("WARM in: chars=%d text=%r", len(text), _truncate(text))
         await worker.warm(text)
+        io_log.info("WARM out: chars=%d", len(text))
         return {"status": "warmed", "chars": len(text)}
 
     # ── /v1/completions ───────────────────────────────────────────────────────
@@ -125,6 +161,13 @@ def build_app(worker: EngineWorker, model_name: Optional[str] = None) -> FastAPI
     @app.post("/v1/completions", tags=["completions"])
     async def completions(req: CompletionRequest):
         _validate_model(req.model, _model_name)
+
+        io_log.info(
+            "COMPLETIONS in: model=%s n_prompts=%d max_tokens=%d temp=%s stream=%s",
+            req.model, len(req.prompts), req.max_tokens, req.temperature, req.stream,
+        )
+        for i, p in enumerate(req.prompts):
+            io_log.info("  prompt[%d]=%r", i, _truncate(p))
 
         if req.stream:
             return StreamingResponse(
@@ -136,6 +179,13 @@ def build_app(worker: EngineWorker, model_name: Optional[str] = None) -> FastAPI
         results = await _run_completions(req, worker, _model_name)
         prompt_tokens = sum(len(worker._tokenize(p)) for p in req.prompts)
         completion_tokens = sum(len(worker._tokenize(r.output_text)) for r in results)
+
+        for i, r in enumerate(results):
+            io_log.info("COMPLETIONS out[%d]=%r", i, _truncate(r.output_text))
+        io_log.info(
+            "COMPLETIONS done: prompt_tokens=%d completion_tokens=%d total=%d",
+            prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
+        )
 
         choices = [
             CompletionChoice(text=r.output_text, index=i)
@@ -159,6 +209,14 @@ def build_app(worker: EngineWorker, model_name: Optional[str] = None) -> FastAPI
 
         prompt = req.to_prompt(worker.engine.tokenizer)
 
+        io_log.info(
+            "CHAT in: model=%s n_messages=%d max_tokens=%d temp=%s stream=%s",
+            req.model, len(req.messages), req.max_tokens, req.temperature, req.stream,
+        )
+        for i, m in enumerate(req.messages):
+            io_log.info("  msg[%d] role=%s content=%r", i, m.role, _truncate(m.content))
+        io_log.debug("CHAT prompt=%r", _truncate(prompt, 1000))
+
         if req.stream:
             return StreamingResponse(
                 _stream_chat(req, prompt, worker, _model_name),
@@ -171,6 +229,13 @@ def build_app(worker: EngineWorker, model_name: Optional[str] = None) -> FastAPI
 
         prompt_tokens = len(worker._tokenize(prompt))
         completion_tokens = len(worker._tokenize(result.output_text))
+
+        io_log.info("CHAT out=%r", _truncate(result.output_text))
+        io_log.info(
+            "CHAT done: prompt_tokens=%d completion_tokens=%d total=%d generated=%d",
+            prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
+            result.generated_tokens,
+        )
 
         return ChatCompletionResponse(
             model=_model_name,
@@ -289,6 +354,8 @@ async def _stream_completions(
                 "logprobs": None,
             }],
         )
+        io_log.info("COMPLETIONS stream out[%d] id=%s text=%r",
+                    i, request_id, _truncate(result.output_text))
         yield f"data: {chunk.model_dump_json()}\n\n"
 
     yield "data: [DONE]\n\n"
@@ -385,6 +452,11 @@ async def _stream_chat(
             "delta": {},
             "finish_reason": finish_reason,
         }],
+    )
+    generated = final_result.generated_tokens if final_result is not None else len(all_tokens)
+    io_log.info(
+        "CHAT stream out id=%s finish=%s generated_tokens=%d text=%r",
+        request_id, finish_reason, generated, _truncate(prev_text),
     )
     yield f"data: {stop_chunk.model_dump_json()}\n\n"
     yield "data: [DONE]\n\n"
