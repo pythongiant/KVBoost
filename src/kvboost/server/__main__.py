@@ -73,6 +73,12 @@ def parse_args():
                    help="Model weight dtype (default: float16)")
     p.add_argument("--backend", default="default", choices=["default", "cpu-paged"],
                    help="Inference backend (default: standard KVBoost)")
+    p.add_argument("--quantization", default="none",
+                   choices=["none", "bnb-4bit", "bnb-8bit"],
+                   help="On-the-fly weight quantization via bitsandbytes. "
+                        "Use 'bnb-4bit' (NF4) for ~4x VRAM reduction, 'bnb-8bit' for ~2x. "
+                        "Pre-quantized AWQ/GPTQ checkpoints are detected automatically — "
+                        "leave this 'none' and just point --model at e.g. Qwen/Qwen3-8B-AWQ.")
 
     # KVBoost cache
     p.add_argument("--max-cache-bytes", type=float, default=2e9,
@@ -127,11 +133,35 @@ def load_engine(args):
     if args.gguf_file:
         log.info("Using GGUF file: %s", args.gguf_file)
     gguf_kwargs = {"gguf_file": args.gguf_file} if args.gguf_file else {}
+
+    quant_config = None
+    if args.quantization != "none":
+        try:
+            from transformers import BitsAndBytesConfig
+            import bitsandbytes  # noqa: F401  — fail-fast if not installed
+        except ImportError:
+            raise SystemExit(
+                "ERROR: --quantization requires bitsandbytes.\n"
+                "Run: pip install bitsandbytes"
+            )
+        if args.quantization == "bnb-4bit":
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch_dtype,
+                bnb_4bit_use_double_quant=True,
+            )
+        else:  # bnb-8bit
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+        log.info("Quantization: %s", args.quantization)
+
     tokenizer = AutoTokenizer.from_pretrained(args.model, **gguf_kwargs)
 
     if args.backend == "cpu-paged":
         if args.gguf_file:
             raise SystemExit("--gguf-file is not supported with --backend cpu-paged.")
+        if quant_config is not None:
+            raise SystemExit("--quantization is not supported with --backend cpu-paged.")
         from ..cpu_paged import CPUPagedEngine
         engine = CPUPagedEngine.from_pretrained(
             args.model,
@@ -151,11 +181,19 @@ def load_engine(args):
         # Load directly onto the target device. Avoid device_map="auto" because
         # accelerate may offload modules to CPU/disk, after which InferenceEngine's
         # subsequent model.to(device) call fails ("can't move offloaded modules").
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            torch_dtype=torch_dtype,
+        from_pretrained_kwargs = dict(
             device_map=device,
             **gguf_kwargs,
+        )
+        if quant_config is not None:
+            # bnb sets compute dtype itself; passing torch_dtype here is ignored
+            # (and would emit a warning), so omit it.
+            from_pretrained_kwargs["quantization_config"] = quant_config
+        else:
+            from_pretrained_kwargs["torch_dtype"] = torch_dtype
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            **from_pretrained_kwargs,
         )
         engine = InferenceEngine(
             model=model,
