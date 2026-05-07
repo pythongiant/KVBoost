@@ -295,6 +295,7 @@ def main():
         batch_window_ms=args.batch_window_ms,
         max_batch_size=args.max_batch_size,
         max_queue_size=args.max_queue_size,
+        release_cache_after_request=args.release_cache_after_request,
     )
 
     app = build_app(

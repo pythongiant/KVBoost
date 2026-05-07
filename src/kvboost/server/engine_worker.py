@@ -186,16 +186,22 @@ class EngineWorker:
 
     def _release_gpu_memory(self) -> None:
         """
-        Return CUDA cached blocks to free memory between requests.
+        Drop the KV cache and return CUDA blocks to free memory between requests.
 
         No-op unless `release_cache_after_request=True` was passed at
-        construction (CLI: --release-cache-after-request). Useful on
-        8 GB-class GPUs where activations from request N otherwise
-        prevent prefill from fitting in request N+1. Costs ~5–20 ms
-        per request because of the CUDA sync; skip it on bigger GPUs.
+        construction (CLI: --release-cache-after-request). Resets the
+        chunk cache (so request N+1 starts cold) and then runs
+        gc.collect() + torch.cuda.empty_cache() to actually return the
+        freed tensors to the allocator. Useful on 8 GB-class GPUs where
+        a populated cache + activations otherwise OOMs request N+1.
+        Trades cache reuse for headroom; skip it on bigger GPUs.
         """
         if not self._release_cache:
             return
+        try:
+            self.engine.reset_cache()
+        except Exception as exc:
+            log.debug("reset_cache failed: %s", exc)
         try:
             import torch
             if torch.cuda.is_available():
