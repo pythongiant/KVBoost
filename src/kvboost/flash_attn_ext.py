@@ -138,6 +138,35 @@ def _make_patched_sdpa(original_sdpa_fn):
     return patched_sdpa
 
 
+def _resolve_forward_globals(module: torch.nn.Module):
+    """
+    Find the global namespace where the module's forward function looks up
+    `scaled_dot_product_attention`. The instance forward may be wrapped
+    (functools.partial via accelerate's offload hooks, decorators, etc.) and
+    not have __globals__ directly — in which case we fall back to the class's
+    own forward method, which is always a real function.
+    """
+    # Try the instance forward first (covers normal case).
+    fwd = getattr(module, "forward", None)
+    g = getattr(fwd, "__globals__", None)
+    if g is not None:
+        return g
+    # Bound method? Use the underlying function.
+    func = getattr(fwd, "__func__", None)
+    g = getattr(func, "__globals__", None)
+    if g is not None:
+        return g
+    # functools.partial / accelerate hook wrapper — drill into common attrs.
+    for attr in ("func", "__wrapped__"):
+        inner = getattr(fwd, attr, None)
+        g = getattr(inner, "__globals__", None) or getattr(getattr(inner, "__func__", None), "__globals__", None)
+        if g is not None:
+            return g
+    # Last resort: the class's forward method.
+    cls_fwd = getattr(type(module), "forward", None)
+    return getattr(cls_fwd, "__globals__", None)
+
+
 def _patch_module(module: torch.nn.Module) -> bool:
     """
     Monkey-patch a single attention module to use _kvboost_flash_attn.
@@ -151,6 +180,14 @@ def _patch_module(module: torch.nn.Module) -> bool:
     if hasattr(module, _SDPA_ATTR):
         return False
 
+    mod_globals = _resolve_forward_globals(module)
+    if mod_globals is None:
+        log.debug(
+            "flash_attn: cannot resolve globals for %s — leaving unpatched",
+            type(module).__name__,
+        )
+        return False
+
     # Stash our custom fn as an attribute; the forward method picks it up via
     # the closure we inject below.
     module.__dict__[_SDPA_ATTR] = _kvboost_flash_attn
@@ -161,7 +198,6 @@ def _patch_module(module: torch.nn.Module) -> bool:
     def patched_forward(self, *args, **kwargs):
         # Temporarily replace F.scaled_dot_product_attention in the module's
         # global namespace with our version.
-        mod_globals = original_forward.__globals__
         old_sdpa = mod_globals.get("scaled_dot_product_attention")
         mod_globals["scaled_dot_product_attention"] = _make_patched_sdpa(old_sdpa)
         try:
