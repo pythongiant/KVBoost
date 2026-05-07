@@ -114,6 +114,16 @@ def parse_args():
     p.add_argument("--max-batch-size", type=int, default=8)
     p.add_argument("--max-queue-size", type=int, default=256)
 
+    # Tool / function calling
+    p.add_argument("--enable-auto-tool-choice", action="store_true",
+                   help="Enable OpenAI-compatible tool/function calling. When set, "
+                        "the server forwards 'tools' to the chat template and parses "
+                        "tool calls out of the model output using --tool-call-parser.")
+    p.add_argument("--tool-call-parser", default="hermes",
+                   choices=["hermes"],
+                   help="Format used by the model to emit tool calls. "
+                        "'hermes' = <tool_call>{json}</tool_call> (Qwen2.5/3, Hermes 2/3).")
+
     # Pre-warm
     p.add_argument("--warm", default=None,
                    help="Text to pre-warm the KV cache before accepting requests")
@@ -282,7 +292,12 @@ def main():
         max_queue_size=args.max_queue_size,
     )
 
-    app = build_app(worker, model_name=args.model_name or args.model)
+    app = build_app(
+        worker,
+        model_name=args.model_name or args.model,
+        enable_auto_tool_choice=args.enable_auto_tool_choice,
+        tool_call_parser=args.tool_call_parser,
+    )
 
     # Pre-warm synchronously before accepting requests
     if args.warm:

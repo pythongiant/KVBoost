@@ -52,6 +52,7 @@ from .schema import (
     UsageStats,
 )
 from .engine_worker import EngineWorker
+from . import tool_parsers
 
 log = logging.getLogger(__name__)
 io_log = logging.getLogger("kvboost.server.io")
@@ -65,16 +66,26 @@ def _truncate(text: str, limit: int = 500) -> str:
     return f"{text[:limit]}…<+{len(text) - limit} chars>"
 
 
-def build_app(worker: EngineWorker, model_name: Optional[str] = None) -> FastAPI:
+def build_app(
+    worker: EngineWorker,
+    model_name: Optional[str] = None,
+    enable_auto_tool_choice: bool = False,
+    tool_call_parser: str = "hermes",
+) -> FastAPI:
     """
     Construct and return the FastAPI application.
 
     Parameters
     ----------
-    worker      : a started EngineWorker instance
-    model_name  : override for the model id shown in /v1/models
+    worker                   : a started EngineWorker instance
+    model_name               : override for the model id shown in /v1/models
+    enable_auto_tool_choice  : if True, parse model output for tool calls when
+                               the request includes `tools`
+    tool_call_parser         : parser name (see tool_parsers.PARSERS)
     """
     _model_name = model_name or worker._model_name
+    _auto_tools = enable_auto_tool_choice
+    _parser_name = tool_call_parser
 
     app = FastAPI(
         title="KVBoost Inference Server",
@@ -219,7 +230,10 @@ def build_app(worker: EngineWorker, model_name: Optional[str] = None) -> FastAPI
 
         if req.stream:
             return StreamingResponse(
-                _stream_chat(req, prompt, worker, _model_name),
+                _stream_chat(
+                    req, prompt, worker, _model_name,
+                    auto_tools=_auto_tools, parser_name=_parser_name,
+                ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -237,13 +251,46 @@ def build_app(worker: EngineWorker, model_name: Optional[str] = None) -> FastAPI
             result.generated_tokens,
         )
 
+        tool_calls = None
+        cleaned_text = result.output_text
+        tools_active = (
+            _auto_tools
+            and bool(req.tools)
+            and req.tool_choice != "none"
+        )
+        if tools_active:
+            cleaned_text, parsed_calls = tool_parsers.parse(
+                result.output_text, _parser_name,
+            )
+            parsed_calls = _filter_tool_choice(parsed_calls, req.tool_choice)
+            if parsed_calls:
+                tool_calls = parsed_calls
+                io_log.info("CHAT tool_calls=%d names=%s",
+                            len(parsed_calls),
+                            [tc.function.name for tc in parsed_calls])
+            elif req.tool_choice == "required":
+                io_log.warning(
+                    "CHAT tool_choice=required but model emitted no tool calls"
+                )
+
+        if tool_calls:
+            finish_reason = "tool_calls"
+            message = ChatMessage(
+                role="assistant",
+                content=cleaned_text or None,
+                tool_calls=tool_calls,
+            )
+        else:
+            finish_reason = "stop" if result.generated_tokens < req.max_tokens else "length"
+            message = ChatMessage(role="assistant", content=cleaned_text)
+
         return ChatCompletionResponse(
             model=_model_name,
             choices=[
                 ChatChoice(
                     index=0,
-                    message=ChatMessage(role="assistant", content=result.output_text),
-                    finish_reason="stop" if result.generated_tokens < req.max_tokens else "length",
+                    message=message,
+                    finish_reason=finish_reason,
                 )
             ],
             usage=UsageStats(
@@ -273,6 +320,30 @@ def build_app(worker: EngineWorker, model_name: Optional[str] = None) -> FastAPI
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _filter_tool_choice(calls, tool_choice):
+    """
+    Apply OpenAI tool_choice semantics to a parsed list of ToolCall objects.
+
+    - None / "auto" : pass through
+    - "none"        : drop everything (callers should also skip parsing)
+    - "required"    : pass through (enforcement is best-effort; we can't force
+                      the model post-hoc, just flag the absence at the call site)
+    - {"type":"function","function":{"name":"X"}} : keep only matching name
+    """
+    if not calls:
+        return calls
+    if tool_choice in (None, "auto", "required"):
+        return calls
+    if tool_choice == "none":
+        return []
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function") or {}
+        wanted = fn.get("name")
+        if wanted:
+            return [c for c in calls if c.function.name == wanted]
+    return calls
+
 
 def _validate_model(requested: str, available: str) -> None:
     if requested != available:
@@ -366,17 +437,66 @@ async def _stream_chat(
     prompt: str,
     worker: EngineWorker,
     model_name: str,
+    *,
+    auto_tools: bool = False,
+    parser_name: str = "hermes",
 ) -> AsyncGenerator[str, None]:
     """SSE generator for /v1/chat/completions with stream=True.
 
-    Emits real token-by-token deltas. The engine invokes an on_token
-    callback per generated token; we incrementally detokenize by decoding
-    the running token list and emitting whatever new text appeared since
-    the previous decode. This handles BPE merges and multi-byte UTF-8
-    boundaries correctly without producing partial/garbled chars.
+    Emits real token-by-token deltas. When `auto_tools` is on and the request
+    includes `tools`, the assistant text stream is run through a streaming
+    Hermes parser: plain content is emitted as `delta.content`, and complete
+    `<tool_call>{...}</tool_call>` blocks are emitted as OpenAI-format
+    `delta.tool_calls`. Partial markup is held back so the client never sees
+    half-tags.
     """
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     tokenizer = worker.engine.tokenizer
+
+    tools_active = (
+        auto_tools and bool(req.tools) and req.tool_choice != "none"
+    )
+    stream_parser = (
+        tool_parsers.make_streaming_parser(parser_name) if tools_active else None
+    )
+    emitted_tool_calls = []  # list of ToolCall, used to set finish_reason
+    tool_call_index = 0       # OpenAI delta indexing within this completion
+
+    def _content_chunk(text: str) -> str:
+        chunk = ChatCompletionChunk(
+            id=request_id,
+            model=model_name,
+            choices=[{
+                "index": 0,
+                "delta": {"content": text},
+                "finish_reason": None,
+            }],
+        )
+        return f"data: {chunk.model_dump_json()}\n\n"
+
+    def _tool_call_chunk(idx: int, call) -> str:
+        # Single-shot delta: emit id, name, and full arguments together.
+        # OpenAI clients (openai-python, LangChain, LiteLLM) accept this.
+        chunk = ChatCompletionChunk(
+            id=request_id,
+            model=model_name,
+            choices=[{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": idx,
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        },
+                    }],
+                },
+                "finish_reason": None,
+            }],
+        )
+        return f"data: {chunk.model_dump_json()}\n\n"
 
     # Role delta first — tells the client a response is starting.
     role_chunk = ChatCompletionChunk(
@@ -411,16 +531,21 @@ async def _stream_chat(
                     # Multi-byte char not yet complete — wait for next token.
                     continue
                 prev_text = cur_text
-                content_chunk = ChatCompletionChunk(
-                    id=request_id,
-                    model=model_name,
-                    choices=[{
-                        "index": 0,
-                        "delta": {"content": delta},
-                        "finish_reason": None,
-                    }],
-                )
-                yield f"data: {content_chunk.model_dump_json()}\n\n"
+
+                if stream_parser is None:
+                    yield _content_chunk(delta)
+                else:
+                    for ev_kind, ev_payload in stream_parser.feed(delta):
+                        if ev_kind == "text":
+                            if ev_payload:
+                                yield _content_chunk(ev_payload)
+                        else:  # "tool_call"
+                            call = _filter_tool_choice([ev_payload], req.tool_choice)
+                            if not call:
+                                continue
+                            yield _tool_call_chunk(tool_call_index, call[0])
+                            emitted_tool_calls.append(call[0])
+                            tool_call_index += 1
             elif kind == "done":
                 final_result = payload
             elif kind == "error":
@@ -440,9 +565,30 @@ async def _stream_chat(
         yield f"data: {error_chunk}\n\n"
         return
 
-    finish_reason = "stop"
-    if final_result is not None and final_result.generated_tokens >= req.max_tokens:
+    # Drain any held-back text/tool_call from the parser.
+    if stream_parser is not None:
+        for ev_kind, ev_payload in stream_parser.flush():
+            if ev_kind == "text":
+                if ev_payload:
+                    yield _content_chunk(ev_payload)
+            else:
+                call = _filter_tool_choice([ev_payload], req.tool_choice)
+                if call:
+                    yield _tool_call_chunk(tool_call_index, call[0])
+                    emitted_tool_calls.append(call[0])
+                    tool_call_index += 1
+
+    if emitted_tool_calls:
+        finish_reason = "tool_calls"
+    elif final_result is not None and final_result.generated_tokens >= req.max_tokens:
         finish_reason = "length"
+    else:
+        finish_reason = "stop"
+
+    if tools_active and not emitted_tool_calls and req.tool_choice == "required":
+        io_log.warning(
+            "CHAT stream tool_choice=required but model emitted no tool calls"
+        )
 
     stop_chunk = ChatCompletionChunk(
         id=request_id,
@@ -455,8 +601,9 @@ async def _stream_chat(
     )
     generated = final_result.generated_tokens if final_result is not None else len(all_tokens)
     io_log.info(
-        "CHAT stream out id=%s finish=%s generated_tokens=%d text=%r",
-        request_id, finish_reason, generated, _truncate(prev_text),
+        "CHAT stream out id=%s finish=%s generated_tokens=%d tool_calls=%d text=%r",
+        request_id, finish_reason, generated, len(emitted_tool_calls),
+        _truncate(prev_text),
     )
     yield f"data: {stop_chunk.model_dump_json()}\n\n"
     yield "data: [DONE]\n\n"

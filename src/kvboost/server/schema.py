@@ -16,11 +16,14 @@ References:
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
+
+log = logging.getLogger(__name__)
 
 
 # ── Shared ────────────────────────────────────────────────────────────────────
@@ -104,19 +107,45 @@ class ContentPart(BaseModel):
     text: Optional[str] = None
 
 
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str  # JSON-encoded string per OpenAI spec
+
+
+class ToolCall(BaseModel):
+    id: str = Field(default_factory=lambda: f"call_{uuid.uuid4().hex[:24]}")
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: Union[str, List[ContentPart]]
+    content: Optional[Union[str, List[ContentPart]]] = None
     name: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None
 
     @field_validator("content")
     @classmethod
     def flatten_content(cls, v):
+        if v is None:
+            return v
         # Accept OpenAI's multimodal parts format and flatten text parts.
         # Non-text parts (images, etc.) are dropped — this server is text-only.
         if isinstance(v, list):
             return "".join(p.text for p in v if p.type == "text" and p.text)
         return v
+
+
+class FunctionDef(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class Tool(BaseModel):
+    type: Literal["function"] = "function"
+    function: FunctionDef
 
 
 class ChatCompletionRequest(BaseModel):
@@ -131,6 +160,8 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     user: Optional[str] = None
+    tools: Optional[List[Tool]] = None
+    tool_choice: Optional[Union[Literal["auto", "none", "required"], Dict[str, Any]]] = None
 
     @field_validator("messages")
     @classmethod
@@ -150,14 +181,46 @@ class ChatCompletionRequest(BaseModel):
         """
         if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
             try:
-                msg_dicts = [{"role": m.role, "content": m.content} for m in self.messages]
+                msg_dicts = []
+                for m in self.messages:
+                    d: Dict[str, Any] = {"role": m.role, "content": m.content or ""}
+                    if m.name is not None:
+                        d["name"] = m.name
+                    if m.tool_calls:
+                        d["tool_calls"] = [
+                            {
+                                "id": tc.id,
+                                "type": tc.type,
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                },
+                            }
+                            for tc in m.tool_calls
+                        ]
+                    if m.tool_call_id is not None:
+                        d["tool_call_id"] = m.tool_call_id
+                    msg_dicts.append(d)
+                tools_arg = None
+                if self.tools:
+                    tools_arg = [t.model_dump() for t in self.tools]
                 return tokenizer.apply_chat_template(
                     msg_dicts,
+                    tools=tools_arg,
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                if tools_arg:
+                    log.warning(
+                        "apply_chat_template failed with tools=%d defs (%s); "
+                        "tools will NOT reach the model. Make sure the tokenizer "
+                        "has a chat template that accepts a `tools` argument "
+                        "(Qwen2.5/3, Hermes 2/3 do; older Llama2 does not).",
+                        len(tools_arg), exc,
+                    )
+                else:
+                    log.debug("apply_chat_template failed: %s — using fallback", exc)
         # Fallback
         parts = []
         for m in self.messages:
@@ -173,7 +236,7 @@ class ChatCompletionRequest(BaseModel):
 class ChatChoice(BaseModel):
     index: int
     message: ChatMessage
-    finish_reason: Literal["stop", "length"] = "stop"
+    finish_reason: Literal["stop", "length", "tool_calls"] = "stop"
 
 
 class ChatCompletionResponse(BaseModel):
