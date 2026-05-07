@@ -45,6 +45,7 @@ OpenAI client example
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 
@@ -74,11 +75,17 @@ def parse_args():
     p.add_argument("--backend", default="default", choices=["default", "cpu-paged"],
                    help="Inference backend (default: standard KVBoost)")
     p.add_argument("--quantization", default="none",
-                   choices=["none", "bnb-4bit", "bnb-8bit"],
-                   help="On-the-fly weight quantization via bitsandbytes. "
-                        "Use 'bnb-4bit' (NF4) for ~4x VRAM reduction, 'bnb-8bit' for ~2x. "
+                   choices=["none", "bnb-4bit", "bnb-8bit", "hqq-4bit", "hqq-2bit"],
+                   help="On-the-fly weight quantization. "
+                        "bnb-4bit (NF4) / bnb-8bit: bitsandbytes, ~4x / 2x VRAM reduction. "
+                        "hqq-4bit / hqq-2bit: HQQ, no calibration, lower load-time memory than bnb. "
                         "Pre-quantized AWQ/GPTQ checkpoints are detected automatically — "
                         "leave this 'none' and just point --model at e.g. Qwen/Qwen3-8B-AWQ.")
+    p.add_argument("--max-memory", default=None,
+                   help="Per-device memory cap for CPU offload, JSON dict. "
+                        'Example: \'{"0": "7GiB", "cpu": "32GiB"}\'. When set, uses '
+                        "device_map='auto' so transformers spills overflow layers to CPU RAM. "
+                        "Slower but lets bigger models run on small GPUs.")
 
     # KVBoost cache
     p.add_argument("--max-cache-bytes", type=float, default=2e9,
@@ -135,13 +142,13 @@ def load_engine(args):
     gguf_kwargs = {"gguf_file": args.gguf_file} if args.gguf_file else {}
 
     quant_config = None
-    if args.quantization != "none":
+    if args.quantization in ("bnb-4bit", "bnb-8bit"):
         try:
             from transformers import BitsAndBytesConfig
             import bitsandbytes  # noqa: F401  — fail-fast if not installed
         except ImportError:
             raise SystemExit(
-                "ERROR: --quantization requires bitsandbytes.\n"
+                "ERROR: --quantization bnb-* requires bitsandbytes.\n"
                 "Run: pip install bitsandbytes"
             )
         if args.quantization == "bnb-4bit":
@@ -151,9 +158,30 @@ def load_engine(args):
                 bnb_4bit_compute_dtype=torch_dtype,
                 bnb_4bit_use_double_quant=True,
             )
-        else:  # bnb-8bit
+        else:
             quant_config = BitsAndBytesConfig(load_in_8bit=True)
         log.info("Quantization: %s", args.quantization)
+    elif args.quantization in ("hqq-4bit", "hqq-2bit"):
+        try:
+            from transformers import HqqConfig
+        except ImportError:
+            raise SystemExit(
+                "ERROR: --quantization hqq-* requires a recent transformers + hqq.\n"
+                "Run: pip install -U transformers hqq"
+            )
+        nbits = 4 if args.quantization == "hqq-4bit" else 2
+        quant_config = HqqConfig(nbits=nbits, group_size=64)
+        log.info("Quantization: %s (HQQ %d-bit)", args.quantization, nbits)
+
+    max_memory = None
+    if args.max_memory:
+        try:
+            raw = json.loads(args.max_memory)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"ERROR: --max-memory must be valid JSON: {e}")
+        # Keys may be int (GPU index) or "cpu" / "disk"
+        max_memory = {(int(k) if k.isdigit() else k): v for k, v in raw.items()}
+        log.info("CPU/GPU offload max_memory=%s", max_memory)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, **gguf_kwargs)
 
@@ -178,16 +206,18 @@ def load_engine(args):
         from ..engine import InferenceEngine
         from ..compat import default_device
         device = args.device or default_device()
-        # Load directly onto the target device. Avoid device_map="auto" because
-        # accelerate may offload modules to CPU/disk, after which InferenceEngine's
-        # subsequent model.to(device) call fails ("can't move offloaded modules").
-        from_pretrained_kwargs = dict(
-            device_map=device,
-            **gguf_kwargs,
-        )
+        # By default load directly onto the target device. With --max-memory we
+        # opt into device_map="auto" + accelerate offload; InferenceEngine
+        # detects this (via hf_device_map / quantization) and skips its .to().
+        from_pretrained_kwargs = dict(**gguf_kwargs)
+        if max_memory is not None:
+            from_pretrained_kwargs["device_map"] = "auto"
+            from_pretrained_kwargs["max_memory"] = max_memory
+        else:
+            from_pretrained_kwargs["device_map"] = device
         if quant_config is not None:
-            # bnb sets compute dtype itself; passing torch_dtype here is ignored
-            # (and would emit a warning), so omit it.
+            # bnb/HQQ set compute dtype themselves; passing torch_dtype here
+            # is ignored (and would warn), so omit it.
             from_pretrained_kwargs["quantization_config"] = quant_config
         else:
             from_pretrained_kwargs["torch_dtype"] = torch_dtype

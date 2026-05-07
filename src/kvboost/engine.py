@@ -99,16 +99,18 @@ class InferenceEngine:
         if device is None:
             device = default_device()
 
-        # Quantized models (bnb 4/8-bit, AWQ, GPTQ) are loaded onto the target
-        # device directly via `device_map=` and cannot be moved with `.to()`
-        # afterwards — bnb modules in particular raise. Detect and skip.
+        # Models loaded via accelerate (device_map="auto") or with weight
+        # quantization (bnb 4/8-bit, AWQ, GPTQ, HQQ) are placed by the loader
+        # and cannot be moved with `.to()` — bnb modules raise outright, and
+        # accelerate offload hooks break if you try. Detect and skip.
+        is_offloaded = bool(getattr(model, "hf_device_map", None))
         is_quantized = (
             getattr(model, "hf_quantizer", None) is not None
             or getattr(model, "is_loaded_in_4bit", False)
             or getattr(model, "is_loaded_in_8bit", False)
             or getattr(getattr(model, "config", None), "quantization_config", None) is not None
         )
-        self.model = model if is_quantized else model.to(device)
+        self.model = model if (is_offloaded or is_quantized) else model.to(device)
         self.tokenizer = tokenizer
         self.device = device
         self.recompute_strategy = RecomputeStrategy(recompute_strategy)
