@@ -113,6 +113,11 @@ def parse_args():
                    help="Request collection window before dispatch (ms)")
     p.add_argument("--max-batch-size", type=int, default=8)
     p.add_argument("--max-queue-size", type=int, default=256)
+    p.add_argument("--release-cache-after-request", action="store_true",
+                   help="Run torch.cuda.empty_cache() between requests. "
+                        "Recommended on 8 GB-class GPUs where PyTorch's "
+                        "allocator cache from request N can prevent prefill "
+                        "from fitting in request N+1. Costs ~5-20 ms per request.")
 
     # Tool / function calling
     p.add_argument("--enable-auto-tool-choice", action="store_true",

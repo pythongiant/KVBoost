@@ -68,6 +68,7 @@ class EngineWorker:
         batch_window_ms: float = 20.0,
         max_batch_size: int = 8,
         max_queue_size: int = 256,
+        release_cache_after_request: bool = False,
     ) -> None:
         self.engine = engine
         self.loop = loop  # may be overridden in start() with the running loop
@@ -75,6 +76,7 @@ class EngineWorker:
             max_workers=max_workers,
             thread_name_prefix="kvboost-worker",
         )
+        self._release_cache = release_cache_after_request
 
         self.queue = BatchQueue(
             tokenize_fn=self._tokenize,
@@ -186,12 +188,14 @@ class EngineWorker:
         """
         Return CUDA cached blocks to free memory between requests.
 
-        Without this, intermediate activations from a finished request
-        (especially attention scratch tensors) sit in PyTorch's allocator
-        cache and aren't available for the next request's prefill — on
-        small (8 GB-class) GPUs this is the difference between succeeding
-        and OOM'ing on the second request.
+        No-op unless `release_cache_after_request=True` was passed at
+        construction (CLI: --release-cache-after-request). Useful on
+        8 GB-class GPUs where activations from request N otherwise
+        prevent prefill from fitting in request N+1. Costs ~5–20 ms
+        per request because of the CUDA sync; skip it on bigger GPUs.
         """
+        if not self._release_cache:
+            return
         try:
             import torch
             if torch.cuda.is_available():
