@@ -214,7 +214,12 @@ def load_engine(args):
             from_pretrained_kwargs["device_map"] = "auto"
             from_pretrained_kwargs["max_memory"] = max_memory
         else:
-            from_pretrained_kwargs["device_map"] = device
+            # Use the explicit-dict form — passing a bare string ("cuda") can
+            # leave some buffers on `meta`, which breaks AWQ-Marlin's post_init
+            # ("Expected a cuda device, but got: meta"). The {"": dev} form
+            # forces every leaf onto the target device.
+            target = device if ":" in device or device in ("cpu", "mps") else f"{device}:0"
+            from_pretrained_kwargs["device_map"] = {"": target}
         if quant_config is not None:
             # bnb/HQQ set compute dtype themselves; passing torch_dtype here
             # is ignored (and would warn), so omit it.
