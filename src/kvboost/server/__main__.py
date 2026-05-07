@@ -210,6 +210,11 @@ def load_engine(args):
         # opt into device_map="auto" + accelerate offload; InferenceEngine
         # detects this (via hf_device_map / quantization) and skips its .to().
         from_pretrained_kwargs = dict(**gguf_kwargs)
+        # Bypass accelerate's meta-init path. With low_cpu_mem_usage=True,
+        # any submodule that dispatch can't place stays on `meta`, which
+        # crashes gptqmodel's Marlin post_init. False forces real tensors
+        # so we either succeed or get a real CUDA-OOM error.
+        from_pretrained_kwargs["low_cpu_mem_usage"] = False
         if max_memory is not None:
             from_pretrained_kwargs["device_map"] = "auto"
             from_pretrained_kwargs["max_memory"] = max_memory
