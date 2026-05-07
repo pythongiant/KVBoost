@@ -186,6 +186,13 @@ class CacheBlendRecompute:
             cached_v = cached_kv[layer_idx][1].clone()
             updated_k_layer = updated_kv[layer_idx][0].to(self.device)
             updated_v_layer = updated_kv[layer_idx][1].to(self.device)
+            # Quantized loaders (bnb/AWQ/GPTQ) often run attention in the model's
+            # native dtype regardless of compute_dtype hints, so the live recompute
+            # may not match the cache dtype. Align to the cache.
+            if updated_k_layer.dtype != cached_k.dtype:
+                updated_k_layer = updated_k_layer.to(cached_k.dtype)
+            if updated_v_layer.dtype != cached_v.dtype:
+                updated_v_layer = updated_v_layer.to(cached_v.dtype)
 
             # Patch only the deviated positions
             idx = top_indices.to(self.device)

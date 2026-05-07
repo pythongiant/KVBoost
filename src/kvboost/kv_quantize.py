@@ -100,11 +100,12 @@ def _quantize_int8(kv: PastKVType) -> QuantizedKV:
 
 
 def _dequantize_int8(qkv: QuantizedKV) -> PastKVType:
-    """Reconstruct float16 KV tensors from int8 quantized storage."""
+    """Reconstruct KV tensors from int8 quantized storage in their original dtype."""
+    out_dtype = qkv.original_dtype
     result = []
     for layer in qkv.layers:
-        key = layer.key_q.to(torch.float16) * layer.key_scale
-        val = layer.val_q.to(torch.float16) * layer.val_scale
+        key = layer.key_q.to(out_dtype) * layer.key_scale.to(out_dtype)
+        val = layer.val_q.to(out_dtype) * layer.val_scale.to(out_dtype)
         result.append((key, val))
     return tuple(result)
 
@@ -143,13 +144,14 @@ def _quantize_int4(kv: PastKVType) -> QuantizedKV:
 
 
 def _dequantize_int4(qkv: QuantizedKV) -> PastKVType:
-    """Reconstruct float16 KV tensors from packed int4 storage."""
+    """Reconstruct KV tensors from packed int4 storage in their original dtype."""
+    out_dtype = qkv.original_dtype
     result = []
     for layer in qkv.layers:
         key_unpacked = _unpack_int4(layer.key_q)
         val_unpacked = _unpack_int4(layer.val_q)
-        key = key_unpacked.to(torch.float16) * layer.key_scale
-        val = val_unpacked.to(torch.float16) * layer.val_scale
+        key = key_unpacked.to(out_dtype) * layer.key_scale.to(out_dtype)
+        val = val_unpacked.to(out_dtype) * layer.val_scale.to(out_dtype)
         result.append((key, val))
     return tuple(result)
 
