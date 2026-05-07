@@ -28,6 +28,7 @@ futures.
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import threading
 import time
@@ -166,6 +167,8 @@ class EngineWorker:
             except Exception as exc:
                 log.exception("Streaming generation failed for %s", request_id)
                 loop.call_soon_threadsafe(token_q.put_nowait, ("error", exc))
+            finally:
+                self._release_gpu_memory()
 
         loop.run_in_executor(self._executor, _run)
 
@@ -178,6 +181,24 @@ class EngineWorker:
     async def warm(self, text: str) -> None:
         """Warm the KV cache with a prefix string (runs in worker thread)."""
         await self.loop.run_in_executor(self._executor, self.engine.warm, text)
+
+    def _release_gpu_memory(self) -> None:
+        """
+        Return CUDA cached blocks to free memory between requests.
+
+        Without this, intermediate activations from a finished request
+        (especially attention scratch tensors) sit in PyTorch's allocator
+        cache and aren't available for the next request's prefill — on
+        small (8 GB-class) GPUs this is the difference between succeeding
+        and OOM'ing on the second request.
+        """
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
+        except Exception as exc:
+            log.debug("empty_cache failed: %s", exc)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -214,32 +235,35 @@ class EngineWorker:
         t0 = time.perf_counter()
         reqs = batch.requests
 
-        if len(reqs) == 1:
-            r = reqs[0]
-            result = self.engine.generate(
-                prompt=r.prompt,
-                max_new_tokens=r.max_tokens,
-                temperature=r.temperature,
-                do_sample=r.do_sample,
-            )
-            log.debug(
-                "Singleton generate: req=%s ttft=%.0fms",
-                r.request_id, result.ttft_ms,
-            )
-            return [result]
+        try:
+            if len(reqs) == 1:
+                r = reqs[0]
+                result = self.engine.generate(
+                    prompt=r.prompt,
+                    max_new_tokens=r.max_tokens,
+                    temperature=r.temperature,
+                    do_sample=r.do_sample,
+                )
+                log.debug(
+                    "Singleton generate: req=%s ttft=%.0fms",
+                    r.request_id, result.ttft_ms,
+                )
+                return [result]
 
-        # Batched path — prompts share a prefix (grouped by BatchQueue)
-        prompts = [r.prompt for r in reqs]
-        max_tokens = max(r.max_tokens for r in reqs)
-        temperature = reqs[0].temperature   # use first req's params for batch
-        do_sample = reqs[0].do_sample
+            # Batched path — prompts share a prefix (grouped by BatchQueue)
+            prompts = [r.prompt for r in reqs]
+            max_tokens = max(r.max_tokens for r in reqs)
+            temperature = reqs[0].temperature   # use first req's params for batch
+            do_sample = reqs[0].do_sample
 
-        results = self.engine.generate_batch(
-            prompts=prompts,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            do_sample=do_sample,
-        )
+            results = self.engine.generate_batch(
+                prompts=prompts,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                do_sample=do_sample,
+            )
+        finally:
+            self._release_gpu_memory()
 
         elapsed = (time.perf_counter() - t0) * 1000
         log.debug(
