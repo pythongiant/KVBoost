@@ -103,6 +103,11 @@ def parse_args():
                    help="KV quantization bits (16=off, 8=int8, 4=int4)")
     p.add_argument("--sink-tokens", type=int, default=0)
     p.add_argument("--overlap-k", type=int, default=0)
+    p.add_argument("--prefill-chunk-size", type=int, default=0,
+                   help="Process the prompt in slices of N tokens during prefill, "
+                        "growing past_key_values between iterations. 0 = single-shot "
+                        "(legacy). Set to e.g. 512 or 1024 to fit long prompts on "
+                        "small GPUs by capping peak FFN/attention activation memory.")
 
     # CPU paged backend
     p.add_argument("--block-size", type=int, default=16, help="Tokens per paged block")
@@ -269,6 +274,7 @@ def load_engine(args):
             kv_cache_bits=args.kv_cache_bits,
             sink_tokens=args.sink_tokens,
             overlap_k=args.overlap_k,
+            prefill_chunk_size=args.prefill_chunk_size,
             device=device,
         )
 

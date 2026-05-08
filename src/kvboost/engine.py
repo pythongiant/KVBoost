@@ -95,6 +95,8 @@ class InferenceEngine:
         overlap_k: int = 0,
         # Attention sink (global memory prefix)
         sink_tokens: int = 0,
+        # Chunked prefill (0 = disabled, single-shot prefill)
+        prefill_chunk_size: int = 0,
     ):
         if device is None:
             device = default_device()
@@ -116,6 +118,7 @@ class InferenceEngine:
         self.recompute_strategy = RecomputeStrategy(recompute_strategy)
         self.overlap_k = overlap_k
         self.sink_tokens = sink_tokens
+        self.prefill_chunk_size = int(prefill_chunk_size)
 
         # Pre-compute boundary token IDs for adaptive splitting
         self._boundary_tokens: Set[int] = (
@@ -689,24 +692,38 @@ class InferenceEngine:
 
         # ----- encode live tokens (prompt tail) -------------------------
         if live_ids:
-            input_ids = torch.tensor([live_ids], dtype=torch.long, device=self.device)
-            pos_ids = torch.arange(
-                cached_len, cached_len + len(live_ids),
-                dtype=torch.long, device=self.device,
-            ).unsqueeze(0)
+            n_live = len(live_ids)
+            cs = self.prefill_chunk_size
+            # cs <= 0 → single-shot prefill (legacy behavior)
+            chunk_step = n_live if cs <= 0 else min(cs, n_live)
 
-            with torch.no_grad(), last_logit_only(self.model):
-                out = self.model(
-                    input_ids=input_ids,
-                    past_key_values=self._as_cache(past_kv),
-                    position_ids=pos_ids,
-                    use_cache=True,
-                )
+            out = None
+            cur = 0
+            while cur < n_live:
+                end = min(cur + chunk_step, n_live)
+                slice_ids = live_ids[cur:end]
+                input_ids = torch.tensor([slice_ids], dtype=torch.long, device=self.device)
+                pos_ids = torch.arange(
+                    cached_len + cur, cached_len + end,
+                    dtype=torch.long, device=self.device,
+                ).unsqueeze(0)
+
+                # last_logit_only is fine for non-final chunks too — we just
+                # don't read those logits, and trimming saves a bit of memory.
+                with torch.no_grad(), last_logit_only(self.model):
+                    out = self.model(
+                        input_ids=input_ids,
+                        past_key_values=self._as_cache(past_kv),
+                        position_ids=pos_ids,
+                        use_cache=True,
+                    )
+                past_kv = self._normalize_past_kv(out.past_key_values)
+                cur = end
+
             first_token_time = time.perf_counter()
             # Capture first-token logits for comparison with baseline
             import numpy as np
             first_token_logits = out.logits[0, -1, :].cpu().float().numpy()
-            past_kv = self._normalize_past_kv(out.past_key_values)
             next_token = self._sample(out.logits[:, -1, :], temperature, do_sample)
             generated.append(next_token)
             if on_token is not None:
