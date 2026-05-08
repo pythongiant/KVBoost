@@ -81,6 +81,12 @@ def parse_args():
                         "hqq-4bit / hqq-2bit: HQQ, no calibration, lower load-time memory than bnb. "
                         "Pre-quantized AWQ/GPTQ checkpoints are detected automatically — "
                         "leave this 'none' and just point --model at e.g. Qwen/Qwen3-8B-AWQ.")
+    p.add_argument("--use-slow-tokenizer", action="store_true",
+                   help="Force the SentencePiece-based slow tokenizer. "
+                        "Workaround for fast-tokenizer builds whose byte-level "
+                        "decoder is missing/broken (symptom: decoded text drops "
+                        "spaces/newlines or shows literal 'Ġ' and 'Ċ'). "
+                        "Seen on some Llama-3 / DeepSeek-R1-Distill checkpoints.")
     p.add_argument("--max-memory", default=None,
                    help="Per-device memory cap for CPU offload, JSON dict. "
                         'Example: \'{"0": "7GiB", "cpu": "32GiB"}\'. When set, uses '
