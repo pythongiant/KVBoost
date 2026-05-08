@@ -133,7 +133,7 @@ class CPUPagedEngine(InferenceEngine):
         device = "cpu"
         model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map=device,
         )
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)

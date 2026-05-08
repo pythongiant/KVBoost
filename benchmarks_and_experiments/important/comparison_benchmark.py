@@ -423,7 +423,7 @@ class BenchmarkRunner:
         tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         hf_model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype=torch.float16 if device in ("cuda", "mps") else torch.float32,
+            dtype=torch.float16 if device in ("cuda", "mps") else torch.float32,
         ).to(device)
         hf_model.eval()
 

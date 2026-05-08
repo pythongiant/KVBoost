@@ -455,7 +455,7 @@ def _measure_baseline(
     tokenizer = AutoTokenizer.from_pretrained(model)
     hf_model = AutoModelForCausalLM.from_pretrained(
         model,
-        torch_dtype=torch.float16 if device in ("cuda", "mps") else torch.float32,
+        dtype=torch.float16 if device in ("cuda", "mps") else torch.float32,
     ).to(device)
     hf_model.eval()
     n = len(samples)

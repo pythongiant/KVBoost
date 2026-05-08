@@ -149,7 +149,7 @@ def load_engine(args):
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
     }
-    torch_dtype = dtype_map[args.dtype]
+    dtype = dtype_map[args.dtype]
 
     log.info("Loading model %s ...", args.model)
     if args.gguf_file:
@@ -170,7 +170,7 @@ def load_engine(args):
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch_dtype,
+                bnb_4bit_compute_dtype=dtype,
                 bnb_4bit_use_double_quant=True,
             )
         else:
@@ -198,7 +198,11 @@ def load_engine(args):
         max_memory = {(int(k) if k.isdigit() else k): v for k, v in raw.items()}
         log.info("CPU/GPU offload max_memory=%s", max_memory)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, **gguf_kwargs)
+    tokenizer_kwargs = dict(**gguf_kwargs)
+    if args.use_slow_tokenizer:
+        tokenizer_kwargs["use_fast"] = False
+        log.info("Loading slow (SentencePiece) tokenizer.")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, **tokenizer_kwargs)
 
     if args.backend == "cpu-paged":
         if args.gguf_file:
@@ -241,11 +245,11 @@ def load_engine(args):
             target = device if ":" in device or device in ("cpu", "mps") else f"{device}:0"
             from_pretrained_kwargs["device_map"] = {"": target}
         if quant_config is not None:
-            # bnb/HQQ set compute dtype themselves; passing torch_dtype here
+            # bnb/HQQ set compute dtype themselves; passing dtype here
             # is ignored (and would warn), so omit it.
             from_pretrained_kwargs["quantization_config"] = quant_config
         else:
-            from_pretrained_kwargs["torch_dtype"] = torch_dtype
+            from_pretrained_kwargs["dtype"] = dtype
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
             **from_pretrained_kwargs,
