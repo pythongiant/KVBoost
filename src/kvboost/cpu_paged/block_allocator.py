@@ -22,6 +22,13 @@ Copy-on-write prefix sharing
 When two sequences share a KVBoost prefix chunk (same prefix_hash) they point
 to the same physical blocks for that prefix.  Before any write to a block we
 check ref_count; if > 1 we copy the block to a fresh allocation first.
+
+Implementation
+--------------
+Bookkeeping (free list, ref counts, copy-on-write decisions) runs in Rust via
+the optional ``kvboost_native`` extension. If that extension is not installed,
+falls back transparently to a pure-Python implementation. Tensor pools and
+the actual KV reads/writes always stay on the Python side.
 """
 
 from __future__ import annotations
@@ -30,6 +37,94 @@ import threading
 from typing import Dict, List, Optional
 
 import torch
+
+try:
+    from kvboost_native import BlockAllocatorMeta as _RustMeta  # type: ignore
+    _HAS_RUST = True
+except ImportError:  # pragma: no cover — fallback path
+    _RustMeta = None
+    _HAS_RUST = False
+
+
+class _PyMeta:
+    """Pure-Python fallback that mirrors the Rust BlockAllocatorMeta API."""
+
+    def __init__(self, num_blocks: int) -> None:
+        self.num_blocks = num_blocks
+        self._free: List[int] = list(range(num_blocks))
+        self._ref_count: Dict[int, int] = {}
+        self._lock = threading.Lock()
+
+    def allocate(self, n: int) -> List[int]:
+        with self._lock:
+            if len(self._free) < n:
+                raise RuntimeError(
+                    f"BlockAllocator OOM: requested {n} blocks but only "
+                    f"{len(self._free)} free (pool size {self.num_blocks})."
+                )
+            ids = [self._free.pop() for _ in range(n)]
+            for bid in ids:
+                self._ref_count[bid] = 1
+            return ids
+
+    def free(self, block_ids: List[int]) -> None:
+        with self._lock:
+            for bid in block_ids:
+                rc = self._ref_count.get(bid, 0)
+                if rc <= 1:
+                    self._ref_count.pop(bid, None)
+                    self._free.append(bid)
+                else:
+                    self._ref_count[bid] = rc - 1
+
+    def fork(self, block_ids: List[int]) -> List[int]:
+        with self._lock:
+            for bid in block_ids:
+                self._ref_count[bid] = self._ref_count.get(bid, 1) + 1
+        return list(block_ids)
+
+    def ensure_writable(self, block_id: int) -> "_PyCowDecision":
+        with self._lock:
+            rc = self._ref_count.get(block_id, 1)
+            if rc <= 1:
+                return _PyCowDecision(block_id, False)
+            if not self._free:
+                raise RuntimeError("BlockAllocator OOM during copy-on-write.")
+            new_id = self._free.pop()
+            self._ref_count[new_id] = 1
+            self._ref_count[block_id] = rc - 1
+        return _PyCowDecision(new_id, True)
+
+    @property
+    def free_blocks(self) -> int:
+        return len(self._free)
+
+    @property
+    def used_blocks(self) -> int:
+        return self.num_blocks - len(self._free)
+
+    def utilization(self) -> float:
+        return self.used_blocks / max(self.num_blocks, 1)
+
+    def ref_count_snapshot(self) -> Dict[int, int]:
+        return dict(self._ref_count)
+
+    def free_snapshot(self) -> List[int]:
+        return list(self._free)
+
+
+class _PyCowDecision:
+    __slots__ = ("block_id", "needs_copy")
+
+    def __init__(self, block_id: int, needs_copy: bool) -> None:
+        self.block_id = block_id
+        self.needs_copy = needs_copy
+
+
+def _make_meta(num_blocks: int):
+    if _HAS_RUST:
+        return _RustMeta(num_blocks)
+    return _PyMeta(num_blocks)
 
 
 class BlockAllocator:
@@ -72,39 +167,18 @@ class BlockAllocator:
             for _ in range(num_layers)
         ]
 
-        # Free list: stack of available block ids
-        self._free: List[int] = list(range(num_blocks))
-
-        # Reference counts: how many sequences point to each block
-        self._ref_count: Dict[int, int] = {}
-
-        self._lock = threading.Lock()
+        # Bookkeeping: Rust extension if available, Python fallback otherwise.
+        self._meta = _make_meta(num_blocks)
 
     # ── Allocation ────────────────────────────────────────────────────────────
 
     def allocate(self, n: int) -> List[int]:
         """Allocate *n* fresh physical blocks. Raises RuntimeError if OOM."""
-        with self._lock:
-            if len(self._free) < n:
-                raise RuntimeError(
-                    f"BlockAllocator OOM: requested {n} blocks but only "
-                    f"{len(self._free)} free (pool size {self.num_blocks})."
-                )
-            block_ids = [self._free.pop() for _ in range(n)]
-            for bid in block_ids:
-                self._ref_count[bid] = 1
-            return block_ids
+        return list(self._meta.allocate(n))
 
     def free(self, block_ids: List[int]) -> None:
         """Decrement ref counts and return blocks to the free list when rc==0."""
-        with self._lock:
-            for bid in block_ids:
-                rc = self._ref_count.get(bid, 0)
-                if rc <= 1:
-                    self._ref_count.pop(bid, None)
-                    self._free.append(bid)
-                else:
-                    self._ref_count[bid] = rc - 1
+        self._meta.free(list(block_ids))
 
     def fork(self, block_ids: List[int]) -> List[int]:
         """
@@ -112,10 +186,7 @@ class BlockAllocator:
         The caller gets a new block_table that logically points to the same
         data.  Any write must call ensure_writable() first.
         """
-        with self._lock:
-            for bid in block_ids:
-                self._ref_count[bid] = self._ref_count.get(bid, 1) + 1
-        return list(block_ids)  # same ids, higher ref count
+        return list(self._meta.fork(list(block_ids)))
 
     def ensure_writable(self, block_id: int) -> int:
         """
@@ -123,21 +194,13 @@ class BlockAllocator:
         decrement the original's ref count and return the new block id.
         Otherwise return block_id unchanged.
         """
-        with self._lock:
-            rc = self._ref_count.get(block_id, 1)
-            if rc <= 1:
-                return block_id
-            # Need to copy
-            if not self._free:
-                raise RuntimeError("BlockAllocator OOM during copy-on-write.")
-            new_id = self._free.pop()
-            self._ref_count[new_id] = 1
-            self._ref_count[block_id] = rc - 1
-
-        # Copy all layers (outside lock for performance)
+        decision = self._meta.ensure_writable(block_id)
+        if not decision.needs_copy:
+            return decision.block_id
+        # Copy all layers (Python owns the tensors).
+        new_id = decision.block_id
         for pool in self.pools:
             pool[new_id].copy_(pool[block_id])
-
         return new_id
 
     # ── Block I/O helpers ─────────────────────────────────────────────────────
@@ -209,19 +272,24 @@ class BlockAllocator:
 
     @property
     def free_blocks(self) -> int:
-        return len(self._free)
+        return self._meta.free_blocks
 
     @property
     def used_blocks(self) -> int:
-        return self.num_blocks - len(self._free)
+        return self._meta.used_blocks
 
     def utilization(self) -> float:
-        return self.used_blocks / self.num_blocks
+        return self._meta.utilization()
+
+    @property
+    def backend(self) -> str:
+        """'rust' if the kvboost_native extension is loaded, 'python' otherwise."""
+        return "rust" if _HAS_RUST else "python"
 
     def __repr__(self) -> str:
         return (
             f"BlockAllocator(layers={self.num_layers}, heads={self.num_heads}, "
             f"head_dim={self.head_dim}, block_size={self.block_size}, "
             f"blocks={self.used_blocks}/{self.num_blocks}, "
-            f"util={self.utilization():.1%})"
+            f"util={self.utilization():.1%}, backend={self.backend})"
         )
