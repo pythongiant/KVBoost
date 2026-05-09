@@ -143,6 +143,12 @@ def parse_args():
     # Pre-warm
     p.add_argument("--warm", default=None,
                    help="Text to pre-warm the KV cache before accepting requests")
+    p.add_argument("--always-warm", default=None,
+                   help="Like --warm, but also re-runs the warm after every cache "
+                        "release (i.e. with --release-cache-after-request). Use to "
+                        "keep a system prompt's KV resident across requests on tight "
+                        "GPUs. Adds the warm latency to each request boundary. "
+                        "If both --warm and --always-warm are set, --always-warm wins.")
 
     # Logging
     p.add_argument("--log-level", default="info",
@@ -305,6 +311,10 @@ def main():
 
     # Don't pre-create a loop here — uvicorn will create its own. EngineWorker
     # captures the running loop in start() (the FastAPI startup hook).
+    # --always-warm wins if both are set; it's a superset of --warm.
+    warm_text = args.always_warm or args.warm
+    rewarm_text = args.always_warm
+
     worker = EngineWorker(
         engine=engine,
         max_workers=args.workers,
@@ -312,6 +322,7 @@ def main():
         max_batch_size=args.max_batch_size,
         max_queue_size=args.max_queue_size,
         release_cache_after_request=args.release_cache_after_request,
+        rewarm_text=rewarm_text,
     )
 
     app = build_app(
@@ -322,9 +333,10 @@ def main():
     )
 
     # Pre-warm synchronously before accepting requests
-    if args.warm:
-        log.info("Pre-warming KV cache ...")
-        engine.warm(args.warm)
+    if warm_text:
+        mode = "always-warm" if args.always_warm else "warm"
+        log.info("Pre-warming KV cache (%s) ...", mode)
+        engine.warm(warm_text)
         log.info("Pre-warm complete.")
 
     log.info("Starting server on %s:%d", args.host, args.port)

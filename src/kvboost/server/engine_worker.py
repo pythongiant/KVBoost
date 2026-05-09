@@ -69,6 +69,7 @@ class EngineWorker:
         max_batch_size: int = 8,
         max_queue_size: int = 256,
         release_cache_after_request: bool = False,
+        rewarm_text: Optional[str] = None,
     ) -> None:
         self.engine = engine
         self.loop = loop  # may be overridden in start() with the running loop
@@ -77,6 +78,7 @@ class EngineWorker:
             thread_name_prefix="kvboost-worker",
         )
         self._release_cache = release_cache_after_request
+        self._rewarm_text = rewarm_text
 
         self.queue = BatchQueue(
             tokenize_fn=self._tokenize,
@@ -209,6 +211,12 @@ class EngineWorker:
                 torch.cuda.empty_cache()
         except Exception as exc:
             log.debug("empty_cache failed: %s", exc)
+
+        if self._rewarm_text:
+            try:
+                self.engine.warm(self._rewarm_text)
+            except Exception as exc:
+                log.warning("rewarm after release failed: %s", exc)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
