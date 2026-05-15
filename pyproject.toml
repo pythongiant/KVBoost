@@ -41,6 +41,11 @@ dev = [
 cuda = [
     "ninja>=1.11",
 ]
+streaming = [
+    "safetensors>=0.4",
+    "huggingface_hub>=0.23",
+    "autoawq-kernels>=0.0.6 ; platform_system=='Linux' and platform_machine=='x86_64'",
+]
 server = [
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.29.0",

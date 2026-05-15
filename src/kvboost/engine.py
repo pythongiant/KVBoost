@@ -167,6 +167,8 @@ class InferenceEngine:
         cls,
         model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         strict: bool = True,
+        streaming_config: Optional["StreamingConfig"] = None,
+        awq_path: Optional[str] = None,
         **kwargs,
     ) -> "InferenceEngine":
         """
@@ -176,6 +178,13 @@ class InferenceEngine:
             model_name: Any HF decoder-only causal LM (must use RoPE).
             strict: If True (default), raise on unsupported architectures
                     and warn on untested ones. Set False to skip checks.
+            streaming_config: If provided, load weights via the streaming
+                    backend (``kvboost.streaming.StreamingCausalLM``) instead
+                    of the default fully-resident path. Layers stream from
+                    pinned host RAM under a residency policy controlled by
+                    the config. The rest of KVBoost (chunk-reuse, FlashAttn)
+                    is untouched.
+            awq_path: Optional path hint forwarded to the streaming loader.
             **kwargs: Passed to InferenceEngine.__init__().
         """
         log.info("Loading model %s ...", model_name)
@@ -183,12 +192,22 @@ class InferenceEngine:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=torch.float16,
-            low_cpu_mem_usage=True,
-        )
-        model.eval()
+        if streaming_config is not None:
+            from .streaming import StreamingCausalLM
+
+            model = StreamingCausalLM.from_pretrained(
+                model_name,
+                streaming_config=streaming_config,
+                awq_path=awq_path,
+                dtype=torch.float16,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                dtype=torch.float16,
+                low_cpu_mem_usage=True,
+            )
+            model.eval()
 
         check_model_compatibility(model, strict=strict)
 
