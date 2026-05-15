@@ -191,6 +191,60 @@ def test_pre_hook_resident_layer_is_noop():
     assert not qlin.is_bound
 
 
+def test_scheduler_primes_on_inner_forward_not_just_wrapper_forward(tmp_path):
+    """Regression: ``model.generate`` calls ``hf_model.generate`` which
+    calls ``hf_model(...)`` internally — bypassing the wrapper's
+    ``forward``. The scheduler must still be primed because the priming
+    hook is attached to ``hf_model`` itself, not to the wrapper.
+    """
+    pytest.importorskip("accelerate")
+
+    class _RecordingScheduler:
+        def __init__(self) -> None:
+            self.device = torch.device("cpu")
+            self.begin_calls = 0
+            self.before_calls: list[int] = []
+            self.after_calls: list[int] = []
+
+        def begin_forward(self) -> None:
+            self.begin_calls += 1
+
+        def before_layer(self, idx: int):
+            self.before_calls.append(idx)
+            return None  # treat as resident — no rebind
+
+        def after_layer(self, idx: int) -> None:
+            self.after_calls.append(idx)
+
+    from kvboost.streaming.config import StreamingConfig
+    from kvboost.streaming.model_shell import StreamingCausalLM
+
+    sched = _RecordingScheduler()
+    hf_model = _FakeHfModel(num_layers=2)
+    wrapper = StreamingCausalLM(
+        hf_model=hf_model,
+        streaming_config=StreamingConfig(residency_mode="partial_resident"),
+        loader=None,
+        scheduler=sched,  # type: ignore[arg-type]
+        streamed_qlinears={},  # no per-layer hooks — only the model-level priming hook
+    )
+
+    # Simulate what hf_model.generate does internally: call hf_model
+    # directly (bypassing wrapper.forward). The model-level pre-hook
+    # must still fire because it's attached to hf_model, not to the
+    # wrapper. The fake doesn't define forward(), so it raises
+    # NotImplementedError *after* the pre-hook has already run.
+    try:
+        wrapper.hf_model(torch.tensor([[1, 2, 3]]))
+    except NotImplementedError:
+        pass
+
+    assert sched.begin_calls >= 1, (
+        "scheduler.begin_forward() was not invoked by the model-level "
+        "pre-hook; generate() would skip priming"
+    )
+
+
 def test_pre_hook_missing_view_raises_clearly():
     qlin = StreamingQLinear(128, 64, group_size=32, prefer="torch")
     qlinears = {"self_attn.k_proj": qlin}

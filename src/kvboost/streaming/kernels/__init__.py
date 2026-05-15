@@ -22,6 +22,25 @@ from typing import Optional
 
 import torch
 
+
+# AutoAWQ packs 8 nibbles per int32 in this column order:
+#   col_idx = [0, 4, 1, 5, 2, 6, 3, 7]
+# See AutoAWQ awq.utils.utils.unpack_awq. We pre-compute the shift table
+# per (device, dtype) so the dequant kernel doesn't recreate it each call.
+_AWQ_BIT_ORDER: tuple[int, ...] = (0, 4, 1, 5, 2, 6, 3, 7)
+_SHIFT_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+
+
+def _shift_table(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (device, dtype)
+    cached = _SHIFT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    order = torch.tensor(_AWQ_BIT_ORDER, device=device, dtype=dtype)
+    shifts = (order * 4).view(1, 1, len(_AWQ_BIT_ORDER))
+    _SHIFT_CACHE[key] = shifts
+    return shifts
+
 from .exllama_awq import exllama_awq_linear, exllama_awq_available
 from .marlin import (
     marlin_awq_linear,
@@ -89,11 +108,7 @@ def awq_dequantize_reference(
     in_features = qweight.shape[0]
     out_features = qweight.shape[1] * pack
 
-    # AutoAWQ packs 8 nibbles per int32 in this column order:
-    #   col_idx = [0, 4, 1, 5, 2, 6, 3, 7]
-    # See AutoAWQ awq.utils.utils.unpack_awq.
-    order = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], device=qweight.device)
-    shifts = (order * 4).view(1, 1, pack)
+    shifts = _shift_table(qweight.device, qweight.dtype)
 
     qw = qweight.unsqueeze(-1)  # (in, out//pack, 1)
     unpacked = (qw >> shifts) & 0xF  # (in, out//pack, pack)

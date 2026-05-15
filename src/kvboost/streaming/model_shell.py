@@ -23,6 +23,7 @@ Modes:
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
 from typing import Any, Iterable, Optional
@@ -66,7 +67,7 @@ class StreamingCausalLM(nn.Module):
         self._streamed_qlinears = streamed_qlinears or {}
         self._hook_handles: list[Any] = []
 
-        if scheduler is not None and streamed_qlinears:
+        if scheduler is not None:
             self._install_streaming_hooks()
 
     # ── Construction ────────────────────────────────────────────────────────
@@ -106,10 +107,26 @@ class StreamingCausalLM(nn.Module):
         )
         num_layers = _detect_num_layers(cfg)
 
+        cuda_available = torch.cuda.is_available()
+        mps_available = _mps_available()
         want_streaming = (
-            streaming_config.should_stream_model(num_layers)
-            and torch.cuda.is_available()
+            streaming_config.should_stream_model(num_layers) and cuda_available
         )
+
+        # MPS unified-memory path: streaming makes no sense (CPU and GPU
+        # share RAM), but HF's AWQ loader won't work either (autoawq's
+        # CUDA kernels are missing). Build a quant-stripped skeleton,
+        # replace every decoder projection with StreamingQLinear(prefer="torch"),
+        # materialize everything resident on MPS.
+        if (not cuda_available) and mps_available and streaming_config is not None:
+            return cls._from_pretrained_mps(
+                model_name_or_path,
+                cfg=cfg,
+                streaming_config=streaming_config,
+                dtype=dtype,
+                revision=revision,
+                cache_dir=cache_dir,
+            )
 
         if not want_streaming:
             hf_model = AutoModelForCausalLM.from_pretrained(
@@ -178,15 +195,113 @@ class StreamingCausalLM(nn.Module):
             streamed_qlinears=streamed_qlinears,
         )
 
+    @classmethod
+    def _from_pretrained_mps(
+        cls,
+        model_name_or_path: str,
+        *,
+        cfg: Any,
+        streaming_config: StreamingConfig,
+        dtype: torch.dtype,
+        revision: Optional[str],
+        cache_dir: Optional[str],
+    ) -> "StreamingCausalLM":
+        """Unified-memory path for Apple Silicon.
+
+        Builds a quant-config-stripped skeleton (so HF instantiates plain
+        ``nn.Linear`` at the AWQ projection paths instead of autoawq's
+        CUDA-only WQLinear_GEMM), replaces those Linears with
+        :class:`StreamingQLinear` sized by the safetensors index, and
+        materializes everything onto MPS.
+
+        No scheduler runs — there is no separate VRAM to amortize transfers
+        against.
+        """
+        from transformers import AutoModelForCausalLM
+
+        try:
+            from accelerate import init_empty_weights
+        except ImportError as exc:
+            raise ImportError(
+                "MPS streaming path requires `accelerate`. "
+                "Install with `pip install kvboost[streaming]`."
+            ) from exc
+
+        # 1. Index the checkpoint (metadata only — no tensors loaded yet).
+        loader = AWQLoader(
+            model_name_or_path,
+            streaming_config=streaming_config,
+            revision=revision,
+            cache_dir=cache_dir,
+            device="mps",
+        )
+        loader.load()
+
+        # 2. Strip the quantization_config so HF builds plain Linear at
+        #    the q_proj / k_proj / ... paths. The autoawq class path
+        #    requires CUDA kernels at __init__ on some versions and is
+        #    pointless here anyway.
+        cfg_no_quant = copy.deepcopy(cfg)
+        for attr in ("quantization_config", "_quantization_config"):
+            if hasattr(cfg_no_quant, attr):
+                try:
+                    setattr(cfg_no_quant, attr, None)
+                except Exception:
+                    pass
+
+        with init_empty_weights():
+            hf_model = AutoModelForCausalLM.from_config(cfg_no_quant, torch_dtype=dtype)
+        hf_model.eval()
+
+        # 3. Replace standard Linears at AWQ projection paths with
+        #    StreamingQLinear sized from the safetensors index. Binds are
+        #    permanent on MPS (no slot recycling), so request the cached-
+        #    dense fast path: dequant happens once at bind, forwards are
+        #    plain matmuls. Trade: ~4× memory per projection vs packed.
+        #
+        #    The env var ``KVBOOST_MPS_CACHE_DENSE=0`` flips this off for
+        #    A/B benchmarking. Default behavior is unchanged.
+        import os
+
+        cache_dense = os.environ.get("KVBOOST_MPS_CACHE_DENSE", "1") != "0"
+        group_size = int(loader.index.quant_config.get("group_size", 128))
+        replacements = _replace_linears_for_quant_paths(
+            hf_model,
+            loader=loader,
+            group_size=group_size,
+            prefer="torch",
+            cache_dense=cache_dense,
+        )
+
+        # 4. Materialize the resident parts (embeddings, lm_head, norms,
+        #    per-layer layernorms) onto MPS.
+        loader.materialize_into_module(hf_model, only_resident=True)
+
+        # 5. Materialize any leftover meta params (biases that aren't in
+        #    safetensors, etc.) as zeros on MPS.
+        mps_device = torch.device("mps")
+        _materialize_meta_buffers(hf_model, device=mps_device, dtype=dtype)
+
+        # 6. Bind every StreamingQLinear with its permanent weights on MPS.
+        loader.bind_streaming_qlinears(replacements, device=mps_device)
+
+        # Empty streamed_qlinears dict → no hooks installed → no scheduler.
+        return cls(
+            hf_model=hf_model,
+            streaming_config=streaming_config,
+            loader=loader,
+            scheduler=None,
+            streamed_qlinears={},
+        )
+
     # ── Forward delegation ──────────────────────────────────────────────────
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
-        if self._scheduler is not None:
-            self._scheduler.begin_forward()
-        out = self.hf_model(*args, **kwargs)
-        if self._scheduler is not None:
-            torch.cuda.synchronize(self._scheduler.device)
-        return out
+        # Scheduler priming + sync happen via pre/post hooks installed on
+        # ``hf_model`` (see ``_install_streaming_hooks``), so they fire on
+        # every forward regardless of call path — including the internal
+        # forwards driven by ``hf_model.generate``.
+        return self.hf_model(*args, **kwargs)
 
     def generate(self, *args: Any, **kwargs: Any) -> Any:
         return self.hf_model.generate(*args, **kwargs)
@@ -203,19 +318,62 @@ class StreamingCausalLM(nn.Module):
     # ── Streaming hook plumbing ─────────────────────────────────────────────
 
     def _install_streaming_hooks(self) -> None:
-        """Attach a pre/post hook to each streamed HF decoder layer.
+        """Attach the per-forward scheduler-priming hook on ``hf_model`` and
+        the per-streamed-layer pre/post hooks on each decoder layer.
 
-        Pre-hook: asks the scheduler to ensure this layer's weights are
-        staged into a slot, then rebinds the layer's StreamingQLinear
+        Model-level pre-hook: calls ``scheduler.begin_forward()`` so the
+        staging pipeline is reset and the first ``num_slots`` prefetches are
+        issued. Fires on *every* forward of ``hf_model``, including the
+        token-by-token forwards driven by ``hf_model.generate`` — that's the
+        whole point of attaching here rather than overriding
+        ``StreamingCausalLM.forward``.
+
+        Model-level post-hook: ``torch.cuda.synchronize`` on the scheduler's
+        device so the caller doesn't see stale results from the transfer
+        stream.
+
+        Layer pre-hook: asks the scheduler to ensure this layer's weights
+        are staged into a slot, then rebinds the layer's StreamingQLinear
         children to that slot's views.
 
-        Post-hook: records the compute-done event and schedules the
+        Layer post-hook: records the compute-done event and schedules the
         next-but-one streamed layer's prefetch into the freed slot.
         """
         if self._scheduler is None:
             return
 
-        layers = dict(_iter_decoder_layers(self.hf_model))
+        sched = self._scheduler
+        device = sched.device
+
+        def _model_pre(_mod: nn.Module, _inputs: tuple[Any, ...]) -> None:
+            sched.begin_forward()
+
+        def _model_post(_mod: nn.Module, _inputs: tuple[Any, ...], _out: Any) -> None:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
+        # Register the model-level priming hooks first, BEFORE walking for
+        # per-layer hooks — otherwise an exception in the walker would
+        # leave the wrapper without the begin_forward hook, silently
+        # breaking generate() on CUDA.
+        self._hook_handles.append(
+            self.hf_model.register_forward_pre_hook(_model_pre, with_kwargs=False)
+        )
+        self._hook_handles.append(
+            self.hf_model.register_forward_hook(_model_post, with_kwargs=False)
+        )
+
+        if not self._streamed_qlinears:
+            return
+
+        try:
+            layers = dict(_iter_decoder_layers(self.hf_model))
+        except Exception as exc:
+            logger.warning(
+                "could not locate decoder layers for per-layer hooks: %s", exc
+            )
+            return
+
         for layer_idx, qlinears in self._streamed_qlinears.items():
             hf_layer = layers[layer_idx]
             pre = hf_layer.register_forward_pre_hook(
@@ -237,6 +395,13 @@ class StreamingCausalLM(nn.Module):
 
 
 # ── Module-tree helpers ─────────────────────────────────────────────────────
+
+
+def _mps_available() -> bool:
+    backend = getattr(torch.backends, "mps", None)
+    if backend is None:
+        return False
+    return bool(backend.is_built() and backend.is_available())
 
 
 def _detect_num_layers(config: Any) -> int:
@@ -337,6 +502,65 @@ def _replace_streamed_linears(
                 out_features=out_f,
                 group_size=group_size,
                 prefer=prefer if prefer != "auto" else "auto",
+            )
+            _set_submodule(layer, sub_path, new)
+            replacements[sub_path] = new
+        out[layer_idx] = replacements
+    return out
+
+
+def _replace_linears_for_quant_paths(
+    hf_model: nn.Module,
+    *,
+    loader: AWQLoader,
+    group_size: int,
+    prefer: str = "torch",
+    cache_dense: bool = False,
+) -> dict[int, dict[str, StreamingQLinear]]:
+    """Replace every decoder-layer projection whose AWQ quant tensors exist
+    in the loader's index with a :class:`StreamingQLinear`.
+
+    Unlike :func:`_replace_streamed_linears` (which requires the skeleton to
+    contain autoawq-style quant linears already), this variant walks the
+    safetensors index to discover the projection paths and replaces whatever
+    module is currently at that path — typically plain ``nn.Linear`` from a
+    quant-config-stripped skeleton. Used on MPS / CPU.
+
+    Pass ``cache_dense=True`` when binds are permanent (no slot recycling).
+    The replacement modules will dequantize once on first rebind and run
+    forward as a dense matmul. Costs ~4× memory per layer but eliminates
+    per-forward dequant.
+    """
+    assert loader.index is not None
+    out: dict[int, dict[str, StreamingQLinear]] = {}
+    decoder_layers = dict(_iter_decoder_layers(hf_model))
+
+    for layer_idx, layer in decoder_layers.items():
+        layer_tensors = loader.index.layers.get(layer_idx)
+        if layer_tensors is None:
+            out[layer_idx] = {}
+            continue
+
+        prefix = f"model.layers.{layer_idx}."
+        sub_paths: list[tuple[str, Any]] = []
+        for tensor_name, spec in layer_tensors.tensors.items():
+            if not tensor_name.endswith(".qweight"):
+                continue
+            if not tensor_name.startswith(prefix):
+                continue
+            sub_path = tensor_name[len(prefix):-len(".qweight")]
+            sub_paths.append((sub_path, spec))
+
+        replacements: dict[str, StreamingQLinear] = {}
+        for sub_path, qw_spec in sorted(sub_paths):
+            in_features = qw_spec.shape[0]
+            out_features = qw_spec.shape[1] * 8  # 4-bit pack=8
+            new = StreamingQLinear(
+                in_features=in_features,
+                out_features=out_features,
+                group_size=group_size,
+                prefer=prefer,
+                cache_dense=cache_dense,
             )
             _set_submodule(layer, sub_path, new)
             replacements[sub_path] = new

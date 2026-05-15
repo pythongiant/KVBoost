@@ -415,6 +415,60 @@ class AWQLoader:
             except AttributeError:
                 pass
 
+    @torch.inference_mode()
+    def bind_streaming_qlinears(
+        self,
+        layer_replacements: dict[int, dict[str, Any]],
+        *,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """One-shot bind: load each StreamingQLinear's quant tensors from
+        disk and rebind permanently.
+
+        Used by the unified-memory (MPS / CPU) path where no scheduler runs
+        — weights are materialized once on the target device and the
+        rebind never changes across forwards.
+
+        ``layer_replacements`` is ``{layer_idx: {sub_path: StreamingQLinear}}``
+        where ``sub_path`` is the within-layer dotted path (e.g.
+        ``"self_attn.q_proj"``). The corresponding safetensors keys are
+        derived as ``model.layers.{layer_idx}.{sub_path}.{kind}`` for
+        ``kind in {qweight, scales, qzeros, bias}``.
+        """
+        assert self.index is not None
+        target_device = device if device is not None else self.device_spec.device
+
+        # Group every needed tensor by its shard for one open per shard.
+        by_shard: dict[Path, list[tuple[int, str, str, TensorSpec]]] = {}
+        for layer_idx, qlinears in layer_replacements.items():
+            for sub_path in qlinears:
+                base = f"model.layers.{layer_idx}.{sub_path}"
+                for kind in ("qweight", "scales", "qzeros", "bias"):
+                    tensor_name = f"{base}.{kind}"
+                    spec = self.index.tensors.get(tensor_name)
+                    if spec is None:
+                        continue  # bias is often absent in AWQ checkpoints
+                    by_shard.setdefault(spec.path, []).append(
+                        (layer_idx, sub_path, kind, spec)
+                    )
+
+        loaded: dict[tuple[int, str, str], torch.Tensor] = {}
+        for shard_path, items in by_shard.items():
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for layer_idx, sub_path, kind, spec in items:
+                    tensor = f.get_tensor(spec.name).to(target_device)
+                    loaded[(layer_idx, sub_path, kind)] = tensor
+
+        for layer_idx, qlinears in layer_replacements.items():
+            for sub_path, qlin in qlinears.items():
+                key = (layer_idx, sub_path)
+                qlin.rebind(
+                    qweight=loaded[(*key, "qweight")],
+                    scales=loaded[(*key, "scales")],
+                    qzeros=loaded[(*key, "qzeros")],
+                    bias=loaded.get((*key, "bias")),
+                )
+
     # =========================================================================
     # Indexing
     # =========================================================================
@@ -799,19 +853,29 @@ class AWQLoader:
 
         assert self.model_dir is not None
 
+        # Legacy: standalone quantize_config.json next to the model.
         for filename in [
             "quantize_config.json",
             "quant_config.json",
         ]:
-
             path = self.model_dir / filename
-
             if path.exists():
                 with open(path) as f:
                     return json.load(f)
 
+        # Modern transformers/AutoAWQ format: quantization config is
+        # embedded inside config.json under the ``quantization_config`` key.
+        config_path = self.model_dir / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                full_config = json.load(f)
+            embedded = full_config.get("quantization_config")
+            if isinstance(embedded, dict):
+                return embedded
+
         raise FileNotFoundError(
-            "No AWQ quantization config found"
+            "No AWQ quantization config found (looked for quantize_config.json, "
+            "quant_config.json, and config.json::quantization_config)."
         )
 
     # =========================================================================
