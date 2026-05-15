@@ -65,27 +65,18 @@ class ResidentLayerRefs:
     mlp: nn.Module
 
 
-@dataclass(frozen=True)
-class StreamedLayerSpec:
-    """Metadata describing the currently staged layer blob.
-
-    The `slot` is managed externally by the staging scheduler. All pointers are
-    slot-relative and must remain stable for the lifetime of the slot storage.
+class _StreamedLayerSpec:
+    """Stand-in placeholder; the real implementation lives in
+    :mod:`kvboost.streaming.model_shell` where streamed layers are driven
+    via :class:`StreamingQLinear` rebinds and forward-pre hooks. Retained
+    here for backward-compat only; do not use in new code.
     """
 
-    slot: int
-    layer_idx: int
-    q_proj: Any
-    k_proj: Any
-    v_proj: Any
-    o_proj: Any
-    gate_proj: Any
-    up_proj: Any
-    down_proj: Any
-    input_layernorm: Any
-    post_attention_layernorm: Any
-    self_attn: Any
-    mlp: Any
+    pass
+
+
+# Backward-compatible alias so any external import keeps resolving.
+StreamedLayerSpec = _StreamedLayerSpec
 
 
 class _IdentityNorm(nn.Module):
@@ -266,10 +257,6 @@ class StreamingDecoderLayer(nn.Module):
     def _call_qlinear(self, proj: Any, x: torch.Tensor) -> torch.Tensor:
         if callable(proj):
             return proj(x)
-        if isinstance(proj, tuple) and len(proj) == 5:
-            # (qweight_ptr, scales_ptr, qzeros_ptr, bias_ptr, kernel)
-            qweight_ptr, scales_ptr, qzeros_ptr, bias_ptr, kernel = proj
-            return kernel(x, qweight_ptr, scales_ptr, qzeros_ptr, bias_ptr)
         raise TypeError(f"unsupported qlinear descriptor: {type(proj)!r}")
 
     def _call_attention(
@@ -327,6 +314,5 @@ class StreamingDecoderLayer(nn.Module):
 __all__ = [
     "LayerRunnerConfig",
     "ResidentLayerRefs",
-    "StreamedLayerSpec",
     "StreamingDecoderLayer",
 ]

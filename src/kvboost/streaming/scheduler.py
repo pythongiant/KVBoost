@@ -33,16 +33,21 @@ class StreamingLayerPlan:
 
 
 class StreamingScheduler:
-    """
-    CUDA stream scheduler for layer-by-layer weight streaming.
+    """CUDA stream scheduler for layer-by-layer weight streaming.
 
-    This class only orchestrates:
-    - transfer stream prefetch
-    - compute stream waits
-    - two-slot reuse
-    - resident layer bypass
+    Two ways to drive it:
 
-    The actual layer execution stays in the caller's run_layer_fn.
+    1. **Hook-driven** (production path used by ``StreamingCausalLM``):
+       call :meth:`begin_forward` before HF's forward, then
+       :meth:`before_layer` from each streamed layer's pre-hook and
+       :meth:`after_layer` from each post-hook. The hooks own when to
+       rebind weights into their executing module.
+
+    2. **All-in-one** (legacy / unit-test path): call :meth:`forward`
+       with the hidden state and per-layer past_kv. The scheduler walks
+       all layers itself and calls ``run_layer_fn``.
+
+    Both paths share the same prefetch + slot-recycle plumbing.
     """
 
     def __init__(
@@ -50,7 +55,7 @@ class StreamingScheduler:
         layer_specs: Sequence[LayerSpec],
         *,
         prefetch_source_fn: PrefetchSourceFn,
-        run_layer_fn: RunLayerFn,
+        run_layer_fn: Optional[RunLayerFn] = None,
         device: str | torch.device = "cuda",
         num_slots: int = 2,
         alignment: int = 16,
@@ -103,11 +108,75 @@ class StreamingScheduler:
         # Maps streamed layer index -> slot id currently holding its weights.
         self._layer_to_slot: dict[int, int] = {}
 
+    # ── Hook-driven primitives ──────────────────────────────────────────────
+
+    def begin_forward(self) -> None:
+        """Reset per-forward state and prime the first ``num_slots`` prefetches.
+
+        Must be called from compute-stream context (typically the main
+        stream) before any layer pre-hook fires.
+        """
+        self.compute_stream = torch.cuda.current_stream(device=self.device)
+        self._layer_to_slot.clear()
+        if self.streamed_indices:
+            self._prime_initial_prefetches()
+
+    def before_layer(self, layer_idx: int) -> Optional[dict[str, torch.Tensor]]:
+        """Block compute on this layer's transfer completion and return its
+        slot views. Returns ``None`` for resident layers (caller should skip).
+        """
+        plan = self.layer_plans[layer_idx]
+        if plan.resident:
+            return None
+
+        slot_id = self._layer_to_slot.get(layer_idx)
+        if slot_id is None:
+            # Late prefetch (single-slot config, or layer was missed). Stage
+            # synchronously into slot 0 so forward can proceed.
+            slot_id = self._fallback_synchronous_prefetch(layer_idx)
+
+        assert self.compute_stream is not None, "begin_forward not called"
+        self.compute_stream.wait_event(self.xfer_done[layer_idx])
+        return self.arena.slot_views(slot_id)
+
+    def after_layer(self, layer_idx: int) -> None:
+        """Record the compute-done event for this layer and schedule the
+        prefetch of the next-but-one streamed layer (i.e. ``i + num_slots``)
+        into the slot we just released.
+        """
+        plan = self.layer_plans[layer_idx]
+        if plan.resident:
+            return
+
+        slot_id = self._layer_to_slot.get(layer_idx)
+        if slot_id is None:
+            return
+
+        assert self.compute_stream is not None
+        self.compute_stream.record_event(self.compute_done[layer_idx])
+
+        # Look ahead by num_slots; that's the next streamed layer eligible to
+        # reuse the slot we're about to free.
+        next_layer = self._next_streamed_after(layer_idx, hops=self.arena.num_slots)
+        if next_layer is not None and next_layer not in self._layer_to_slot:
+            self._prefetch_streamed_layer_into_slot(
+                layer_idx=next_layer,
+                slot_id=slot_id,
+                wait_event=self.compute_done[layer_idx],
+            )
+
+    # ── Legacy all-in-one driver ────────────────────────────────────────────
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         past_kv: Sequence[Any],
     ) -> torch.Tensor:
+        if self.run_layer_fn is None:
+            raise RuntimeError(
+                "StreamingScheduler.forward requires run_layer_fn at construction; "
+                "use begin_forward/before_layer/after_layer for hook-driven mode."
+            )
         if hidden_states.device.type != "cuda":
             raise ValueError("StreamingScheduler.forward expects CUDA tensors")
 
@@ -116,23 +185,7 @@ class StreamingScheduler:
                 f"past_kv has length {len(past_kv)} but {self.num_layers} layers were provided"
             )
 
-        self.compute_stream = torch.cuda.current_stream(device=self.device)
-        self._layer_to_slot.clear()
-
-        if not self.streamed_indices:
-            # Fully resident model.
-            for i, plan in enumerate(self.layer_plans):
-                hidden_states = self.run_layer_fn(
-                    i,
-                    hidden_states,
-                    past_kv[i],
-                    None,
-                    None,
-                    plan,
-                )
-            return hidden_states
-
-        self._prime_initial_prefetches()
+        self.begin_forward()
 
         for layer_idx, plan in enumerate(self.layer_plans):
             if plan.resident:
@@ -146,36 +199,23 @@ class StreamingScheduler:
                 )
                 continue
 
+            slot_views = self.before_layer(layer_idx)
             slot_id = self._layer_to_slot[layer_idx]
-            self.compute_stream.wait_event(self.xfer_done[layer_idx])
-
             hidden_states = self.run_layer_fn(
                 layer_idx,
                 hidden_states,
                 past_kv[layer_idx],
-                self.arena.slot_views(slot_id),
+                slot_views,
                 slot_id,
                 plan,
             )
-
-            self.compute_stream.record_event(self.compute_done[layer_idx])
-
-            # Reuse the same slot for the next streamed layer after the current
-            # compute finishes. This is the slot-reuse hazard boundary.
-            next_streamed_idx = self._next_unprefetched_streamed_layer(layer_idx)
-            if next_streamed_idx is not None:
-                self._prefetch_streamed_layer_into_slot(
-                    layer_idx=next_streamed_idx,
-                    slot_id=slot_id,
-                    wait_event=self.compute_done[layer_idx],
-                )
+            self.after_layer(layer_idx)
 
         return hidden_states
 
+    # ── Internals ───────────────────────────────────────────────────────────
+
     def _prime_initial_prefetches(self) -> None:
-        """
-        Prefetch the first two streamed layers into slot 0 and slot 1.
-        """
         initial = self.streamed_indices[: self.arena.num_slots]
         for slot_id, layer_idx in enumerate(initial):
             self._prefetch_streamed_layer_into_slot(
@@ -184,17 +224,18 @@ class StreamingScheduler:
                 wait_event=None,
             )
 
-    def _next_unprefetched_streamed_layer(self, current_layer_idx: int) -> int | None:
+    def _next_streamed_after(self, current_layer_idx: int, *, hops: int = 1) -> int | None:
+        """Return the streamed layer that's ``hops`` positions after
+        ``current_layer_idx`` in the streamed-only sequence. ``hops=1`` is
+        the immediate next streamed layer.
         """
-        Return the next streamed layer index after current_layer_idx that has not
-        been scheduled into a slot yet.
-        """
-        seen = False
-        for layer_idx in self.streamed_indices:
-            if seen:
-                return layer_idx
-            if layer_idx == current_layer_idx:
-                seen = True
+        try:
+            pos = self.streamed_indices.index(current_layer_idx)
+        except ValueError:
+            return None
+        target = pos + hops
+        if 0 <= target < len(self.streamed_indices):
+            return self.streamed_indices[target]
         return None
 
     def _prefetch_streamed_layer_into_slot(
@@ -204,11 +245,7 @@ class StreamingScheduler:
         slot_id: int,
         wait_event: Optional[torch.cuda.Event],
     ) -> None:
-        """
-        Copy the given layer's weights into the selected slot on the transfer stream.
-        """
         if layer_idx in self._layer_to_slot:
-            # Already prefetched.
             return
 
         if wait_event is not None:
@@ -221,6 +258,18 @@ class StreamingScheduler:
             self.xfer_done[layer_idx].record(self.transfer_stream)
 
         self._layer_to_slot[layer_idx] = slot_id
+
+    def _fallback_synchronous_prefetch(self, layer_idx: int) -> int:
+        """Stage a layer into slot 0 synchronously. Used when the pipeline
+        has only 1 slot or the caller skipped priming.
+        """
+        slot_id = 0
+        self._prefetch_streamed_layer_into_slot(
+            layer_idx=layer_idx,
+            slot_id=slot_id,
+            wait_event=None,
+        )
+        return slot_id
 
     def debug_state(self) -> dict[str, Any]:
         return {

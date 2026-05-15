@@ -1,0 +1,207 @@
+"""Tests for the streamed-layer linear replacement + hook rebind plumbing.
+
+These run offline by faking the autoawq-style quant linear: any nn.Module
+with ``qweight`` / ``scales`` / ``qzeros`` attributes counts.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+import torch.nn as nn
+
+from kvboost.streaming.model_shell import (
+    _detect_in_out,
+    _is_quant_linear,
+    _iter_quant_linears,
+    _make_pre_hook,
+    _make_post_hook,
+    _replace_streamed_linears,
+    _set_submodule,
+)
+from kvboost.streaming.qkv_proj import StreamingQLinear
+
+
+class _FakeAwqLinear(nn.Module):
+    """Stand-in for autoawq's WQLinear_GEMM — just owns the tensor attrs."""
+
+    def __init__(self, in_features: int, out_features: int) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        pack = 8
+        self.qweight = torch.zeros(in_features, out_features // pack, dtype=torch.int32)
+        self.scales = torch.zeros(in_features // 32, out_features, dtype=torch.float16)
+        self.qzeros = torch.zeros(in_features // 32, out_features // pack, dtype=torch.int32)
+
+
+class _FakeAttn(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.q_proj = _FakeAwqLinear(128, 128)
+        self.k_proj = _FakeAwqLinear(128, 64)
+        self.v_proj = _FakeAwqLinear(128, 64)
+        self.o_proj = _FakeAwqLinear(128, 128)
+
+
+class _FakeMlp(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate_proj = _FakeAwqLinear(128, 256)
+        self.up_proj = _FakeAwqLinear(128, 256)
+        self.down_proj = _FakeAwqLinear(256, 128)
+
+
+class _FakeDecoderLayer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_layernorm = nn.LayerNorm(128)
+        self.post_attention_layernorm = nn.LayerNorm(128)
+        self.self_attn = _FakeAttn()
+        self.mlp = _FakeMlp()
+
+
+class _FakeInnerModel(nn.Module):
+    def __init__(self, num_layers: int) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(32, 128)
+        self.layers = nn.ModuleList(_FakeDecoderLayer() for _ in range(num_layers))
+        self.norm = nn.LayerNorm(128)
+
+
+class _FakeHfModel(nn.Module):
+    def __init__(self, num_layers: int) -> None:
+        super().__init__()
+        from types import SimpleNamespace
+        self.config = SimpleNamespace(num_hidden_layers=num_layers)
+        self.model = _FakeInnerModel(num_layers)
+        self.lm_head = nn.Linear(128, 32, bias=False)
+
+
+# ── Tests ───────────────────────────────────────────────────────────────────
+
+
+def test_is_quant_linear_duck_types():
+    assert _is_quant_linear(_FakeAwqLinear(64, 64))
+    assert not _is_quant_linear(nn.Linear(64, 64))
+
+
+def test_iter_quant_linears_finds_all_seven():
+    layer = _FakeDecoderLayer()
+    found = _iter_quant_linears(layer)
+    paths = sorted(p for p, _ in found)
+    assert paths == sorted([
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+    ])
+
+
+def test_detect_in_out():
+    assert _detect_in_out(_FakeAwqLinear(128, 256)) == (128, 256)
+    # If in_features attr is missing, derive from qweight shape.
+    fake = _FakeAwqLinear(128, 256)
+    delattr(fake, "in_features")
+    delattr(fake, "out_features")
+    assert _detect_in_out(fake) == (128, 256)
+
+
+def test_set_submodule_replaces_at_path():
+    layer = _FakeDecoderLayer()
+    sq = StreamingQLinear(128, 64, group_size=32, prefer="torch")
+    _set_submodule(layer, "self_attn.k_proj", sq)
+    assert layer.self_attn.k_proj is sq
+
+
+def test_replace_streamed_linears_swaps_all_projections():
+    model = _FakeHfModel(num_layers=4)
+    replacements = _replace_streamed_linears(
+        model,
+        layer_indices={1, 2},
+        group_size=32,
+        prefer="torch",
+    )
+    # Layers 1, 2 swapped; 0, 3 untouched.
+    assert set(replacements.keys()) == {1, 2}
+    for layer_idx in (1, 2):
+        assert isinstance(model.model.layers[layer_idx].self_attn.q_proj, StreamingQLinear)
+        assert len(replacements[layer_idx]) == 7
+    for layer_idx in (0, 3):
+        assert isinstance(model.model.layers[layer_idx].self_attn.q_proj, _FakeAwqLinear)
+
+
+def test_pre_hook_rebinds_streaming_qlinears():
+    """Pre-hook must populate qweight/scales/qzeros on each StreamingQLinear
+    using slot views keyed by the full safetensors path.
+    """
+    qlin = StreamingQLinear(128, 64, group_size=32, prefer="torch")
+    qlinears = {"self_attn.k_proj": qlin}
+
+    class _FakeScheduler:
+        def __init__(self) -> None:
+            self.before_calls = 0
+            self.after_calls = 0
+            pack = 8
+            self._views = {
+                "model.layers.7.self_attn.k_proj.qweight": torch.zeros(128, 64 // pack, dtype=torch.int32),
+                "model.layers.7.self_attn.k_proj.scales": torch.zeros(128 // 32, 64, dtype=torch.float16),
+                "model.layers.7.self_attn.k_proj.qzeros": torch.zeros(128 // 32, 64 // pack, dtype=torch.int32),
+            }
+
+        def before_layer(self, _idx: int):
+            self.before_calls += 1
+            return self._views
+
+        def after_layer(self, _idx: int) -> None:
+            self.after_calls += 1
+
+    sched = _FakeScheduler()
+    pre = _make_pre_hook(sched, layer_idx=7, qlinears=qlinears)
+    post = _make_post_hook(sched, layer_idx=7)
+
+    assert not qlin.is_bound
+    pre(_module=nn.Identity(), _inputs=())
+    assert qlin.is_bound
+    assert sched.before_calls == 1
+
+    post(_module=nn.Identity(), _inputs=(), _output=None)
+    assert sched.after_calls == 1
+
+
+def test_pre_hook_resident_layer_is_noop():
+    """When the scheduler reports the layer as resident (returns None),
+    the pre-hook must not attempt to rebind.
+    """
+    qlin = StreamingQLinear(128, 64, group_size=32, prefer="torch")
+    qlinears = {"self_attn.k_proj": qlin}
+
+    class _ResidentScheduler:
+        def before_layer(self, _idx: int):
+            return None
+
+        def after_layer(self, _idx: int) -> None:
+            pass
+
+    pre = _make_pre_hook(_ResidentScheduler(), layer_idx=0, qlinears=qlinears)
+    pre(_module=nn.Identity(), _inputs=())
+    assert not qlin.is_bound
+
+
+def test_pre_hook_missing_view_raises_clearly():
+    qlin = StreamingQLinear(128, 64, group_size=32, prefer="torch")
+    qlinears = {"self_attn.k_proj": qlin}
+
+    class _IncompleteScheduler:
+        def before_layer(self, _idx: int):
+            return {}  # empty — every lookup misses
+
+        def after_layer(self, _idx: int) -> None:
+            pass
+
+    pre = _make_pre_hook(_IncompleteScheduler(), layer_idx=3, qlinears=qlinears)
+    with pytest.raises(RuntimeError, match="slot views missing"):
+        pre(_module=nn.Identity(), _inputs=())

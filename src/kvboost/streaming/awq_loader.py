@@ -355,6 +355,66 @@ class AWQLoader:
     ) -> torch.Tensor:
         return self._resident_tensors[name]
 
+    def streamed_layer_indices(self) -> list[int]:
+        """Layer indices whose projection tensors are NOT resident."""
+        assert self.index is not None
+        streamed: list[int] = []
+        for layer_idx, layer in sorted(self.index.layers.items()):
+            has_streamed_proj = any(
+                ("proj" in name) and (not spec.is_resident)
+                for name, spec in layer.tensors.items()
+            )
+            if has_streamed_proj:
+                streamed.append(layer_idx)
+        return streamed
+
+    @torch.inference_mode()
+    def materialize_into_module(
+        self,
+        hf_model: "torch.nn.Module",
+        *,
+        only_resident: bool = True,
+    ) -> None:
+        """Write resident tensors into the matching submodules of ``hf_model``.
+
+        Walks each tensor that ``_apply_residency_policy`` flagged resident,
+        navigates the dotted path on ``hf_model``, and assigns the loaded
+        tensor to the leaf attribute (either as a fresh ``nn.Parameter`` or a
+        plain attribute, depending on what's there).
+
+        This is the bridge that lets us use ``accelerate.init_empty_weights``
+        for the skeleton and then selectively materialize only the layers that
+        should live in VRAM.
+        """
+        assert self.index is not None
+
+        wanted = [
+            spec for spec in self.index.tensors.values()
+            if (spec.is_resident if only_resident else True)
+        ]
+
+        by_shard: dict[Path, list[TensorSpec]] = {}
+        for spec in wanted:
+            by_shard.setdefault(spec.path, []).append(spec)
+
+        for shard_path, specs in by_shard.items():
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for spec in specs:
+                    tensor = f.get_tensor(spec.name)
+                    tensor = tensor.to(
+                        self.device_spec.device,
+                        non_blocking=False,
+                    )
+                    _assign_dotted_attribute(hf_model, spec.name, tensor)
+
+        # Re-alias tied embeddings if they were materialized separately.
+        if self.index.tied_embeddings:
+            try:
+                embed = _resolve_dotted_attribute(hf_model, "model.embed_tokens.weight")
+                _assign_dotted_attribute(hf_model, "lm_head.weight", embed)
+            except AttributeError:
+                pass
+
     # =========================================================================
     # Indexing
     # =========================================================================
@@ -774,3 +834,53 @@ class AWQLoader:
                 return int(parts[i + 1])
 
         return None
+
+
+# =============================================================================
+# Module-tree helpers (free functions — used by materialize_into_module and
+# the streaming layer-replacement walker in model_shell.py)
+# =============================================================================
+
+
+def _resolve_dotted_attribute(root: "torch.nn.Module", dotted: str) -> Any:
+    parts = dotted.split(".")
+    obj: Any = root
+    for p in parts:
+        obj = getattr(obj, p)
+    return obj
+
+
+def _assign_dotted_attribute(
+    root: "torch.nn.Module",
+    dotted: str,
+    value: torch.Tensor,
+) -> None:
+    """Navigate ``root`` to the parent of the dotted path and set the leaf.
+
+    If the leaf currently exists as an ``nn.Parameter``, wrap ``value`` in a
+    fresh ``nn.Parameter`` so PyTorch's parameter machinery (and state_dict)
+    continues to see it. Otherwise plain ``setattr``.
+
+    Handles meta-device parameters from ``accelerate.init_empty_weights``:
+    those land in ``module._parameters`` and we replace them in-place.
+    """
+    import torch.nn as nn
+
+    parts = dotted.split(".")
+    parent: Any = root
+    for p in parts[:-1]:
+        parent = getattr(parent, p)
+    leaf = parts[-1]
+
+    existing = None
+    if isinstance(parent, nn.Module):
+        existing = parent._parameters.get(leaf)
+    if existing is None and hasattr(parent, leaf):
+        existing = getattr(parent, leaf)
+
+    if isinstance(existing, nn.Parameter):
+        parent._parameters[leaf] = nn.Parameter(value, requires_grad=False)
+    elif isinstance(parent, nn.Module) and leaf in parent._buffers:
+        parent._buffers[leaf] = value
+    else:
+        setattr(parent, leaf, value)
