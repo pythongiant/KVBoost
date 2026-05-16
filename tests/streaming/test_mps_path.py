@@ -224,6 +224,61 @@ def test_bound_streaming_qlinear_runs_forward(tmp_path):
     assert out.shape == (2, 16)
 
 
+def test_materialize_skips_quant_projections_by_default(tmp_path):
+    """Regression: ``materialize_into_module`` must not write the packed
+    AWQ tensors (``*.qweight``/``*.scales``/``*.qzeros``) onto submodules.
+    Those tensors are bound separately via ``bind_streaming_qlinears`` into
+    the StreamingQLinear's ``_qweight`` etc. slots. If materialize also
+    assigns them via ``setattr``, we get a second on-device copy that
+    nothing reads — pure VRAM waste (~2 GiB on a 32B model).
+    """
+    loader = _make_loader(tmp_path, num_layers=2)
+    model = _FakeHfModel(num_layers=2)
+
+    # Replace projections with StreamingQLinear (this is what the streaming
+    # path does before calling materialize).
+    replacements = _replace_linears_for_quant_paths(
+        model, loader=loader, group_size=8, prefer="torch",
+    )
+
+    # Materialize with the default (skip_quant_projections=True).
+    loader.materialize_into_module(model, only_resident=False)
+
+    # Verify the StreamingQLinears were NOT polluted with bare-attribute
+    # qweight/scales/qzeros tensors. Their packed slots should still be
+    # empty (only ``bind_streaming_qlinears`` fills those).
+    for layer_idx, layer_repl in replacements.items():
+        for sub_path, qlin in layer_repl.items():
+            # _qweight is the bound slot; should be None pre-bind.
+            assert qlin._qweight is None, (
+                f"layer {layer_idx} {sub_path}: _qweight set without bind"
+            )
+            # And NO bare-attribute pollution either.
+            for attr in ("qweight", "scales", "qzeros"):
+                assert not hasattr(qlin, attr) or getattr(qlin, attr) is None, (
+                    f"layer {layer_idx} {sub_path}: bare .{attr} attr leaked"
+                )
+
+
+def test_materialize_with_skip_disabled_does_assign_projections(tmp_path):
+    """The opt-out exists for callers that genuinely want to write
+    projections via setattr (e.g. when the target is autoawq's
+    WQLinear_GEMM with real qweight buffers).
+    """
+    loader = _make_loader(tmp_path, num_layers=1)
+    # Use a raw _FakeHfModel WITHOUT replacing — q_proj is plain nn.Linear,
+    # which doesn't have a qweight slot. setattr should set a bare attribute.
+    model = _FakeHfModel(num_layers=1)
+
+    loader.materialize_into_module(
+        model, only_resident=False, skip_quant_projections=False,
+    )
+
+    # Projections should now have qweight as a bare attribute (since the
+    # plain Linear doesn't pre-declare one).
+    assert hasattr(model.model.layers[0].self_attn.q_proj, "qweight")
+
+
 def test_iter_decoder_layers_on_fake_skeleton():
     model = _FakeHfModel(num_layers=4)
     pairs = _iter_decoder_layers(model)

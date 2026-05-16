@@ -374,6 +374,7 @@ class AWQLoader:
         hf_model: "torch.nn.Module",
         *,
         only_resident: bool = True,
+        skip_quant_projections: bool = True,
     ) -> None:
         """Write resident tensors into the matching submodules of ``hf_model``.
 
@@ -385,12 +386,31 @@ class AWQLoader:
         This is the bridge that lets us use ``accelerate.init_empty_weights``
         for the skeleton and then selectively materialize only the layers that
         should live in VRAM.
+
+        ``skip_quant_projections`` (default True) skips ``*.qweight``,
+        ``*.scales``, ``*.qzeros`` tensors. When the streaming pipeline
+        replaces projection modules with :class:`StreamingQLinear` (which
+        has no ``qweight`` parameter slot), naively assigning those tensors
+        via ``setattr`` creates **orphaned duplicate** allocations — they
+        sit on the new module as bare attributes while the real binding
+        happens later via :meth:`bind_streaming_qlinears` into the
+        ``_qweight`` / ``_scales`` / ``_qzeros`` slots. Skipping them here
+        avoids that double-allocation (~2 GiB for a 32B model with 8
+        resident layers).
         """
         assert self.index is not None
+
+        def _is_quant_proj(name: str) -> bool:
+            return (
+                name.endswith(".qweight")
+                or name.endswith(".scales")
+                or name.endswith(".qzeros")
+            )
 
         wanted = [
             spec for spec in self.index.tensors.values()
             if (spec.is_resident if only_resident else True)
+            and not (skip_quant_projections and _is_quant_proj(spec.name))
         ]
 
         by_shard: dict[Path, list[TensorSpec]] = {}
