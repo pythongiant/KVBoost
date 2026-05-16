@@ -485,13 +485,80 @@ def _mps_available() -> bool:
     return bool(backend.is_built() and backend.is_available())
 
 
+_LAYER_COUNT_ATTRS = (
+    "num_hidden_layers",
+    "num_decoder_layers",
+    "n_layer",
+    "n_layers",
+    "num_layers",
+    "decoder_layers",
+)
+_NESTED_CONFIG_ATTRS = (
+    "text_config",
+    "llm_config",
+    "decoder_config",
+    "language_config",
+    "thinker_config",
+)
+
+
 def _detect_num_layers(config: Any) -> int:
-    for attr in ("num_hidden_layers", "n_layer", "num_layers"):
+    """Walk a HF ``PretrainedConfig`` looking for the decoder layer count.
+
+    Tries a wide set of attribute names first (different architectures use
+    different ones), then recurses one level into known sub-config
+    attributes for multi-modal / nested configs (Qwen3.5, Llama-4, etc.).
+    Falls back to scanning ``config.to_dict()`` for any ``num_hidden_layers``
+    / ``num_layers`` / ``n_layer`` key at any depth.
+    """
+    # 1. Direct attribute lookup
+    for attr in _LAYER_COUNT_ATTRS:
         n = getattr(config, attr, None)
         if isinstance(n, int) and n > 0:
             return n
+
+    # 2. Recurse into nested sub-configs (one level)
+    for sub_attr in _NESTED_CONFIG_ATTRS:
+        sub = getattr(config, sub_attr, None)
+        if sub is None:
+            continue
+        for attr in _LAYER_COUNT_ATTRS:
+            n = getattr(sub, attr, None)
+            if isinstance(n, int) and n > 0:
+                return n
+
+    # 3. Last resort: dict scan at any depth
+    try:
+        cfg_dict = config.to_dict()
+    except Exception:
+        cfg_dict = {}
+
+    def _scan(d: Any) -> Optional[int]:
+        if isinstance(d, dict):
+            for key in _LAYER_COUNT_ATTRS:
+                v = d.get(key)
+                if isinstance(v, int) and v > 0:
+                    return v
+            for v in d.values():
+                hit = _scan(v)
+                if hit is not None:
+                    return hit
+        elif isinstance(d, list):
+            for v in d:
+                hit = _scan(v)
+                if hit is not None:
+                    return hit
+        return None
+
+    hit = _scan(cfg_dict)
+    if hit is not None:
+        return hit
+
     raise ValueError(
-        f"could not detect number of decoder layers from config {type(config).__name__}"
+        f"could not detect number of decoder layers from config "
+        f"{type(config).__name__}. Tried attrs={_LAYER_COUNT_ATTRS}, "
+        f"sub-configs={_NESTED_CONFIG_ATTRS}, and a recursive dict scan. "
+        f"Top-level config keys: {sorted(cfg_dict.keys())[:20]}…"
     )
 
 
