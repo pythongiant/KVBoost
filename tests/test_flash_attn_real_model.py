@@ -46,7 +46,7 @@ def tinyllama():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        dtype=torch.float32,   # float32 so CPU attention is numerically stable
+        torch_dtype=torch.float32,   # float32 so CPU attention is numerically stable
         low_cpu_mem_usage=True,
     )
     model = model.to("cpu")

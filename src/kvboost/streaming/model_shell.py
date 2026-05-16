@@ -131,7 +131,7 @@ class StreamingCausalLM(nn.Module):
         if not want_streaming:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_name_or_path,
-                dtype=dtype,
+                torch_dtype=dtype,
                 low_cpu_mem_usage=True,
                 revision=revision,
                 cache_dir=cache_dir,

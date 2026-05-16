@@ -62,7 +62,7 @@ def _run_kvboost(
     model = StreamingCausalLM.from_pretrained(
         model_id,
         streaming_config=StreamingConfig(),
-        dtype=torch.float16,
+        torch_dtype=torch.float16,
     )
     load_s = time.perf_counter() - t0
 

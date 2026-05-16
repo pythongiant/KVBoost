@@ -204,7 +204,7 @@ class InferenceEngine:
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                dtype=torch.float16,
+                torch_dtype=torch.float16,
                 low_cpu_mem_usage=True,
             )
             model.eval()

@@ -497,7 +497,7 @@ def _run_baseline(
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(model)
     hf_model = AutoModelForCausalLM.from_pretrained(
-        model, dtype=torch.float16 if device in ("cuda", "mps") else torch.float32
+        model, torch_dtype=torch.float16 if device in ("cuda", "mps") else torch.float32
     ).to(device)
     hf_model.eval()
 

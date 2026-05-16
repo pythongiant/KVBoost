@@ -33,7 +33,7 @@ def test_full_resident_parity_with_hf():
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
     inputs = tok("Hello world.", return_tensors="pt").to("cuda")
 
-    hf_model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float16).cuda()
+    hf_model = AutoModelForCausalLM.from_pretrained(MODEL_ID,torch_dtype=torch.float16).cuda()
     hf_model.eval()
     with torch.inference_mode():
         ref_logits = hf_model(**inputs).logits
