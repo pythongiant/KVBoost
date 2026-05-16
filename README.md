@@ -19,6 +19,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> &bull;
+  <a href="#awq-layer-streaming-run-models-bigger-than-vram">AWQ Streaming</a> &bull;
   <a href="#benchmarks">Benchmarks</a> &bull;
   <a href="#how-it-works">How it works</a> &bull;
   <a href="#when-kvboost-helps-and-when-it-doesnt">When it helps</a> &bull;
@@ -157,6 +158,142 @@ print(engine.paged_stats())
 ```
 
 `CPUPagedEngine` inherits all of KVBoost's chunk hashing, recompute strategies, and KV quantization — only the decode loop changes.
+
+---
+
+## AWQ Layer Streaming (run models bigger than VRAM)
+
+KVBoost can run AWQ-quantized models whose weights **do not fit in GPU VRAM** by streaming layer weights from pinned host RAM into a pair of CUDA staging slots on demand. Embeddings, LM head, layernorms, and a configurable handful of "always-resident" decoder layers (first `keep_first_k` + last `keep_last_k`) stay in VRAM. The remaining decoder layers' projection weights live in host RAM and are DMA'd into a staging slot just before that layer's forward fires.
+
+It's a **VRAM savings** feature, not a throughput feature. Use this when the model wouldn't otherwise load at all.
+
+### Install
+
+```bash
+pip install "kvboost[streaming]"
+# adds: safetensors, huggingface_hub, accelerate; on Linux x86, autoawq-kernels
+```
+
+### Run a 32B model on an 8 GB GPU
+
+```bash
+PYTHONPATH=src python -m kvboost.streaming.demo_partial_8b \
+    --model Qwen/Qwen2.5-32B-Instruct-AWQ \
+    --keep-first-k 4 --keep-last-k 4 \
+    --prompt "Explain entropy in two sentences." \
+    --max-new-tokens 32 --verbose
+```
+
+Real output on an 8 GB GPU (Qwen2.5-32B-Instruct-AWQ, ~19 GB packed):
+
+```
+INFO:kvboost.streaming.model_shell:Replaced projections:
+    56 resident across 8 layers, 392 streamed across 56 layers
+  load_time: 10.7s
+  peak_vram_after_load: 5.65 GB
+  prompt_tokens: 7
+
+--- warm-up prefill ---
+  prefill_time: 67.71s
+
+--- generation ---
+ Ent
+  [  1/32] Δ_last= 12059ms  running= 0.08 tok/s
+ropy is a measure of the disorder
+  [  8/32] Δ_last= 10551ms  running= 0.11 tok/s
+ or randomness in a system. It can
+  [ 16/32] Δ_last=  9729ms  running= 0.11 tok/s
+ also be thought of as the amount of
+  [ 24/32] Δ_last=  7595ms  running= 0.11 tok/s
+ energy in a system that is unavailable for
+  [ 32/32] Δ_last=  7758ms  running= 0.11 tok/s
+
+--- summary ---
+  new_tokens:              32
+  total_decode_time:       304.05s
+  avg_tok_per_s:           0.11
+  first_token_latency:     12059ms
+  steady_state_ms_per_tok: 9419ms
+  steady_state_tok_per_s:  0.11
+  peak_vram_during_decode: 6.13 GB
+```
+
+The 32B model is **~2.4× larger than the GPU** and runs end-to-end without OOM. Output is fully coherent; throughput is ~0.11 tok/s because each token DMAs ~13 GB of weight bytes from host RAM and dequantizes them in a chunked torch fallback (no fused Marlin kernel on this box). On a system with `autoawq-kernels` installed and the resident-layer count tuned higher, expect ~1–3 tok/s for a 32B-class model.
+
+### Programmatic use
+
+```python
+from kvboost.streaming import StreamingCausalLM, StreamingConfig
+import torch
+
+model = StreamingCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-32B-Instruct-AWQ",
+    streaming_config=StreamingConfig(
+        residency_mode="partial_resident",
+        keep_first_k=4,
+        keep_last_k=4,
+    ),
+    dtype=torch.float16,
+)
+# Behaves like a plain HF causal LM: model.generate(...), model(input_ids=...), etc.
+```
+
+Or layer the rest of KVBoost on top via the engine:
+
+```python
+from kvboost import KVBoost
+from kvboost.streaming import StreamingConfig
+
+engine = KVBoost.from_pretrained(
+    "Qwen/Qwen2.5-32B-Instruct-AWQ",
+    streaming_config=StreamingConfig(keep_first_k=4, keep_last_k=4),
+    max_cache_bytes=1 * 1024**3,
+)
+result = engine.generate("...", max_new_tokens=64)
+```
+
+### How it works
+
+| Phase | Where the bytes live | What runs |
+|---|---|---|
+| Indexing | safetensors on disk (memory-mapped) | `AWQLoader` builds a tensor-name → shard-offset map without loading anything |
+| Resident materialization | GPU VRAM | Embeddings, LM head, all layernorms, and the projection weights of the first `keep_first_k` + last `keep_last_k` decoder layers are loaded once into `StreamingQLinear` modules |
+| Streamed staging | Host pinned RAM | Remaining layers' AWQ-packed projections (`qweight`/`scales`/`qzeros`) are pinned for async DMA |
+| Per-forward DMA | CUDA staging slots (2 × max layer size) | A `forward_pre_hook` on each streamed decoder layer asks the scheduler to DMA the next layer's weights into a slot on a dedicated transfer stream, then rebinds that layer's `StreamingQLinear` children to the slot views — Marlin's launch-config cache stays valid because the slot pointer is constant across forwards |
+| Per-projection compute | GPU | Chunked, fused dequant+matmul keeps peak per-call memory to ~20 MB instead of the ~280 MB a dense materialization would need |
+
+### Configuration
+
+```python
+StreamingConfig(
+    residency_mode="partial_resident",   # full_resident | partial_resident | ffn_only_stream | full_stream
+    keep_first_k=4,                      # decoder layers that stay in VRAM (head of network)
+    keep_last_k=4,                       # decoder layers that stay in VRAM (tail)
+    n_staging_slots=2,                   # 2 = full pipelining; 1 = serial fallback
+    quant_kernel="auto",                 # auto | marlin | exllama_v2 | torch
+)
+```
+
+| Knob | Effect |
+|---|---|
+| `keep_first_k` / `keep_last_k` | More resident = faster, more VRAM. With 32B on 8 GB the sweet spot is ~4 each; on a 4 GB GPU drop to 2 each |
+| `residency_mode="ffn_only_stream"` | Attention weights resident, FFN weights streamed (FFN dominates layer bytes 2:1) — less peak VRAM at the same throughput |
+| `quant_kernel="auto"` | Probes for Marlin / ExLlamaV2 at import time, falls back to a pure-torch chunked dequant if neither is available |
+
+### Honest expectations
+
+- **Throughput is PCIe-bound, not compute-bound.** A 32B AWQ model with 56 streamed layers needs ~13 GB of host→GPU DMA per token. PCIe 4.0 x16 (~32 GB/s) caps that at ~2.5 tok/s in the limit; without a fused dequant kernel you'll see ~0.1–1 tok/s.
+- **First token is slow.** Prefill walks every layer once with cold staging; expect 10–60 s TTFT depending on prompt length and layer count. Subsequent tokens are at steady-state speed.
+- **Pinned host RAM is required.** For 32B AWQ you'll pin ~19 GB of host RAM. Containers often default `ulimit -l` to 64 MB — set `ulimit -l unlimited` (or raise the cgroup `memory.lock_limit`) before running.
+- **Unified-memory devices skip streaming.** On Apple Silicon (MPS) there is no separate VRAM, so the streaming pipeline auto-disables and weights are bound once to MPS. The wrapper still works as a way to load AWQ checkpoints HF can't load natively on Mac.
+
+### Files
+
+- [src/kvboost/streaming/model_shell.py](src/kvboost/streaming/model_shell.py) — `StreamingCausalLM`, the wrapper + layer-replacement walker
+- [src/kvboost/streaming/scheduler.py](src/kvboost/streaming/scheduler.py) — `StreamingScheduler` with `begin_forward` / `before_layer` / `after_layer` primitives
+- [src/kvboost/streaming/staging.py](src/kvboost/streaming/staging.py) — staging-slot arena and layout
+- [src/kvboost/streaming/awq_loader.py](src/kvboost/streaming/awq_loader.py) — safetensors indexing, pinned-host loading, marlin repack cache
+- [src/kvboost/streaming/kernels/](src/kvboost/streaming/kernels/) — Marlin / ExLlamaV2 wrappers + chunked torch fallback
 
 ---
 
