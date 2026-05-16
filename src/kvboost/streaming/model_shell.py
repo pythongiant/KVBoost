@@ -159,55 +159,97 @@ class StreamingCausalLM(nn.Module):
                 "Install with `pip install kvboost[streaming]`."
             ) from exc
 
+        # Strip quantization_config before from_config. Otherwise HF's AWQ
+        # integration fires and constructs autoawq's WQLinear_GEMM at every
+        # projection path — and that class allocates real CUDA buffers in
+        # __init__ regardless of init_empty_weights (it passes an explicit
+        # device). Even after we replace the streamed-layer modules, the
+        # transient CUDA allocation taints peak-memory measurement (no real
+        # VRAM savings) and pulls in autoawq's per-layer kernel state.
+        #
+        # With the config stripped, from_config builds plain nn.Linear on
+        # meta. We then replace ALL projection paths (resident + streamed)
+        # with StreamingQLinear, sized via the safetensors index. Resident
+        # layers are bound once via bind_streaming_qlinears; streamed
+        # layers are bound per-forward by the scheduler hooks.
+        cfg_no_quant = copy.deepcopy(cfg)
+        for attr in ("quantization_config", "_quantization_config"):
+            if hasattr(cfg_no_quant, attr):
+                try:
+                    setattr(cfg_no_quant, attr, None)
+                except Exception:
+                    pass
+
         with init_empty_weights():
-            hf_model = AutoModelForCausalLM.from_config(cfg, torch_dtype=dtype)
+            hf_model = AutoModelForCausalLM.from_config(cfg_no_quant, torch_dtype=dtype)
         hf_model.eval()
 
-        # 1. Replace streamed layers' quant linears BEFORE materializing —
-        #    that way we don't accidentally materialize tensors we're about
-        #    to throw away.
-        #
-        #    We use the *index-based* walker (not the duck-type walker)
-        #    because ``AutoModelForCausalLM.from_config`` under
-        #    ``init_empty_weights`` does NOT always trigger HF's AWQ
-        #    integration — depending on the transformers version, the
-        #    skeleton's projections may be plain ``nn.Linear`` rather than
-        #    ``WQLinear_GEMM``. The index walker discovers projection paths
-        #    from the safetensors keys, which works for both.
         streamed_indices = set(loader.streamed_layer_indices())
+        resident_indices = set(loader.index.layers.keys()) - streamed_indices
         group_size = int(loader.index.quant_config.get("group_size", 128))
+
+        # 1. Replace streamed-layer projections with StreamingQLinear
+        #    (cache_dense=False so the scheduler can rebind per-forward).
         streamed_qlinears = _replace_linears_for_quant_paths(
             hf_model,
             loader=loader,
             group_size=group_size,
             prefer=streaming_config.quant_kernel,
-            cache_dense=False,  # CUDA: weights change per slot, can't cache
+            cache_dense=False,
             layer_indices=streamed_indices,
         )
-
-        # Diagnostic: if zero replacements happened, the streaming pipeline
-        # is silently a no-op. Fail loudly rather than producing wrong logits.
-        total_replaced = sum(len(v) for v in streamed_qlinears.values())
-        if streamed_indices and total_replaced == 0:
-            raise RuntimeError(
-                f"Streaming path tried to replace projections in "
-                f"{len(streamed_indices)} layers but replaced 0 modules. "
-                f"The safetensors index either has no qweight tensors or no "
-                f"layers were matched. Aborting before producing garbage."
-            )
-        logger.info(
-            "Replaced %d quant projections across %d streamed layers",
-            total_replaced,
-            len(streamed_qlinears),
+        # 2. Replace resident-layer projections too — also StreamingQLinear,
+        #    but bound once permanently. cache_dense=False keeps the weights
+        #    packed (~4× less VRAM than fp16 dense); forward pays torch
+        #    dequant per call, which on resident layers is the price of not
+        #    depending on autoawq's CUDA kernel.
+        resident_qlinears = _replace_linears_for_quant_paths(
+            hf_model,
+            loader=loader,
+            group_size=group_size,
+            prefer="torch",
+            cache_dense=False,
+            layer_indices=resident_indices,
         )
 
-        # 2. Materialize resident tensors onto GPU.
+        total_streamed = sum(len(v) for v in streamed_qlinears.values())
+        total_resident = sum(len(v) for v in resident_qlinears.values())
+        if (streamed_indices or resident_indices) and (total_streamed + total_resident) == 0:
+            raise RuntimeError(
+                "Streaming path replaced 0 projection modules. The safetensors "
+                "index has no qweight tensors at the expected paths."
+            )
+        logger.info(
+            "Replaced projections: %d resident across %d layers, "
+            "%d streamed across %d layers",
+            total_resident, len(resident_qlinears),
+            total_streamed, len(streamed_qlinears),
+        )
+
+        # 3. Materialize non-quant resident tensors (embeds, lm_head,
+        #    final norm, per-layer layernorms, qkv biases on resident
+        #    layers) onto GPU. Quant projection tensors (qweight/scales/
+        #    qzeros) are skipped here — they're bound directly into the
+        #    StreamingQLinear modules below, which don't have parameter
+        #    slots for `_assign_dotted_attribute` to write into.
         loader.materialize_into_module(hf_model, only_resident=True)
 
-        # 3. Move any remaining meta params on resident submodules off meta.
+        # 4. Zero out any remaining meta params (rotary inv_freq is a
+        #    buffer initialized in __init__, not a meta param; safety net
+        #    for things we didn't enumerate).
         _materialize_meta_buffers(hf_model, device=loader.device_spec.device, dtype=dtype)
 
-        # 4. Build the scheduler that drives the staged DMA.
+        # 5. One-shot bind for the resident-layer StreamingQLinears: load
+        #    their packed AWQ tensors from disk and call .rebind() once.
+        if resident_qlinears:
+            loader.bind_streaming_qlinears(
+                resident_qlinears,
+                device=loader.device_spec.device,
+            )
+
+        # 6. Build the scheduler that drives the per-forward DMA for
+        #    streamed layers. begin_forward/before_layer/after_layer fire
+        #    from the hooks installed below.
         scheduler = _build_scheduler(
             hf_model,
             loader=loader,

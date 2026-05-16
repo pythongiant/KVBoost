@@ -732,6 +732,7 @@ class AWQLoader:
             return torch.load(
                 cache_path,
                 map_location="cpu",
+                weights_only=True,
             )
 
         logger.info(
