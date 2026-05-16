@@ -136,7 +136,9 @@ def test_replace_streamed_linears_swaps_all_projections():
 
 def test_pre_hook_rebinds_streaming_qlinears():
     """Pre-hook must populate qweight/scales/qzeros on each StreamingQLinear
-    using slot views keyed by the full safetensors path.
+    using slot views keyed by *layer-relative* paths (the layout strips the
+    ``model.layers.{i}.`` prefix so layer schemas match across the streamed
+    sequence — see ``_build_scheduler`` in model_shell.py).
     """
     qlin = StreamingQLinear(128, 64, group_size=32, prefer="torch")
     qlinears = {"self_attn.k_proj": qlin}
@@ -147,9 +149,9 @@ def test_pre_hook_rebinds_streaming_qlinears():
             self.after_calls = 0
             pack = 8
             self._views = {
-                "model.layers.7.self_attn.k_proj.qweight": torch.zeros(128, 64 // pack, dtype=torch.int32),
-                "model.layers.7.self_attn.k_proj.scales": torch.zeros(128 // 32, 64, dtype=torch.float16),
-                "model.layers.7.self_attn.k_proj.qzeros": torch.zeros(128 // 32, 64 // pack, dtype=torch.int32),
+                "self_attn.k_proj.qweight": torch.zeros(128, 64 // pack, dtype=torch.int32),
+                "self_attn.k_proj.scales": torch.zeros(128 // 32, 64, dtype=torch.float16),
+                "self_attn.k_proj.qzeros": torch.zeros(128 // 32, 64 // pack, dtype=torch.int32),
             }
 
         def before_layer(self, _idx: int):

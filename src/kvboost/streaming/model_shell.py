@@ -34,6 +34,7 @@ import torch.nn as nn
 from .awq_loader import (
     AWQLoader,
     LayerSpec,
+    TensorSpec,
     _assign_dotted_attribute,
     _resolve_dotted_attribute,
 )
@@ -615,28 +616,52 @@ def _build_scheduler(
     # Only stream the *projection* tensors. Layernorms and biases for
     # streamed layers are tiny and already resident; keep them out of the
     # slot layout so per-DMA bytes stay equal to the proj sum.
+    #
+    # IMPORTANT: SlotLayout cross-validates that every streamed layer has
+    # the same tensor schema. The keys in spec.tensors are full safetensors
+    # paths ("model.layers.{i}.self_attn.q_proj.qweight"), so they differ
+    # between layers by the layer index alone. Strip that prefix so the
+    # schema check sees identical keys across layers — and remember to do
+    # the matching strip in prefetch_source_fn and the pre-hook below.
     layer_specs_streaming: list[LayerSpec] = []
     for spec in layer_specs:
         if spec.resident:
             layer_specs_streaming.append(spec)
             continue
+        normalized: dict[str, TensorSpec] = {}
+        for full_key, tspec in spec.tensors.items():
+            if "proj" not in full_key:
+                continue
+            if tspec.is_resident:
+                continue
+            sub_path = _strip_layer_prefix(full_key, spec.layer_idx)
+            normalized[sub_path] = TensorSpec(
+                name=sub_path,
+                path=tspec.path,
+                shape=tspec.shape,
+                dtype=tspec.dtype,
+                layer_idx=tspec.layer_idx,
+                is_quantized=tspec.is_quantized,
+                is_resident=tspec.is_resident,
+                nbytes=tspec.nbytes,
+            )
         proj_only = LayerSpec(
             layer_idx=spec.layer_idx,
-            tensors={
-                k: v for k, v in spec.tensors.items()
-                if "proj" in k and not v.is_resident
-            },
+            tensors=normalized,
             resident=False,
         )
         layer_specs_streaming.append(proj_only)
 
     def prefetch_source_fn(layer_idx: int) -> dict[str, torch.Tensor]:
         # AWQLoader.pin_layer returns full safetensors keys
-        # ("model.layers.{i}.self_attn.q_proj.qweight"). The slot layout
-        # uses the same keys (built from the same TensorSpec.name), so no
-        # renaming is needed — return as-is filtering to proj tensors only.
+        # ("model.layers.{i}.self_attn.q_proj.qweight"). Normalize to the
+        # same layer-relative form the slot layout was built with.
         raw = loader.pin_layer(layer_idx)
-        return {k: v for k, v in raw.items() if "proj" in k}
+        return {
+            _strip_layer_prefix(k, layer_idx): v
+            for k, v in raw.items()
+            if "proj" in k
+        }
 
     try:
         return StreamingScheduler(
@@ -646,8 +671,25 @@ def _build_scheduler(
             num_slots=streaming_config.n_staging_slots,
         )
     except Exception as exc:
-        logger.warning("scheduler construction failed: %s", exc)
-        return None
+        # Hard fail. A silent fallback here leaves the model with mostly
+        # meta-device parameters and produces garbage logits at forward
+        # time — much better to surface the real error.
+        raise RuntimeError(
+            f"streaming scheduler construction failed: {exc}. "
+            "The streamed model would have undefined weights; refusing to "
+            "return a broken wrapper."
+        ) from exc
+
+
+def _strip_layer_prefix(name: str, layer_idx: int) -> str:
+    """``model.layers.{i}.self_attn.q_proj.qweight`` → ``self_attn.q_proj.qweight``.
+
+    The streaming pipeline keys slot views by *layer-relative* paths so the
+    slot layout's per-layer schema check sees identical keys regardless of
+    which layer is staged.
+    """
+    prefix = f"model.layers.{layer_idx}."
+    return name[len(prefix):] if name.startswith(prefix) else name
 
 
 def _make_pre_hook(
@@ -658,28 +700,26 @@ def _make_pre_hook(
     """Pre-hook: stage this layer's weights and rebind StreamingQLinears.
 
     ``qlinears`` maps the sub-path within the decoder layer (e.g.
-    ``"self_attn.q_proj"``) to the StreamingQLinear we installed. We use
-    that path to derive the full safetensors key
-    (``"model.layers.{i}.{sub_path}.{kind}"``) that indexes into the slot
-    views the arena returns.
+    ``"self_attn.q_proj"``) to the StreamingQLinear we installed. Slot
+    views are keyed by layer-relative paths
+    (``"{sub_path}.{kind}"``), matching what the arena layout was built
+    with in :func:`_build_scheduler`.
     """
 
     def hook(_module: nn.Module, _inputs: tuple[Any, ...]) -> None:
         slot_views = scheduler.before_layer(layer_idx)
         if slot_views is None:
             return
-        prefix = f"model.layers.{layer_idx}."
         for sub_path, qlin in qlinears.items():
             try:
-                qweight = slot_views[f"{prefix}{sub_path}.qweight"]
-                scales = slot_views[f"{prefix}{sub_path}.scales"]
-                qzeros = slot_views[f"{prefix}{sub_path}.qzeros"]
+                qweight = slot_views[f"{sub_path}.qweight"]
+                scales = slot_views[f"{sub_path}.scales"]
+                qzeros = slot_views[f"{sub_path}.qzeros"]
             except KeyError as exc:
                 raise RuntimeError(
                     f"slot views missing tensor for {sub_path}: {exc}"
                 ) from exc
-            bias_key = f"{prefix}{sub_path}.bias"
-            bias = slot_views.get(bias_key)
+            bias = slot_views.get(f"{sub_path}.bias")
             qlin.rebind(qweight=qweight, scales=scales, qzeros=qzeros, bias=bias)
 
     return hook
