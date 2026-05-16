@@ -166,13 +166,39 @@ class StreamingCausalLM(nn.Module):
         # 1. Replace streamed layers' quant linears BEFORE materializing —
         #    that way we don't accidentally materialize tensors we're about
         #    to throw away.
+        #
+        #    We use the *index-based* walker (not the duck-type walker)
+        #    because ``AutoModelForCausalLM.from_config`` under
+        #    ``init_empty_weights`` does NOT always trigger HF's AWQ
+        #    integration — depending on the transformers version, the
+        #    skeleton's projections may be plain ``nn.Linear`` rather than
+        #    ``WQLinear_GEMM``. The index walker discovers projection paths
+        #    from the safetensors keys, which works for both.
         streamed_indices = set(loader.streamed_layer_indices())
         group_size = int(loader.index.quant_config.get("group_size", 128))
-        streamed_qlinears = _replace_streamed_linears(
+        streamed_qlinears = _replace_linears_for_quant_paths(
             hf_model,
-            layer_indices=streamed_indices,
+            loader=loader,
             group_size=group_size,
             prefer=streaming_config.quant_kernel,
+            cache_dense=False,  # CUDA: weights change per slot, can't cache
+            layer_indices=streamed_indices,
+        )
+
+        # Diagnostic: if zero replacements happened, the streaming pipeline
+        # is silently a no-op. Fail loudly rather than producing wrong logits.
+        total_replaced = sum(len(v) for v in streamed_qlinears.values())
+        if streamed_indices and total_replaced == 0:
+            raise RuntimeError(
+                f"Streaming path tried to replace projections in "
+                f"{len(streamed_indices)} layers but replaced 0 modules. "
+                f"The safetensors index either has no qweight tensors or no "
+                f"layers were matched. Aborting before producing garbage."
+            )
+        logger.info(
+            "Replaced %d quant projections across %d streamed layers",
+            total_replaced,
+            len(streamed_qlinears),
         )
 
         # 2. Materialize resident tensors onto GPU.
@@ -517,6 +543,7 @@ def _replace_linears_for_quant_paths(
     group_size: int,
     prefer: str = "torch",
     cache_dense: bool = False,
+    layer_indices: Optional[Iterable[int]] = None,
 ) -> dict[int, dict[str, StreamingQLinear]]:
     """Replace every decoder-layer projection whose AWQ quant tensors exist
     in the loader's index with a :class:`StreamingQLinear`.
@@ -525,7 +552,13 @@ def _replace_linears_for_quant_paths(
     contain autoawq-style quant linears already), this variant walks the
     safetensors index to discover the projection paths and replaces whatever
     module is currently at that path — typically plain ``nn.Linear`` from a
-    quant-config-stripped skeleton. Used on MPS / CPU.
+    quant-config-stripped skeleton (MPS) **or** a skeleton built via
+    ``AutoModelForCausalLM.from_config`` where HF's AWQ integration didn't
+    fire (CUDA streaming).
+
+    ``layer_indices`` restricts replacement to those layer ids. If ``None``,
+    walks every decoder layer (the MPS / full-replace pattern). For CUDA
+    streaming, pass the set of streamed-only indices.
 
     Pass ``cache_dense=True`` when binds are permanent (no slot recycling).
     The replacement modules will dequantize once on first rebind and run
@@ -536,7 +569,15 @@ def _replace_linears_for_quant_paths(
     out: dict[int, dict[str, StreamingQLinear]] = {}
     decoder_layers = dict(_iter_decoder_layers(hf_model))
 
+    target_layers = (
+        set(layer_indices)
+        if layer_indices is not None
+        else set(decoder_layers.keys())
+    )
+
     for layer_idx, layer in decoder_layers.items():
+        if layer_idx not in target_layers:
+            continue
         layer_tensors = loader.index.layers.get(layer_idx)
         if layer_tensors is None:
             out[layer_idx] = {}
