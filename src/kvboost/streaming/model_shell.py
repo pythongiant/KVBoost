@@ -172,13 +172,7 @@ class StreamingCausalLM(nn.Module):
         # with StreamingQLinear, sized via the safetensors index. Resident
         # layers are bound once via bind_streaming_qlinears; streamed
         # layers are bound per-forward by the scheduler hooks.
-        cfg_no_quant = copy.deepcopy(cfg)
-        for attr in ("quantization_config", "_quantization_config"):
-            if hasattr(cfg_no_quant, attr):
-                try:
-                    setattr(cfg_no_quant, attr, None)
-                except Exception:
-                    pass
+        cfg_no_quant = _strip_quantization_config(cfg)
 
         with init_empty_weights():
             hf_model = AutoModelForCausalLM.from_config(cfg_no_quant, torch_dtype=dtype)
@@ -310,13 +304,7 @@ class StreamingCausalLM(nn.Module):
         #    the q_proj / k_proj / ... paths. The autoawq class path
         #    requires CUDA kernels at __init__ on some versions and is
         #    pointless here anyway.
-        cfg_no_quant = copy.deepcopy(cfg)
-        for attr in ("quantization_config", "_quantization_config"):
-            if hasattr(cfg_no_quant, attr):
-                try:
-                    setattr(cfg_no_quant, attr, None)
-                except Exception:
-                    pass
+        cfg_no_quant = _strip_quantization_config(cfg)
 
         with init_empty_weights():
             hf_model = AutoModelForCausalLM.from_config(cfg_no_quant, torch_dtype=dtype)
@@ -464,6 +452,30 @@ class StreamingCausalLM(nn.Module):
 
 
 # ── Module-tree helpers ─────────────────────────────────────────────────────
+
+
+def _strip_quantization_config(cfg: Any) -> Any:
+    """Return a deep-copy of ``cfg`` with ``quantization_config`` fully
+    removed from its ``__dict__``.
+
+    Setting ``cfg.quantization_config = None`` is **not** sufficient:
+    :meth:`PretrainedConfig.to_dict` (which ``GenerationConfig.from_model_config``
+    invokes during ``from_config``) checks ``if "quantization_config" in
+    output`` and then calls ``.to_dict()`` on the value unconditionally,
+    crashing with ``AttributeError`` when the value is None. We have to
+    remove the key from ``__dict__`` entirely.
+
+    Also strips ``_pre_quantization_dtype`` and the private ``_quantization_config``
+    if present, so HF's AWQ integration has no breadcrumbs to follow.
+    """
+    stripped = copy.deepcopy(cfg)
+    for attr in (
+        "quantization_config",
+        "_quantization_config",
+        "_pre_quantization_dtype",
+    ):
+        stripped.__dict__.pop(attr, None)
+    return stripped
 
 
 def _mps_available() -> bool:

@@ -193,6 +193,45 @@ def test_pre_hook_resident_layer_is_noop():
     assert not qlin.is_bound
 
 
+def test_strip_quantization_config_survives_to_dict():
+    """Regression: setting ``cfg.quantization_config = None`` leaves the
+    key present in ``__dict__`` and :meth:`PretrainedConfig.to_dict` then
+    blindly calls ``.to_dict()`` on the None value — crashing during
+    ``AutoModelForCausalLM.from_config``. The strip helper must remove the
+    attribute entirely so the stripped config round-trips cleanly.
+    """
+    pytest.importorskip("transformers")
+    from transformers import AutoConfig
+
+    from kvboost.streaming.model_shell import _strip_quantization_config
+
+    # Build a minimal config with an AWQ quantization_config dict attached
+    # so the strip has something real to remove. Dimensions must satisfy
+    # ``hidden_size % num_attention_heads == 0`` for HF's validator.
+    cfg = AutoConfig.for_model(
+        "llama",
+        num_hidden_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        intermediate_size=128,
+    )
+    cfg.quantization_config = {"quant_method": "awq", "bits": 4, "group_size": 8}
+
+    # Sanity: pre-strip, the dict-form has the quant key.
+    pre = cfg.to_dict()
+    assert "quantization_config" in pre
+
+    stripped = _strip_quantization_config(cfg)
+    assert "quantization_config" not in stripped.__dict__
+
+    # The critical assertion: to_dict must not crash on the stripped config.
+    # This is what AutoModelForCausalLM.from_config calls indirectly via
+    # GenerationConfig.from_model_config.
+    post = stripped.to_dict()
+    assert "quantization_config" not in post
+
+
 def test_scheduler_primes_on_inner_forward_not_just_wrapper_forward(tmp_path):
     """Regression: ``model.generate`` calls ``hf_model.generate`` which
     calls ``hf_model(...)`` internally — bypassing the wrapper's
