@@ -209,9 +209,25 @@ class StreamingCausalLM(nn.Module):
         total_streamed = sum(len(v) for v in streamed_qlinears.values())
         total_resident = sum(len(v) for v in resident_qlinears.values())
         if (streamed_indices or resident_indices) and (total_streamed + total_resident) == 0:
+            # Show the user what we actually found so they can see whether
+            # this is an architecture mismatch (hybrid attention, MoE
+            # routers at non-standard paths, etc.) vs a real bug.
+            sample_keys: list[str] = []
+            for name in loader.index.tensors.keys():
+                sample_keys.append(name)
+                if len(sample_keys) >= 12:
+                    break
+            qweight_keys = [k for k in loader.index.tensors.keys() if k.endswith(".qweight")]
             raise RuntimeError(
-                "Streaming path replaced 0 projection modules. The safetensors "
-                "index has no qweight tensors at the expected paths."
+                "Streaming path replaced 0 projection modules.\n"
+                f"  Expected pattern: model.layers.{{i}}.{{self_attn|mlp}}.{{proj}}.qweight\n"
+                f"  Total qweight tensors found in safetensors: {len(qweight_keys)}\n"
+                f"  Sample qweight paths: {qweight_keys[:5]}\n"
+                f"  First {len(sample_keys)} index entries: {sample_keys}\n"
+                "Hybrid architectures (linear-attention / Mamba / MoE with "
+                "non-standard router paths) aren't supported by the current "
+                "walker. Try a standard transformer AWQ model — e.g. "
+                "casperhansen/llama-3-8b-instruct-awq or Qwen/Qwen2.5-7B-Instruct-AWQ."
             )
         logger.info(
             "Replaced projections: %d resident across %d layers, "

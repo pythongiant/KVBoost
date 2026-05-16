@@ -31,6 +31,63 @@ def test_dequant_reference_shape(small_awq_layer):
     assert weight.dtype == small_awq_layer["scales"].dtype
 
 
+def test_torch_linear_fused_matches_reference_dequant_matmul(small_awq_layer):
+    """The fused chunked path (``_torch_awq_linear``) must produce the same
+    result as the reference dense-dequant-then-matmul, within fp16 noise.
+    """
+    from kvboost.streaming.kernels import _torch_awq_linear
+
+    x = torch.randn(4, small_awq_layer["in_features"], dtype=torch.float16)
+
+    fused = _torch_awq_linear(
+        x,
+        small_awq_layer["qweight"],
+        small_awq_layer["scales"],
+        small_awq_layer["qzeros"],
+        bias=None,
+        group_size=small_awq_layer["group_size"],
+    )
+
+    weight = awq_dequantize_reference(
+        small_awq_layer["qweight"],
+        small_awq_layer["scales"],
+        small_awq_layer["qzeros"],
+        small_awq_layer["group_size"],
+    )
+    reference = x @ weight
+
+    # Strict: same algebra, same fp16 — only difference is op ordering
+    # across chunks. Allow tiny accumulation drift.
+    assert fused.shape == reference.shape
+    rel = (fused - reference).abs() / reference.abs().clamp(min=1.0)
+    assert rel.max() < 1e-2
+
+
+def test_torch_linear_fused_handles_various_chunk_sizes(small_awq_layer):
+    """Chunk size is a memory/perf knob; output must be invariant."""
+    from kvboost.streaming.kernels import _torch_awq_linear
+
+    x = torch.randn(2, small_awq_layer["in_features"], dtype=torch.float16)
+    outputs = []
+    for cg in (1, 2, 4, 16):
+        out = _torch_awq_linear(
+            x,
+            small_awq_layer["qweight"],
+            small_awq_layer["scales"],
+            small_awq_layer["qzeros"],
+            bias=None,
+            group_size=small_awq_layer["group_size"],
+            chunk_groups=cg,
+        )
+        outputs.append(out)
+
+    # Chunk size should not change the result meaningfully. Allow tiny
+    # fp16 noise from non-associative accumulation across chunk boundaries.
+    for o in outputs[1:]:
+        rel = (o - outputs[0]).abs() / outputs[0].abs().clamp(min=1.0)
+        assert rel.max() < 5e-3, f"chunk-size sensitivity: rel max {rel.max().item()}"
+
+
 def test_torch_linear_matches_manual_matmul(small_awq_layer):
     x = torch.randn(4, small_awq_layer["in_features"], dtype=torch.float16)
     out = awq_linear(

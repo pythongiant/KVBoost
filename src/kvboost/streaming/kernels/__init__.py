@@ -133,9 +133,71 @@ def _torch_awq_linear(
     qzeros: torch.Tensor,
     bias: Optional[torch.Tensor],
     group_size: int,
+    *,
+    chunk_groups: int = 16,
 ) -> torch.Tensor:
-    weight = awq_dequantize_reference(qweight, scales, qzeros, group_size)
-    out = x.to(weight.dtype) @ weight
+    """Fused dequant + matmul, chunked along input groups.
+
+    Never materializes the full dense ``(in_features, out_features)`` weight
+    matrix — instead processes ``chunk_groups`` groups (= ``chunk_groups *
+    group_size`` rows) at a time and accumulates into the output. Peak
+    additional GPU memory per call is roughly
+    ``chunk_groups * group_size * out_features * 2 bytes`` (e.g. for
+    ``chunk_groups=16, group_size=128, out_features=5120`` that's ~20 MB,
+    vs ~280 MB for the dense materialization).
+
+    Mathematically equivalent (within fp16 rounding) to
+    ``x @ awq_dequantize_reference(...) + bias``. Used by
+    :class:`StreamingQLinear` when the torch fallback is selected, which
+    is the common case for larger models on small GPUs where the dense
+    materialization would OOM.
+    """
+    pack = 8
+    in_features = qweight.shape[0]
+    out_features = qweight.shape[1] * pack
+    num_groups = scales.shape[0]
+
+    shifts = _shift_table(qweight.device, qweight.dtype)
+
+    out_shape = x.shape[:-1] + (out_features,)
+    out = torch.zeros(out_shape, dtype=scales.dtype, device=x.device)
+
+    x_compute = x.to(scales.dtype) if x.dtype != scales.dtype else x
+
+    for g_start in range(0, num_groups, chunk_groups):
+        g_end = min(g_start + chunk_groups, num_groups)
+        row_start = g_start * group_size
+        row_end = min(g_end * group_size, in_features)
+
+        # Dequant only the rows in this group chunk.
+        qw_chunk = qweight[row_start:row_end].unsqueeze(-1)
+        unpacked = ((qw_chunk >> shifts) & 0xF).to(scales.dtype)
+        unpacked = unpacked.reshape(row_end - row_start, out_features)
+
+        qz_chunk = qzeros[g_start:g_end].unsqueeze(-1)
+        zeros_grp = ((qz_chunk >> shifts) & 0xF).to(scales.dtype)
+        zeros_grp = zeros_grp.reshape(g_end - g_start, out_features)
+
+        scales_grp = scales[g_start:g_end]  # (g_chunk, out_features)
+
+        # Broadcast scales/zeros across the group_size rows inside each group.
+        # repeat_interleave is cheap because the group_size is small.
+        rows_in_chunk = row_end - row_start
+        # Use indexing instead of repeat_interleave to keep memory low.
+        local_group_idx = (
+            torch.arange(rows_in_chunk, device=qweight.device) // group_size
+        )
+        scales_full = scales_grp[local_group_idx]
+        zeros_full = zeros_grp[local_group_idx]
+
+        # In-place fuse: weight_chunk = (unpacked - zeros) * scales
+        unpacked.sub_(zeros_full).mul_(scales_full)
+        del zeros_full, scales_full
+
+        # Accumulate matmul into out.
+        out.add_(x_compute[..., row_start:row_end] @ unpacked)
+        del unpacked
+
     if bias is not None:
         out = out + bias.to(out.dtype)
     return out
