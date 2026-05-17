@@ -113,6 +113,30 @@ def parse_args():
     p.add_argument("--block-size", type=int, default=16, help="Tokens per paged block")
     p.add_argument("--num-blocks", type=int, default=4096, help="Number of paged blocks")
 
+    # AWQ Layer Streaming — load AWQ weights to host RAM and DMA per layer
+    # so models larger than GPU VRAM still run. Layers in keep_first_k +
+    # keep_last_k stay resident; the rest stream from pinned host RAM.
+    # Composes with chunk reuse: KV-cache hits work the same on streamed
+    # weights, so a warm prefix still skips prefill.
+    p.add_argument("--awq-streaming", action="store_true",
+                   help="Enable AWQ layer streaming. Use for AWQ-quantized "
+                        "models that don't fit fully in GPU VRAM.")
+    p.add_argument("--streaming-mode", default="partial_resident",
+                   choices=["full_resident", "partial_resident",
+                            "ffn_only_stream", "full_stream"],
+                   help="Residency policy when --awq-streaming is set "
+                        "(default: partial_resident)")
+    p.add_argument("--keep-first-k", type=int, default=4,
+                   help="Decoder layers at the head of the network that stay "
+                        "resident in VRAM (default: 4)")
+    p.add_argument("--keep-last-k", type=int, default=4,
+                   help="Decoder layers at the tail of the network that stay "
+                        "resident in VRAM (default: 4)")
+    p.add_argument("--streaming-quant-kernel", default="auto",
+                   choices=["auto", "marlin", "exllama_v2", "torch"],
+                   help="AWQ GEMM kernel preference (default: auto — "
+                        "probes Marlin → ExLlamaV2 → pure-torch fallback)")
+
     # Server
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
@@ -242,6 +266,55 @@ def load_engine(args):
         from ..engine import InferenceEngine
         from ..compat import default_device
         device = args.device or default_device()
+
+        # ── AWQ Layer Streaming path ─────────────────────────────────────
+        # When --awq-streaming is set, the engine's factory constructs the
+        # model via StreamingCausalLM (pinned-host AWQ + per-forward DMA).
+        # Chunk reuse, KV-cache management, and SSE token streaming work
+        # exactly the same on top of it — InferenceEngine doesn't care that
+        # the model's weights are being shuffled in and out.
+        if args.awq_streaming:
+            if args.gguf_file:
+                raise SystemExit(
+                    "--gguf-file is incompatible with --awq-streaming "
+                    "(GGUF weights don't have AWQ projection layout)."
+                )
+            if quant_config is not None:
+                raise SystemExit(
+                    "--quantization is incompatible with --awq-streaming. "
+                    "Streaming reads AWQ tensors directly from safetensors; "
+                    "drop --quantization (the model already has its own "
+                    "AWQ quantization_config in config.json)."
+                )
+            from ..streaming import StreamingConfig
+            streaming_config = StreamingConfig(
+                residency_mode=args.streaming_mode,
+                keep_first_k=args.keep_first_k,
+                keep_last_k=args.keep_last_k,
+                quant_kernel=args.streaming_quant_kernel,
+            )
+            log.info(
+                "AWQ streaming enabled: %s, keep_first_k=%d, keep_last_k=%d, "
+                "kernel=%s",
+                args.streaming_mode, args.keep_first_k, args.keep_last_k,
+                args.streaming_quant_kernel,
+            )
+            engine = InferenceEngine.from_pretrained(
+                args.model,
+                streaming_config=streaming_config,
+                max_cache_bytes=int(args.max_cache_bytes),
+                chunk_size=args.chunk_size,
+                recompute_strategy=args.recompute_strategy,
+                kv_cache_bits=args.kv_cache_bits,
+                sink_tokens=args.sink_tokens,
+                overlap_k=args.overlap_k,
+                prefill_chunk_size=args.prefill_chunk_size,
+                device=device,
+            )
+            log.info("Model loaded.")
+            return engine
+
+        # ── Standard load path ───────────────────────────────────────────
         # By default load directly onto the target device. With --max-memory we
         # opt into device_map="auto" + accelerate offload; InferenceEngine
         # detects this (via hf_device_map / quantization) and skips its .to().

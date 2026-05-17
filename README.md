@@ -287,6 +287,46 @@ StreamingConfig(
 - **Pinned host RAM is required.** For 32B AWQ you'll pin ~19 GB of host RAM. Containers often default `ulimit -l` to 64 MB — set `ulimit -l unlimited` (or raise the cgroup `memory.lock_limit`) before running.
 - **Unified-memory devices skip streaming.** On Apple Silicon (MPS) there is no separate VRAM, so the streaming pipeline auto-disables and weights are bound once to MPS. The wrapper still works as a way to load AWQ checkpoints HF can't load natively on Mac.
 
+### Serve over HTTP (OpenAI-compatible) with streaming AWQ
+
+The bundled FastAPI server can launch with the streaming backend, so the same `/v1/completions` and `/v1/chat/completions` endpoints work on models that don't fit in VRAM. Chunk reuse + SSE token streaming compose with it automatically:
+
+```bash
+pip install "kvboost[server,streaming]"
+
+python -m kvboost.server \
+    --model Qwen/Qwen2.5-32B-Instruct-AWQ \
+    --awq-streaming \
+    --keep-first-k 4 --keep-last-k 4 \
+    --streaming-mode partial_resident \
+    --max-cache-bytes 1e9 \
+    --port 8000
+```
+
+Then talk to it like any OpenAI-compatible endpoint:
+
+```bash
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Qwen/Qwen2.5-32B-Instruct-AWQ",
+        "prompt": "Explain entropy in two sentences.",
+        "max_tokens": 32,
+        "stream": true
+    }'
+```
+
+Each SSE chunk is a token; the per-token latency you see in the demo script (`demo_partial_8b`) is the same physical work each SSE chunk represents. Subsequent requests that share a prompt prefix get full chunk-reuse savings — the streaming backend doesn't change the KV-cache contract.
+
+| Server flag | Purpose |
+|---|---|
+| `--awq-streaming` | Enable the streaming backend (required to unlock the rest) |
+| `--streaming-mode` | `full_resident` / `partial_resident` / `ffn_only_stream` / `full_stream` |
+| `--keep-first-k`, `--keep-last-k` | Decoder layers to keep resident at head / tail of network |
+| `--streaming-quant-kernel` | `auto` (Marlin → ExLlamaV2 → torch fallback), or pin a specific one |
+
+`--awq-streaming` is incompatible with `--gguf-file` and `--quantization` (the streaming loader reads AWQ tensors straight from safetensors; the model already has its own `quantization_config` in `config.json`).
+
 ### Files
 
 - [src/kvboost/streaming/model_shell.py](src/kvboost/streaming/model_shell.py) — `StreamingCausalLM`, the wrapper + layer-replacement walker
@@ -294,6 +334,7 @@ StreamingConfig(
 - [src/kvboost/streaming/staging.py](src/kvboost/streaming/staging.py) — staging-slot arena and layout
 - [src/kvboost/streaming/awq_loader.py](src/kvboost/streaming/awq_loader.py) — safetensors indexing, pinned-host loading, marlin repack cache
 - [src/kvboost/streaming/kernels/](src/kvboost/streaming/kernels/) — Marlin / ExLlamaV2 wrappers + chunked torch fallback
+- [src/kvboost/server/__main__.py](src/kvboost/server/__main__.py) — `--awq-streaming` CLI flag and dispatch to `InferenceEngine.from_pretrained(streaming_config=...)`
 
 ---
 
