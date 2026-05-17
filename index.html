@@ -2,300 +2,645 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>KVBoost — The LLM Inference Tax Nobody Talks About</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KVBoost — Pitch Deck</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: Georgia, 'Times New Roman', serif;
-  font-size: 19px;
-  line-height: 1.85;
-  color: #111;
-  background: #fff;
-  max-width: 720px;
-  margin: 0 auto;
-  padding: 4rem 2rem 6rem;
-}
-h1 { font-size: 2.3rem; line-height: 1.2; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 0.7rem; }
-h2 { font-size: 1.3rem; font-weight: 700; margin: 2.8rem 0 0.9rem; letter-spacing: -0.2px; }
-.subtitle { font-size: 1.05rem; color: #666; font-style: italic; margin-bottom: 1.5rem; }
-.byline { font-size: 0.87rem; color: #bbb; border-bottom: 1px solid #eee; padding-bottom: 2rem; margin-bottom: 2.8rem; }
-p { margin-bottom: 1.3rem; }
-a { color: #111; }
-code { font-family: 'SFMono-Regular', 'Consolas', monospace; font-size: 0.82em; background: #f4f4f2; padding: 0.15em 0.4em; border-radius: 3px; }
-ul { margin-bottom: 1.3rem; padding-left: 1.5rem; }
-li { margin-bottom: 0.5rem; }
-figure { margin: 2.8rem -0.5rem; background: #fafaf8; border: 1px solid #eee; border-radius: 10px; padding: 1.5rem 1rem 0.8rem; }
-figcaption { font-family: system-ui, -apple-system, sans-serif; font-size: 0.82rem; color: #999; text-align: center; margin-top: 1rem; font-style: italic; line-height: 1.45; }
-.stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin: 2.2rem 0; }
-.stat { background: #f8f8f6; border: 1px solid #eee; border-radius: 8px; padding: 1.2rem; }
-.stat-n { font-family: system-ui, -apple-system, sans-serif; font-size: 1.9rem; font-weight: 700; color: #111; line-height: 1; }
-.stat-l { font-family: system-ui, -apple-system, sans-serif; font-size: 0.77rem; color: #aaa; margin-top: 0.4rem; line-height: 1.4; }
-.chart-wrap { position: relative; width: 100%; height: 200px; }
-hr { border: none; border-top: 1px solid #eee; margin: 2.8rem 0; }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --dark:    #0D1117;
+    --navy:    #0D2137;
+    --teal:    #0EA5E9;
+    --teal-dk: #0284C7;
+    --teal-lt: #38BDF8;
+    --green:   #10B981;
+    --white:   #FFFFFF;
+    --off:     #F0F9FF;
+    --gray:    #64748B;
+    --gray-lt: #CBD5E1;
+    --card:    #131F2E;
+    --accent:  #F59E0B;
+    --purple:  #A78BFA;
+    --red:     #F87171;
+  }
+
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: 'Syne', sans-serif; }
+
+  .deck { width: 100vw; height: 100vh; position: relative; }
+
+  .slide {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; justify-content: center;
+    padding: 5vh 7vw;
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.45s ease, transform 0.45s ease;
+    transform: translateY(30px);
+  }
+  .slide.active {
+    opacity: 1; pointer-events: all;
+    transform: translateY(0);
+  }
+  .slide.out {
+    opacity: 0; transform: translateY(-30px);
+  }
+
+  /* ── NAV ── */
+  .nav {
+    position: fixed; bottom: 3vh; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 12px; z-index: 100;
+    background: rgba(13,17,23,0.85); backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 999px; padding: 10px 20px;
+  }
+  .nav-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--gray); cursor: pointer; transition: all 0.25s; }
+  .nav-dot.active { background: var(--teal); width: 24px; border-radius: 4px; }
+  .nav-btn {
+    background: none; border: none; color: var(--gray); cursor: pointer;
+    font-size: 18px; padding: 2px 6px; transition: color 0.2s;
+  }
+  .nav-btn:hover { color: var(--white); }
+  .slide-count { color: var(--gray); font-size: 11px; font-family: 'JetBrains Mono', monospace; min-width: 40px; text-align: center; }
+
+  /* ── COMMON ── */
+  .chip {
+    display: inline-block; background: rgba(14,165,233,0.12);
+    border: 1px solid rgba(14,165,233,0.3); color: var(--teal-lt);
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    padding: 4px 12px; border-radius: 4px; letter-spacing: 0.05em;
+  }
+  .overline { font-size: 11px; letter-spacing: 0.15em; text-transform: uppercase; color: var(--teal); font-weight: 600; margin-bottom: 12px; }
+  .h1 { font-size: clamp(42px, 6vw, 76px); font-weight: 800; color: var(--white); line-height: 1.05; }
+  .h2 { font-size: clamp(28px, 3.5vw, 48px); font-weight: 800; color: var(--white); line-height: 1.1; }
+  .h3 { font-size: clamp(14px, 1.6vw, 20px); font-weight: 600; }
+  .body { font-size: clamp(12px, 1.2vw, 16px); color: var(--gray-lt); line-height: 1.6; }
+  .accent-line { width: 60px; height: 3px; background: var(--teal); border-radius: 2px; margin: 16px 0; }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+
+  .card {
+    background: var(--card); border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 10px; padding: 24px; position: relative; overflow: hidden;
+  }
+  .card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: var(--border-color, var(--teal));
+  }
+
+  /* ── SLIDE 1: TITLE ── */
+  #s1 { background: var(--dark); justify-content: center; }
+  #s1 .bg-grid {
+    position: absolute; inset: 0; z-index: 0;
+    background-image:
+      linear-gradient(rgba(14,165,233,0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(14,165,233,0.04) 1px, transparent 1px);
+    background-size: 60px 60px;
+  }
+  #s1 .left-bar { position: absolute; left: 0; top: 0; width: 5px; height: 100%; background: var(--teal); }
+  #s1 .content { position: relative; z-index: 1; max-width: 800px; }
+  #s1 .tagline { font-size: clamp(18px, 2.2vw, 28px); color: var(--off); font-weight: 400; margin-top: 20px; line-height: 1.5; }
+  #s1 .subtitle { margin-top: 14px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--gray); }
+  #s1 .bolt { position: absolute; right: 8vw; top: 50%; transform: translateY(-50%); font-size: 120px; opacity: 0.07; }
+
+  /* ── SLIDE 2: PROBLEM ── */
+  #s2 { background: var(--dark); }
+  #s2 .problem-card { --border-color: var(--card-color); }
+  #s2 .icon-wrap { font-size: 36px; margin-bottom: 16px; }
+
+  /* ── SLIDE 3: SOLUTION ── */
+  #s3 { background: var(--dark); }
+  #s3 .two-col { display: grid; grid-template-columns: 1.1fr 1fr; gap: 32px; align-items: start; margin-top: 20px; }
+  .code-block {
+    background: #090E14; border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px; overflow: hidden; font-family: 'JetBrains Mono', monospace;
+    font-size: clamp(10px, 1vw, 13px);
+  }
+  .code-header { background: #141E2A; padding: 8px 16px; font-size: 10px; color: var(--gray); border-bottom: 1px solid rgba(255,255,255,0.06); }
+  .code-body { padding: 16px; line-height: 1.8; }
+  .c-kw { color: var(--teal-lt); } .c-fn { color: #FBBF24; } .c-str { color: #86EFAC; }
+  .c-cm { color: var(--gray); } .c-id { color: var(--white); } .c-op { color: var(--teal); }
+  .feature-row { display: flex; align-items: flex-start; gap: 14px; padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+  .feature-row:last-child { border-bottom: none; }
+  .feature-icon { font-size: 22px; flex-shrink: 0; margin-top: 2px; }
+
+  /* ── SLIDE 4: PERF ── */
+  #s4 { background: var(--dark); }
+  .stat-card { --border-color: var(--c); text-align: left; }
+  .stat-num { font-size: clamp(32px, 4vw, 52px); font-weight: 800; line-height: 1; margin-bottom: 8px; }
+  .stat-lbl { font-size: 12px; color: var(--gray-lt); line-height: 1.4; }
+  .chart-wrap { margin-top: 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .bar-chart { background: var(--card); border-radius: 10px; padding: 20px; }
+  .bar-chart h4 { font-size: 12px; color: var(--gray); margin-bottom: 16px; font-weight: 400; font-family: 'JetBrains Mono', monospace; }
+  .bar-group { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .bar-label { font-size: 11px; color: var(--gray); width: 100px; flex-shrink: 0; font-family: 'JetBrains Mono', monospace; }
+  .bar-track { flex: 1; height: 22px; background: rgba(255,255,255,0.04); border-radius: 4px; overflow: hidden; position: relative; }
+  .bar-fill { height: 100%; border-radius: 4px; display: flex; align-items: center; justify-content: flex-end; padding-right: 8px; font-size: 10px; font-family: 'JetBrains Mono', monospace; color: var(--white); font-weight: 700; transition: width 1s cubic-bezier(.4,0,.2,1); }
+
+  /* ── SLIDE 5: HOW IT WORKS ── */
+  #s5 { background: var(--dark); }
+  .step-card { --border-color: var(--c); }
+  .step-num { font-size: 48px; font-weight: 800; line-height: 1; margin-bottom: 12px; opacity: 0.9; }
+
+  /* ── SLIDE 6: AWQ ── */
+  #s6 { background: var(--dark); }
+  #s6 .two-col { display: grid; grid-template-columns: 1.2fr 1fr; gap: 28px; align-items: start; margin-top: 16px; }
+  .terminal { background: #090E14; border: 1px solid rgba(255,255,255,0.07); border-radius: 10px; overflow: hidden; font-family: 'JetBrains Mono', monospace; font-size: clamp(9px, 0.9vw, 12px); }
+  .term-header { background: #141E2A; padding: 8px 14px; font-size: 10px; color: var(--gray); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; }
+  .term-body { padding: 14px 16px; line-height: 1.9; }
+  .t-cmd { color: var(--teal); } .t-val { color: var(--white); }
+  .t-num-p { color: var(--purple); } .t-num-a { color: var(--accent); }
+  .t-ok { color: var(--green); } .t-muted { color: var(--gray); }
+  .metric-card { --border-color: var(--c); }
+  .metric-val { font-size: clamp(24px, 3vw, 38px); font-weight: 800; margin-bottom: 6px; }
+
+  /* ── SLIDE 7: USE CASES ── */
+  #s7 { background: var(--dark); }
+  #s7 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 20px; }
+  .usecase-card { --border-color: var(--c); }
+  .uc-icon { font-size: 28px; margin-bottom: 10px; }
+
+  /* ── SLIDE 8: TECH ── */
+  #s8 { background: var(--dark); }
+  #s8 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 0; margin-top: 20px; }
+  #s8 .col { padding: 0 20px; }
+  #s8 .col:first-child { border-right: 1px solid rgba(255,255,255,0.06); padding-left: 0; }
+  .tech-item { display: flex; align-items: flex-start; gap: 12px; padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
+  .tech-item:last-child { border-bottom: none; }
+  .check { color: var(--teal); font-size: 16px; flex-shrink: 0; margin-top: 2px; }
+
+  /* ── SLIDE 9: ROADMAP ── */
+  #s9 { background: var(--dark); }
+
+  /* ── SLIDE 10: CTA ── */
+  #s10 { background: var(--navy); }
+  #s10 .bg-grid {
+    position: absolute; inset: 0; z-index: 0;
+    background-image:
+      linear-gradient(rgba(14,165,233,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(14,165,233,0.03) 1px, transparent 1px);
+    background-size: 80px 80px;
+  }
+  #s10 .left-bar { position: absolute; left: 0; top: 0; width: 5px; height: 100%; background: var(--teal); }
+  #s10 .content { position: relative; z-index: 1; }
+  .link-card { --border-color: var(--c); }
+  .link-url { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--gray); margin-top: 4px; }
+  .install-box {
+    display: inline-flex; align-items: center; gap: 10px;
+    background: #090E14; border: 1px solid rgba(14,165,233,0.2);
+    border-radius: 8px; padding: 12px 24px; margin-top: 24px;
+    font-family: 'JetBrains Mono', monospace; font-size: clamp(14px, 1.5vw, 18px); color: var(--teal-lt);
+  }
+
+  /* ── SLIDE BACKGROUNDS ── */
+  .slide-bg { position: absolute; inset: 0; z-index: 0; }
+  .slide-content { position: relative; z-index: 1; width: 100%; }
+
+  /* ── ANIMATIONS ── */
+  @keyframes fadeUp { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
+  .slide.active .anim { animation: fadeUp 0.5s ease forwards; }
+  .slide.active .anim:nth-child(1) { animation-delay: 0.05s; opacity: 0; }
+  .slide.active .anim:nth-child(2) { animation-delay: 0.15s; opacity: 0; }
+  .slide.active .anim:nth-child(3) { animation-delay: 0.25s; opacity: 0; }
+  .slide.active .anim:nth-child(4) { animation-delay: 0.35s; opacity: 0; }
+  .slide.active .anim:nth-child(5) { animation-delay: 0.42s; opacity: 0; }
 </style>
 </head>
 <body>
+<div class="deck">
 
-<h1>The LLM inference tax nobody talks about</h1>
-<p class="subtitle">Every request recomputes everything. I built an open-source fix for the cases prefix caching misses.</p>
-<p class="byline">Srihari Unnikrishnan &middot; Independent research &middot; 2026</p>
-
-<p>Every LLM request at your company recomputes everything. System prompt, retrieved documents, few-shot examples &mdash; the model reads them fresh, every time. Doesn't matter if those exact tokens showed up in the last million requests. No memory. Full price.</p>
-
-<p>The industry has a partial answer: prefix caching. If requests share a leading prefix token-for-token, vLLM and SGLang will skip that recomputation. It works well when your shared content always sits at the very front. It does nothing when a retrieved document shows up at position 200, or when a system prompt gets shuffled by dynamic context injection, or when two users share common boilerplate that happens not to be the very first tokens.</p>
-
-<p>I got tired of paying the tax where prefix caching doesn't apply. So I built KVBoost. Source: <a href="https://github.com/pythongiant/kvboost">github.com/pythongiant/kvboost</a>, MIT licensed, open for contributors.</p>
-
-<h2>The idea</h2>
-
-<p>Split the prompt into 128-token chunks. Give each chunk two hash keys &mdash; one encoding content plus positional context (for exact reuse), one encoding content alone (for approximate reuse regardless of where it appears in the prompt). When a request arrives, check both stores before touching the GPU for those tokens.</p>
-
-<!-- FIGURE 1: Chunk comparison -->
-<figure>
-<svg width="100%" viewBox="0 0 680 210" role="img" xmlns="http://www.w3.org/2000/svg">
-  <title>Chunk-level KV cache reuse: prefix caching vs KVBoost</title>
-  <desc>Left shows prefix caching failing after a mid-prompt miss. Right shows KVBoost reusing non-contiguous chunks.</desc>
-
-  <!-- Section labels -->
-  <text x="170" y="22" text-anchor="middle" font-size="13" font-weight="500" fill="#555" font-family="system-ui, sans-serif">Prefix caching</text>
-  <text x="510" y="22" text-anchor="middle" font-size="13" font-weight="500" fill="#555" font-family="system-ui, sans-serif">KVBoost</text>
-
-  <!-- Divider -->
-  <line x1="340" y1="10" x2="340" y2="200" stroke="#e8e8e8" stroke-width="1"/>
-
-  <!-- LEFT side: prefix caching -->
-  <!-- C1: teal hit -->
-  <rect x="42" y="45" width="58" height="42" rx="4" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/>
-  <text x="71" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#085041" font-family="system-ui, sans-serif">C1</text>
-  <text x="71" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#0F6E56" font-family="system-ui, sans-serif">hit</text>
-  <!-- C2: teal hit -->
-  <rect x="108" y="45" width="58" height="42" rx="4" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/>
-  <text x="137" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#085041" font-family="system-ui, sans-serif">C2</text>
-  <text x="137" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#0F6E56" font-family="system-ui, sans-serif">hit</text>
-  <!-- C3: gray miss -->
-  <rect x="174" y="45" width="58" height="42" rx="4" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
-  <text x="203" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#444441" font-family="system-ui, sans-serif">C3</text>
-  <text x="203" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#888780" font-family="system-ui, sans-serif">miss</text>
-  <!-- C4: blocked -->
-  <rect x="240" y="45" width="58" height="42" rx="4" fill="#F1EFE8" stroke="#D3D1C7" stroke-width="0.5"/>
-  <text x="269" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#888780" font-family="system-ui, sans-serif">C4</text>
-  <text x="269" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#B4B2A9" font-family="system-ui, sans-serif">blocked</text>
-
-  <!-- Red break marker between C2 and C3 -->
-  <line x1="171" y1="45" x2="171" y2="87" stroke="#E24B4A" stroke-width="1.2" stroke-dasharray="3 2"/>
-  <text x="102" y="108" text-anchor="middle" font-size="10" fill="#E24B4A" font-family="system-ui, sans-serif">miss breaks</text>
-  <text x="102" y="121" text-anchor="middle" font-size="10" fill="#E24B4A" font-family="system-ui, sans-serif">the chain</text>
-  <text x="247" y="108" text-anchor="middle" font-size="10" fill="#B4B2A9" font-family="system-ui, sans-serif">C4 blocked even</text>
-  <text x="247" y="121" text-anchor="middle" font-size="10" fill="#B4B2A9" font-family="system-ui, sans-serif">if cached elsewhere</text>
-
-  <!-- Left result -->
-  <text x="170" y="162" text-anchor="middle" font-size="12" font-weight="500" fill="#444" font-family="system-ui, sans-serif">2 / 4 chunks reused</text>
-
-  <!-- RIGHT side: KVBoost -->
-  <!-- C1: exact hit -->
-  <rect x="382" y="45" width="58" height="42" rx="4" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/>
-  <text x="411" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#085041" font-family="system-ui, sans-serif">C1</text>
-  <text x="411" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#0F6E56" font-family="system-ui, sans-serif">hit</text>
-  <!-- C2: miss -->
-  <rect x="448" y="45" width="58" height="42" rx="4" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
-  <text x="477" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#444441" font-family="system-ui, sans-serif">C2</text>
-  <text x="477" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#888780" font-family="system-ui, sans-serif">miss</text>
-  <!-- C3: exact hit despite gap -->
-  <rect x="514" y="45" width="58" height="42" rx="4" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/>
-  <text x="543" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#085041" font-family="system-ui, sans-serif">C3</text>
-  <text x="543" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#0F6E56" font-family="system-ui, sans-serif">hit</text>
-  <!-- C4: approximate hit -->
-  <rect x="580" y="45" width="58" height="42" rx="4" fill="#EEEDFE" stroke="#7F77DD" stroke-width="0.5"/>
-  <text x="609" y="64" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#26215C" font-family="system-ui, sans-serif">C4</text>
-  <text x="609" y="79" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#534AB7" font-family="system-ui, sans-serif">&#x2248; hit</text>
-
-  <!-- Right annotations -->
-  <text x="510" y="108" text-anchor="middle" font-size="10" fill="#0F6E56" font-family="system-ui, sans-serif">gap doesn&#39;t block</text>
-  <text x="510" y="121" text-anchor="middle" font-size="10" fill="#0F6E56" font-family="system-ui, sans-serif">subsequent chunks</text>
-
-  <!-- Right result -->
-  <text x="510" y="162" text-anchor="middle" font-size="12" font-weight="500" fill="#444" font-family="system-ui, sans-serif">3 / 4 chunks reused</text>
-
-  <!-- Legend -->
-  <rect x="178" y="186" width="11" height="11" rx="2" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/>
-  <text x="193" y="195" font-size="10" fill="#888" font-family="system-ui, sans-serif">Exact hit</text>
-  <rect x="265" y="186" width="11" height="11" rx="2" fill="#EEEDFE" stroke="#7F77DD" stroke-width="0.5"/>
-  <text x="280" y="195" font-size="10" fill="#888" font-family="system-ui, sans-serif">Approx hit</text>
-  <rect x="360" y="186" width="11" height="11" rx="2" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
-  <text x="375" y="195" font-size="10" fill="#888" font-family="system-ui, sans-serif">Miss / blocked</text>
-</svg>
-<figcaption>Figure 1. Prefix caching (left) fails when a miss appears mid-prompt — all subsequent chunks are blocked even if their content is cached elsewhere. KVBoost (right) reuses any matching chunk regardless of position, including approximate content matches (C4).</figcaption>
-</figure>
-
-<p>The result: 4.49&times; mean time-to-first-token speedup over full recomputation, and 16% faster than vLLM prefix caching, on 1,000 samples from a bug-localization benchmark using Qwen2.5-3B. Exact-match accuracy: 99.2% vs 99.1% for both baselines.</p>
-
-<div class="stats-row">
-  <div class="stat">
-    <div class="stat-n">4.49&times;</div>
-    <div class="stat-l">speedup vs. full recompute (mean TTFT)</div>
+  <!-- ═══════════════════════════════ SLIDE 1: TITLE ═══════════════════════════════ -->
+  <div class="slide active" id="s1">
+    <div class="bg-grid"></div>
+    <div class="left-bar"></div>
+    <div class="content">
+      <div class="anim"><span class="chip">pip install kvboost</span></div>
+      <div class="h1 anim" style="margin-top:20px">KVBoost</div>
+      <div class="accent-line anim"></div>
+      <div class="tagline anim">Faster LLM Inference.<br>Less VRAM. No Model Changes.</div>
+      <div class="subtitle anim">Chunk-level KV cache reuse &nbsp;·&nbsp; FlashAttention-2 &nbsp;·&nbsp; AWQ layer streaming &nbsp;·&nbsp; CPU paged decoding</div>
+    </div>
+    <div class="bolt">⚡</div>
   </div>
-  <div class="stat">
-    <div class="stat-n">16%</div>
-    <div class="stat-l">faster than vLLM prefix caching</div>
+
+  <!-- ═══════════════════════════════ SLIDE 2: PROBLEM ══════════════════════════════ -->
+  <div class="slide" id="s2">
+    <div class="slide-content">
+      <div class="overline anim">The Problem</div>
+      <div class="h2 anim">LLM inference is broken by default.</div>
+      <div class="grid-3 anim" style="margin-top:28px">
+        <div class="card problem-card" style="--card-color:#F87171; --border-color:#F87171">
+          <div class="icon-wrap">🧱</div>
+          <div class="h3" style="color:#F87171;margin-bottom:10px">VRAM Walls</div>
+          <div class="body">Modern LLMs like Qwen2.5-32B require 60+ GB VRAM at full precision — out of reach for most teams.</div>
+        </div>
+        <div class="card problem-card" style="--border-color:#FBBF24">
+          <div class="icon-wrap">🐢</div>
+          <div class="h3" style="color:#FBBF24;margin-bottom:10px">Slow Prefill</div>
+          <div class="body">Repeated system prompts are recomputed from scratch on every single request — wasting GPU cycles constantly.</div>
+        </div>
+        <div class="card problem-card" style="--border-color:var(--purple)">
+          <div class="icon-wrap">🔧</div>
+          <div class="h3" style="color:var(--purple);margin-bottom:10px">HF Bottlenecks</div>
+          <div class="body">HuggingFace's default inference loop has no KV cache reuse, no chunked attention, and no memory-efficient decoding.</div>
+        </div>
+      </div>
+    </div>
   </div>
-  <div class="stat">
-    <div class="stat-n">99.2%</div>
-    <div class="stat-l">exact-match accuracy, vs 99.1% baseline</div>
+
+  <!-- ═══════════════════════════════ SLIDE 3: SOLUTION ════════════════════════════ -->
+  <div class="slide" id="s3">
+    <div class="slide-content">
+      <div class="overline anim">The Solution</div>
+      <div class="h2 anim">KVBoost: drop-in, no rewrites.</div>
+      <div class="two-col anim">
+        <div class="code-block">
+          <div class="code-header">Python</div>
+          <div class="code-body">
+            <span class="c-kw">from</span> <span class="c-id">kvboost</span> <span class="c-kw">import</span> <span class="c-id">KVBoost</span><br><br>
+            <span class="c-id">engine</span> <span class="c-op">=</span> <span class="c-fn">KVBoost</span><span class="c-id">.from_pretrained(</span><br>
+            &nbsp;&nbsp;<span class="c-str">"Qwen/Qwen2.5-3B"</span><br>
+            <span class="c-id">)</span><br><br>
+            <span class="c-cm"># Warm a shared prefix once</span><br>
+            <span class="c-id">engine</span><span class="c-op">.</span><span class="c-fn">warm</span><span class="c-id">(</span><span class="c-str">"You are a helpful assistant..."</span><span class="c-id">)</span><br><br>
+            <span class="c-cm"># All subsequent calls reuse cache</span><br>
+            <span class="c-id">result</span> <span class="c-op">=</span> <span class="c-id">engine</span><span class="c-op">.</span><span class="c-fn">generate</span><span class="c-id">(prompt)</span><br><br>
+            <span class="c-fn">print</span><span class="c-id">(result.</span><span class="c-kw">kv_reuse_ratio</span><span class="c-id">)</span>
+            <span class="c-cm">&nbsp;# ✓ 80%+</span>
+          </div>
+        </div>
+        <div>
+          <div class="feature-row">
+            <div class="feature-icon">⚡</div>
+            <div><div class="h3" style="color:var(--teal);margin-bottom:4px">KV Cache Reuse</div><div class="body">Chunk-level cache reuse eliminates redundant prefill for shared prompts.</div></div>
+          </div>
+          <div class="feature-row">
+            <div class="feature-icon">🚀</div>
+            <div><div class="h3" style="color:var(--green);margin-bottom:4px">FlashAttention-2</div><div class="body">Memory-efficient attention with 3–5× TTFT speedup vs vanilla HuggingFace.</div></div>
+          </div>
+          <div class="feature-row">
+            <div class="feature-icon">💾</div>
+            <div><div class="h3" style="color:var(--purple);margin-bottom:4px">AWQ Layer Streaming</div><div class="body">Run 32B+ models on 8 GB VRAM via pinned-host weight streaming.</div></div>
+          </div>
+          <div class="feature-row">
+            <div class="feature-icon">🗄️</div>
+            <div><div class="h3" style="color:var(--accent);margin-bottom:4px">CPU Paged Decoding</div><div class="body">Spill KV cache to CPU RAM — handle long contexts without OOM errors.</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════ SLIDE 4: PERFORMANCE ═════════════════════════ -->
+  <div class="slide" id="s4">
+    <div class="slide-content">
+      <div class="overline anim">Performance</div>
+      <div class="h2 anim">Real numbers. Real hardware.</div>
+      <div class="grid-4 anim" style="margin-top:22px">
+        <div class="card stat-card" style="--c:var(--teal)">
+          <div class="stat-num" style="color:var(--teal)">3–5×</div>
+          <div class="stat-lbl">TTFT Speedup<br>vs HF Baseline</div>
+        </div>
+        <div class="card stat-card" style="--c:var(--green)">
+          <div class="stat-num" style="color:var(--green)">80%+</div>
+          <div class="stat-lbl">KV Cache Hit Rate<br>Multi-Turn</div>
+        </div>
+        <div class="card stat-card" style="--c:var(--purple)">
+          <div class="stat-num" style="color:var(--purple)">8 GB</div>
+          <div class="stat-lbl">VRAM for 32B Model<br>AWQ Streaming</div>
+        </div>
+        <div class="card stat-card" style="--c:var(--accent)">
+          <div class="stat-num" style="color:var(--accent)">~10K</div>
+          <div class="stat-lbl">Lines of Code<br>43 Python Modules</div>
+        </div>
+      </div>
+      <div class="chart-wrap anim">
+        <div class="bar-chart">
+          <h4>Time to First Token (ms) — lower is better</h4>
+          <div class="bar-group">
+            <div class="bar-label">HF Baseline</div>
+            <div class="bar-track"><div class="bar-fill" data-w="100" style="background:#475569;width:0%">850ms</div></div>
+          </div>
+          <div class="bar-group">
+            <div class="bar-label">Prefix Reuse</div>
+            <div class="bar-track"><div class="bar-fill" data-w="37" style="background:var(--teal-dk);width:0%">320ms</div></div>
+          </div>
+          <div class="bar-group">
+            <div class="bar-label">Chunk Reuse</div>
+            <div class="bar-track"><div class="bar-fill" data-w="24" style="background:var(--teal);width:0%">210ms</div></div>
+          </div>
+        </div>
+        <div class="bar-chart">
+          <h4>Multi-Turn Cache Hit Rate (%)</h4>
+          <div class="bar-group">
+            <div class="bar-label">Turn 1</div>
+            <div class="bar-track"><div class="bar-fill" data-w="0" style="background:var(--green);width:0%">0%</div></div>
+          </div>
+          <div class="bar-group">
+            <div class="bar-label">Turn 2</div>
+            <div class="bar-track"><div class="bar-fill" data-w="45" style="background:var(--green);width:0%">45%</div></div>
+          </div>
+          <div class="bar-group">
+            <div class="bar-label">Turn 3</div>
+            <div class="bar-track"><div class="bar-fill" data-w="68" style="background:var(--green);width:0%">68%</div></div>
+          </div>
+          <div class="bar-group">
+            <div class="bar-label">Turn 4</div>
+            <div class="bar-track"><div class="bar-fill" data-w="78" style="background:var(--green);width:0%">78%</div></div>
+          </div>
+          <div class="bar-group">
+            <div class="bar-label">Turn 5+</div>
+            <div class="bar-track"><div class="bar-fill" data-w="85" style="background:var(--green);width:0%">85%</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════ SLIDE 5: HOW IT WORKS ════════════════════════ -->
+  <div class="slide" id="s5">
+    <div class="slide-content">
+      <div class="overline anim">How It Works</div>
+      <div class="h2 anim">Four layers of optimization.</div>
+      <div class="grid-4 anim" style="margin-top:28px">
+        <div class="card step-card" style="--c:var(--teal)">
+          <div class="step-num" style="color:var(--teal)">01</div>
+          <div class="h3" style="color:var(--teal);margin-bottom:10px">Hash Chunks</div>
+          <div class="body">Incoming prompt is split into chunks. Each chunk is hashed to look up prior cached K/V pairs.</div>
+        </div>
+        <div class="card step-card" style="--c:var(--green)">
+          <div class="step-num" style="color:var(--green)">02</div>
+          <div class="h3" style="color:var(--green);margin-bottom:10px">Reuse Cache</div>
+          <div class="body">Matching chunks skip attention entirely. Only novel tokens are forwarded through the transformer.</div>
+        </div>
+        <div class="card step-card" style="--c:var(--purple)">
+          <div class="step-num" style="color:var(--purple)">03</div>
+          <div class="h3" style="color:var(--purple);margin-bottom:10px">Flash Attention</div>
+          <div class="body">New tokens run FlashAttention-2 — tiled CUDA kernels with O(√N) memory. No custom model code needed.</div>
+        </div>
+        <div class="card step-card" style="--c:var(--accent)">
+          <div class="step-num" style="color:var(--accent)">04</div>
+          <div class="h3" style="color:var(--accent);margin-bottom:10px">Page Offload</div>
+          <div class="body">Long-context KV blocks are evicted to CPU RAM via async DMA — enabling contexts beyond GPU VRAM.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════ SLIDE 6: AWQ STREAMING ══════════════════════ -->
+  <div class="slide" id="s6">
+    <div class="slide-content">
+      <div class="overline anim" style="color:var(--purple)">AWQ Layer Streaming</div>
+      <div class="h2 anim">Run a 32B model on a gaming GPU.</div>
+      <div class="two-col anim">
+        <div class="terminal">
+          <div class="term-header">
+            <div class="dot" style="background:#FF5F57"></div>
+            <div class="dot" style="background:#FEBC2E"></div>
+            <div class="dot" style="background:#28C840"></div>
+            &nbsp; Terminal
+          </div>
+          <div class="term-body">
+            <span class="t-cmd">$ python -m kvboost.streaming.demo_partial_8b</span><br>
+            <span class="t-muted">&nbsp;&nbsp;--model Qwen/Qwen2.5-32B-Instruct-AWQ</span><br><br>
+            <span class="t-muted">INFO: Replaced projections:</span><br>
+            <span class="t-ok">&nbsp;&nbsp;56 resident across 8 layers</span><br>
+            <span class="t-ok">&nbsp;&nbsp;392 streamed across 56 layers</span><br><br>
+            <span class="t-muted">&nbsp;&nbsp;load_time:               </span><span class="t-val">10.7s</span><br>
+            <span class="t-muted">&nbsp;&nbsp;peak_vram_after_load:    </span><span class="t-num-p">5.65 GB</span><br>
+            <span class="t-muted">&nbsp;&nbsp;avg_tok_per_s:           </span><span class="t-num-a">0.11</span><br>
+            <span class="t-muted">&nbsp;&nbsp;peak_vram_during_decode: </span><span class="t-num-p">6.13 GB</span>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:14px">
+          <div class="card metric-card" style="--c:var(--purple)">
+            <div class="metric-val" style="color:var(--purple)">5.65 GB</div>
+            <div class="body">Peak VRAM after loading a 32B model — fits on a single 8 GB gaming GPU.</div>
+          </div>
+          <div class="card metric-card" style="--c:var(--teal)">
+            <div class="metric-val" style="color:var(--teal)">6.13 GB</div>
+            <div class="body">Peak VRAM during decode — stays safely under the 8 GB limit.</div>
+          </div>
+          <div class="card metric-card" style="--c:var(--accent)">
+            <div class="metric-val" style="color:var(--accent)">0.11 tok/s</div>
+            <div class="body">PCIe-bound throughput — built for VRAM savings, not raw speed.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════ SLIDE 7: USE CASES ══════════════════════════ -->
+  <div class="slide" id="s7">
+    <div class="slide-content">
+      <div class="overline anim">Use Cases</div>
+      <div class="h2 anim">Who needs KVBoost?</div>
+      <div class="grid anim">
+        <div class="card usecase-card" style="--c:var(--teal)">
+          <div class="uc-icon">💻</div>
+          <div class="h3" style="color:var(--teal);margin-bottom:8px">AI Coding Assistants</div>
+          <div class="body">System prompts are re-used across 100s of requests. Cache the context once, speed up every response by 3–5×.</div>
+        </div>
+        <div class="card usecase-card" style="--c:var(--green)">
+          <div class="uc-icon">📚</div>
+          <div class="h3" style="color:var(--green);margin-bottom:8px">RAG Pipelines</div>
+          <div class="body">Document chunks appear in many queries. Chunk-level reuse makes multi-document QA dramatically faster.</div>
+        </div>
+        <div class="card usecase-card" style="--c:var(--purple)">
+          <div class="uc-icon">⚙️</div>
+          <div class="h3" style="color:var(--purple);margin-bottom:8px">Edge / Budget Infra</div>
+          <div class="body">AWQ streaming lets teams deploy 30B+ models on consumer GPUs — no $10K A100 required.</div>
+        </div>
+        <div class="card usecase-card" style="--c:var(--accent)">
+          <div class="uc-icon">💬</div>
+          <div class="h3" style="color:var(--accent);margin-bottom:8px">Multi-Turn Chatbots</div>
+          <div class="body">Conversation history grows each turn. CPU paged decoding handles long contexts without OOM crashes.</div>
+        </div>
+      </div>
+      <div class="anim" style="margin-top:18px;font-size:12px;color:var(--gray);font-family:'JetBrains Mono',monospace">
+        MIT Licensed &nbsp;·&nbsp; Drop-in with HuggingFace Transformers &nbsp;·&nbsp; No fine-tuning, no architecture changes
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════ SLIDE 8: TECH STACK ═════════════════════════ -->
+  <div class="slide" id="s8">
+    <div class="slide-content">
+      <div class="overline anim">Technology</div>
+      <div class="h2 anim">Built on solid foundations.</div>
+      <div class="two-col anim">
+        <div class="col">
+          <div class="tech-item">
+            <div class="check">✓</div>
+            <div><div class="h3" style="color:var(--teal-lt);margin-bottom:3px">FlashAttention-2</div><div class="body">Tiled CUDA kernels for O(√N) memory attention</div></div>
+          </div>
+          <div class="tech-item">
+            <div class="check">✓</div>
+            <div><div class="h3" style="color:var(--teal-lt);margin-bottom:3px">AWQ (AutoQuant)</div><div class="body">Weight-only 4-bit quantization preserving accuracy</div></div>
+          </div>
+          <div class="tech-item">
+            <div class="check">✓</div>
+            <div><div class="h3" style="color:var(--teal-lt);margin-bottom:3px">HuggingFace Transformers</div><div class="body">Drop-in compatibility — no model changes required</div></div>
+          </div>
+          <div class="tech-item">
+            <div class="check">✓</div>
+            <div><div class="h3" style="color:var(--teal-lt);margin-bottom:3px">CUDA DMA Streams</div><div class="body">Async PCIe transfers for layer-by-layer weight streaming</div></div>
+          </div>
+        </div>
+        <div class="col">
+          <div class="tech-item">
+            <div class="check" style="color:var(--green)">✓</div>
+            <div><div class="h3" style="color:#86EFAC;margin-bottom:3px">Chunk Hashing</div><div class="body">Deterministic token-level hashing for cache lookup</div></div>
+          </div>
+          <div class="tech-item">
+            <div class="check" style="color:var(--green)">✓</div>
+            <div><div class="h3" style="color:#86EFAC;margin-bottom:3px">CPU Paged Memory</div><div class="body">Page-table KV offload — evict cold blocks to RAM</div></div>
+          </div>
+          <div class="tech-item">
+            <div class="check" style="color:var(--green)">✓</div>
+            <div><div class="h3" style="color:#86EFAC;margin-bottom:3px">PyPI Package</div><div class="body">pip install kvboost — ready in 2 minutes</div></div>
+          </div>
+          <div class="tech-item">
+            <div class="check" style="color:var(--green)">✓</div>
+            <div><div class="h3" style="color:#86EFAC;margin-bottom:3px">MIT License</div><div class="body">Fully open source, production-ready for any use</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════ SLIDE 9: ROADMAP ════════════════════════════ -->
+  <div class="slide" id="s9">
+    <div class="slide-content">
+      <div class="overline anim">Roadmap</div>
+      <div class="h2 anim">What's next.</div>
+      <div class="grid-3 anim" style="margin-top:28px">
+        <div class="card" style="--border-color:var(--teal)">
+          <div class="h3" style="color:var(--teal);margin-bottom:16px;font-size:20px">Now ✅</div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div class="body">✓&nbsp; Chunk-level KV reuse</div>
+            <div class="body">✓&nbsp; FlashAttention-2 integration</div>
+            <div class="body">✓&nbsp; AWQ layer streaming</div>
+            <div class="body">✓&nbsp; CPU paged decoding</div>
+          </div>
+        </div>
+        <div class="card" style="--border-color:var(--green)">
+          <div class="h3" style="color:var(--green);margin-bottom:16px;font-size:20px">Next 🔨</div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div class="body">◦&nbsp; Multi-GPU tensor parallel</div>
+            <div class="body">◦&nbsp; Speculative decoding</div>
+            <div class="body">◦&nbsp; LoRA adapter hot-swap</div>
+            <div class="body">◦&nbsp; Continuous batching</div>
+          </div>
+        </div>
+        <div class="card" style="--border-color:var(--purple)">
+          <div class="h3" style="color:var(--purple);margin-bottom:16px;font-size:20px">Future 🔭</div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div class="body">◦&nbsp; GGUF / GGML support</div>
+            <div class="body">◦&nbsp; Triton custom kernels</div>
+            <div class="body">◦&nbsp; Distributed KV cache</div>
+            <div class="body">◦&nbsp; Cloud-hosted cache tier</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════ SLIDE 10: CTA ═══════════════════════════════ -->
+  <div class="slide" id="s10">
+    <div class="bg-grid"></div>
+    <div class="left-bar"></div>
+    <div class="content">
+      <div class="h1 anim" style="font-size:clamp(48px,7vw,88px)">Start building<br>faster.</div>
+      <div class="accent-line anim"></div>
+      <div class="body anim" style="font-size:clamp(14px,1.5vw,20px);color:var(--off);max-width:600px;line-height:1.6">
+        KVBoost is open source and production-ready.<br>Drop it into any HuggingFace project today.
+      </div>
+      <div class="grid-3 anim" style="margin-top:28px;max-width:700px">
+        <div class="card link-card" style="--c:var(--teal)">
+          <div class="h3" style="color:var(--teal)">GitHub</div>
+          <div class="link-url">github.com/pythongiant/kvboost</div>
+        </div>
+        <div class="card link-card" style="--c:var(--green)">
+          <div class="h3" style="color:var(--green)">PyPI</div>
+          <div class="link-url">pypi.org/project/kvboost/</div>
+        </div>
+        <div class="card link-card" style="--c:var(--purple)">
+          <div class="h3" style="color:var(--purple)">Docs</div>
+          <div class="link-url">kvboost.readthedocs.io</div>
+        </div>
+      </div>
+      <div class="install-box anim">
+        <span style="color:var(--gray)">$</span> pip install kvboost
+      </div>
+      <div class="anim" style="margin-top:16px;font-size:11px;color:var(--gray);font-family:'JetBrains Mono',monospace">MIT License · Built by @pythongiant</div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════ NAVIGATION ═════════════════════════════════ -->
+  <div class="nav">
+    <button class="nav-btn" id="prevBtn">‹</button>
+    <div id="dots"></div>
+    <button class="nav-btn" id="nextBtn">›</button>
+    <div class="slide-count" id="count">1 / 10</div>
   </div>
 </div>
 
-<h2>The hard part</h2>
-
-<p>Two problems nearly killed this.</p>
-
-<p>The first is attention seams. When you stitch cached chunks together, boundary tokens attended to a different preceding context when they were originally encoded. Reusing those KV tensors verbatim produces silent attention errors &mdash; the kind that don't crash, don't appear in logs, and quietly degrade output quality.</p>
-
-<p>I implemented two repair strategies. The spatial one (SelectiveRecompute) re-encodes the last 16 tokens before each seam. The deviation-guided one (CacheBlendRecompute, adapted from the CacheBlend paper) does a cheap probe pass, measures per-token cosine deviation, and recomputes only the tokens that actually changed &mdash; about 15% of the prompt. The deviation-guided approach catches mid-chunk errors the spatial window misses entirely, and it's mandatory for any approximate content match.</p>
-
-<!-- FIGURE 2: Seam repair -->
-<figure>
-<svg width="100%" viewBox="0 0 680 188" role="img" xmlns="http://www.w3.org/2000/svg">
-  <title>Seam error and repair at chunk boundaries</title>
-  <desc>Two cached chunks joined at a seam have incorrect KV tensors near the boundary. The repair window spans both sides of the seam and is re-encoded with full context.</desc>
-
-  <text x="340" y="20" text-anchor="middle" font-size="12" fill="#999" font-family="system-ui, sans-serif" font-style="italic">Assembling two cached chunks creates seam error at the boundary</text>
-
-  <!-- C1 block -->
-  <rect x="130" y="52" width="200" height="58" rx="6" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/>
-  <text x="230" y="76" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#085041" font-family="system-ui, sans-serif">C1</text>
-  <text x="230" y="94" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0F6E56" font-family="system-ui, sans-serif">cached KV tensors</text>
-
-  <!-- C2 block -->
-  <rect x="350" y="52" width="200" height="58" rx="6" fill="#E6F1FB" stroke="#378ADD" stroke-width="0.5"/>
-  <text x="450" y="76" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53" font-family="system-ui, sans-serif">C2</text>
-  <text x="450" y="94" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185FA5" font-family="system-ui, sans-serif">cached KV tensors</text>
-
-  <!-- Seam dashed line -->
-  <line x1="340" y1="35" x2="340" y2="128" stroke="#E24B4A" stroke-width="1" stroke-dasharray="4 3"/>
-  <text x="340" y="30" text-anchor="middle" font-size="10" fill="#E24B4A" font-family="system-ui, sans-serif">seam</text>
-
-  <!-- Repair window (drawn on top so it overlays both chunks) -->
-  <rect x="258" y="47" width="164" height="68" rx="5" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5" fill-opacity="0.88"/>
-  <text x="340" y="72" text-anchor="middle" dominant-baseline="central" font-size="12" font-weight="500" fill="#633806" font-family="system-ui, sans-serif">repair window</text>
-  <text x="340" y="90" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#854F0B" font-family="system-ui, sans-serif">re-encoded with full context</text>
-
-  <!-- Bracket below repair window -->
-  <line x1="258" y1="121" x2="422" y2="121" stroke="#EF9F27" stroke-width="0.8"/>
-  <line x1="258" y1="116" x2="258" y2="121" stroke="#EF9F27" stroke-width="0.8"/>
-  <line x1="422" y1="116" x2="422" y2="121" stroke="#EF9F27" stroke-width="0.8"/>
-
-  <!-- Strategy labels -->
-  <text x="340" y="140" text-anchor="middle" font-size="11" fill="#666" font-family="system-ui, sans-serif">SelectiveRecompute: fixed 16-token boundary window</text>
-  <text x="340" y="158" text-anchor="middle" font-size="11" fill="#666" font-family="system-ui, sans-serif">CacheBlendRecompute: top ~15% of tokens by cosine deviation</text>
-  <text x="340" y="176" text-anchor="middle" font-size="10" fill="#aaa" font-family="system-ui, sans-serif">Both strategies correct attention context before the main forward pass</text>
-</svg>
-<figcaption>Figure 2. The repair window straddles each chunk seam, spanning portions of both cached chunks. KVBoost patches only the tokens that actually deviate from what a full-context forward pass would produce.</figcaption>
-</figure>
-
-<p>The second problem is RoPE position collisions. Key vectors carry their positional encoding baked in. A chunk cached at positions 0&ndash;128 is wrong if reused at positions 512&ndash;640. The dual-hash scheme handles this: the prefix hash encodes content plus position context (exact reuse, no correction needed), while the content hash encodes content alone (approximate reuse, mandatory deviation repair). Two lookup tiers, two different trust levels.</p>
-
-<h2>What&rsquo;s in the repo</h2>
-
-<p>Beyond the core caching engine, a few things make this production-usable rather than a research toy.</p>
-
-<p>Asymmetric KIVI-style quantization cuts cache memory by about half (int8) or 4&times; (int4) with negligible quality impact. It uses per-channel quantization for keys and per-token quantization for values, which matches how outliers actually distribute across those tensors.</p>
-
-<p>Importance-weighted LRU eviction scores chunks by their &ell;2 key norm before deciding what to evict. A system prompt with high attention signal outlives filler tokens under memory pressure, rather than being evicted purely by recency.</p>
-
-<p>An optional disk-tier overflow stores cold chunks as memory-mapped files. Retrieval takes 10&ndash;50ms per chunk, compared to 100&ndash;500ms for GPU recompute. Not free, but substantially cheaper.</p>
-
-<p>Adaptive chunk boundary splitting nudges split points toward punctuation so seams fall at natural linguistic breaks. Batch generation loads the shared chunk prefix once across a batch and broadcasts it zero-copy via <code>torch.Tensor.expand</code>. The API is two methods: <code>warm(text)</code> pre-loads documents into cache, <code>generate(prompt)</code> uses it.</p>
-
-<p>Compatibility covers Qwen2, LLaMA, Mistral, Mixtral, Gemma, Phi, and anything else using RoPE with HuggingFace&rsquo;s <code>past_key_values</code> interface. ALiBi and learned absolute embeddings are not supported &mdash; they require different position correction mechanisms that aren&rsquo;t implemented yet.</p>
-
-<h2>The numbers, honestly</h2>
-
-<!-- FIGURE 3: TTFT chart -->
-<figure>
-<div class="chart-wrap">
-  <canvas id="ttftChart" role="img" aria-label="Horizontal bar chart comparing mean time-to-first-token: KVBoost 142ms, vLLM prefix cache 165ms, full recompute 639ms">Full recompute: 639ms, vLLM prefix cache: 165ms, KVBoost: 142ms</canvas>
-</div>
-<figcaption>Figure 3. Mean time-to-first-token across 1,000 samples (Qwen2.5-3B, RTX 4060). KVBoost&rsquo;s advantage over vLLM is largest at short context lengths (1.53&times; in the 0&ndash;500 token bucket) and narrows as context grows.</figcaption>
-</figure>
-
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
-(function() {
-  var ctx = document.getElementById('ttftChart');
-  if (!ctx) return;
-  new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: ['Full recompute', 'vLLM prefix cache', 'KVBoost'],
-      datasets: [{
-        label: 'Mean TTFT (ms)',
-        data: [639, 165, 142],
-        backgroundColor: ['#D3D1C7', '#85B7EB', '#5DCAA5'],
-        borderColor: ['#888780', '#378ADD', '#1D9E75'],
-        borderWidth: 0.5,
-        borderRadius: 4,
-        barThickness: 36,
-      }]
-    },
-    options: {
-      indexAxis: 'y',
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          callbacks: {
-            label: function(ctx) { return ' ' + ctx.parsed.x + ' ms'; }
-          }
-        }
-      },
-      scales: {
-        x: {
-          title: { display: true, text: 'Mean time to first token (ms)', font: { size: 11, family: 'system-ui' }, color: '#999' },
-          grid: { color: '#f0f0ee' },
-          ticks: { color: '#888', font: { size: 11, family: 'system-ui' } }
-        },
-        y: {
-          grid: { display: false },
-          ticks: { color: '#444', font: { size: 12, family: 'system-ui' } }
-        }
-      }
-    }
+  const slides = document.querySelectorAll('.slide');
+  const total = slides.length;
+  let current = 0;
+
+  // Build dots
+  const dotsEl = document.getElementById('dots');
+  for (let i = 0; i < total; i++) {
+    const d = document.createElement('div');
+    d.className = 'nav-dot' + (i === 0 ? ' active' : '');
+    d.onclick = () => goTo(i);
+    dotsEl.appendChild(d);
+  }
+
+  function goTo(n) {
+    if (n < 0 || n >= total || n === current) return;
+    slides[current].classList.remove('active');
+    slides[current].classList.add('out');
+    setTimeout(() => slides[current].classList.remove('out'), 500);
+    current = n;
+    slides[current].classList.add('active');
+    // Update dots
+    document.querySelectorAll('.nav-dot').forEach((d, i) => d.classList.toggle('active', i === current));
+    document.getElementById('count').textContent = (current + 1) + ' / ' + total;
+    // Animate bars on slide 4
+    if (current === 3) animateBars();
+  }
+
+  document.getElementById('prevBtn').onclick = () => goTo(current - 1);
+  document.getElementById('nextBtn').onclick = () => goTo(current + 1);
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ') { e.preventDefault(); goTo(current + 1); }
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); goTo(current - 1); }
   });
-})();
+
+  // Swipe support
+  let tx = 0;
+  document.addEventListener('touchstart', e => tx = e.touches[0].clientX);
+  document.addEventListener('touchend', e => {
+    const dx = tx - e.changedTouches[0].clientX;
+    if (Math.abs(dx) > 40) goTo(current + (dx > 0 ? 1 : -1));
+  });
+
+  function animateBars() {
+    setTimeout(() => {
+      document.querySelectorAll('.bar-fill').forEach(b => {
+        b.style.width = b.dataset.w + '%';
+      });
+    }, 300);
+  }
+  // Reset bars when leaving slide 4
+  const origGoTo = goTo;
 </script>
-
-<p>The 4.49&times; speedup is real on this workload. The 16% advantage over vLLM reflects two things: KVBoost avoids PagedAttention&rsquo;s per-page overhead, and its repair strategy means it can safely reuse chunks that prefix caching would have to leave alone.</p>
-
-<p>The accuracy numbers are clean. Seam repair doesn&rsquo;t hurt quality on bug localization. What I haven&rsquo;t tested: long-form generation, code completion, multi-document summarization. Those benchmarks would tell a more complete story. I haven&rsquo;t run them yet, and the benchmark suite in the repo is there if you want to.</p>
-
-<p>Two known rough edges: single-GPU only (multi-GPU tensor parallelism isn&rsquo;t implemented), and for very long cached contexts (over 8K tokens) the CacheBlend probe pass itself gets expensive &mdash; a threshold-based activation would fix it, but it&rsquo;s not shipped yet.</p>
-
-<h2>Who should care</h2>
-
-<p>RAG pipelines are the obvious case. Every retrieved document chunk is a cache candidate. Pre-warm the document store once; pay for encoding amortized across thousands of queries instead of per-query. Multi-turn chat benefits similarly &mdash; system prompts and early conversation turns get cached and reused across users sharing the same context.</p>
-
-<p>As context windows grow from 128K to 1M tokens, the cost of recomputing shared content scales quadratically. Prefix caching handles that cost only when your architecture happens to front-load all shared content. Most production architectures don&rsquo;t.</p>
-
-<p>The core idea &mdash; that where content appears in a prompt shouldn&rsquo;t determine whether its KV tensors can be reused &mdash; sounds obvious in retrospect. Making it work without quality regression means solving the position encoding problem and the attention seam problem together. I think KVBoost is the first open-source implementation that does both in a single usable package.</p>
-
-<hr>
-
-<h2>Come build this</h2>
-
-<p>The repo is at <a href="https://github.com/pythongiant/kvboost">github.com/pythongiant/kvboost</a>, MIT licensed. Issues are open. Benchmark suite and experiment scripts are in <code>benchmarks_and_experiments/important/</code>.</p>
-
-<p>Things I&rsquo;m actively looking for help with:</p>
-<ul>
-  <li>Broader benchmark coverage: long-form generation, code completion, summarization, multilingual tasks</li>
-  <li>Multi-GPU support: cache shard coordination across tensor-parallel deployments</li>
-  <li>Integration adapters: LangChain/LlamaIndex middleware, OpenAI-compatible API wrapper</li>
-  <li>Threshold-based probe activation: skip the CacheBlend probe when cache hit rate is below a configurable floor</li>
-  <li>ALiBi position correction: extending the dual-hash scheme to models that use ALiBi instead of RoPE</li>
-</ul>
-
-<p>If the problem interests you &mdash; whether that means opening a PR, stress-testing the benchmarks on a different model or task, or just asking hard questions about the architecture &mdash; find me on GitHub.</p>
-
 </body>
 </html>

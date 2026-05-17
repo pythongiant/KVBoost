@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 
 from .kernels import awq_dequantize_reference, awq_linear
+from .profile import get_profiler
 
 
 class StreamingQLinear(nn.Module):
@@ -49,6 +50,8 @@ class StreamingQLinear(nn.Module):
         group_size: int,
         prefer: str = "auto",
         cache_dense: bool = False,
+        layer_idx: Optional[int] = None,
+        sub_path: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.in_features = in_features
@@ -56,6 +59,9 @@ class StreamingQLinear(nn.Module):
         self.group_size = group_size
         self.prefer = prefer
         self.cache_dense = cache_dense
+        # Tags for the profiler — purely metadata, never read by forward().
+        self.layer_idx = layer_idx
+        self.sub_path = sub_path
 
         self._qweight: Optional[torch.Tensor] = None
         self._scales: Optional[torch.Tensor] = None
@@ -119,28 +125,33 @@ class StreamingQLinear(nn.Module):
     # ── Forward ─────────────────────────────────────────────────────────────
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._dense_weight is not None:
-            # Cached-dense fast path: one matmul, no dequant per forward.
-            out = x.to(self._dense_weight.dtype) @ self._dense_weight
-            if self._bias is not None:
-                out = out + self._bias.to(out.dtype)
-            return out
+        with get_profiler().region(
+            "qlinear.forward",
+            layer_idx=self.layer_idx,
+            sub_path=self.sub_path,
+        ):
+            if self._dense_weight is not None:
+                # Cached-dense fast path: one matmul, no dequant per forward.
+                out = x.to(self._dense_weight.dtype) @ self._dense_weight
+                if self._bias is not None:
+                    out = out + self._bias.to(out.dtype)
+                return out
 
-        if self._qweight is None or self._scales is None or self._qzeros is None:
-            raise RuntimeError(
-                "StreamingQLinear.forward called before rebind(); the streaming "
-                "scheduler must populate weights for this layer first."
+            if self._qweight is None or self._scales is None or self._qzeros is None:
+                raise RuntimeError(
+                    "StreamingQLinear.forward called before rebind(); the streaming "
+                    "scheduler must populate weights for this layer first."
+                )
+
+            return awq_linear(
+                x,
+                self._qweight,
+                self._scales,
+                self._qzeros,
+                self._bias,
+                group_size=self.group_size,
+                prefer=self.prefer,
             )
-
-        return awq_linear(
-            x,
-            self._qweight,
-            self._scales,
-            self._qzeros,
-            self._bias,
-            group_size=self.group_size,
-            prefer=self.prefer,
-        )
 
     def extra_repr(self) -> str:
         mode = "dense" if self.cache_dense else "streaming"

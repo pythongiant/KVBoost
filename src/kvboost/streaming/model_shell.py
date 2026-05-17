@@ -39,6 +39,7 @@ from .awq_loader import (
     _resolve_dotted_attribute,
 )
 from .config import StreamingConfig
+from .profile import get_profiler
 from .qkv_proj import StreamingQLinear
 from .scheduler import StreamingScheduler
 
@@ -374,6 +375,11 @@ class StreamingCausalLM(nn.Module):
         # ``hf_model`` (see ``_install_streaming_hooks``), so they fire on
         # every forward regardless of call path — including the internal
         # forwards driven by ``hf_model.generate``.
+        #
+        # The profiler region wraps the full forward — but the
+        # iteration bump and the inner regions live in
+        # _install_streaming_hooks's model-pre hook so that
+        # hf_model.generate's per-token forwards are counted too.
         return self.hf_model(*args, **kwargs)
 
     def generate(self, *args: Any, **kwargs: Any) -> Any:
@@ -417,13 +423,21 @@ class StreamingCausalLM(nn.Module):
 
         sched = self._scheduler
         device = sched.device
+        profiler = get_profiler()
+        # Pair a forward.total start-handle across pre/post hooks. Stored
+        # as a mutable cell because nested closures can't rebind in py3.
+        _forward_handle: dict[str, Any] = {"h": None}
 
         def _model_pre(_mod: nn.Module, _inputs: tuple[Any, ...]) -> None:
+            profiler.bump_iteration()
+            _forward_handle["h"] = profiler.start("model.forward.total")
             sched.begin_forward()
 
         def _model_post(_mod: nn.Module, _inputs: tuple[Any, ...], _out: Any) -> None:
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
+            profiler.end(_forward_handle["h"])
+            _forward_handle["h"] = None
 
         # Register the model-level priming hooks first, BEFORE walking for
         # per-layer hooks — otherwise an exception in the walker would
@@ -458,6 +472,25 @@ class StreamingCausalLM(nn.Module):
                 with_kwargs=False,
             )
             self._hook_handles.extend([pre, post])
+
+            # Per-block timing for the breakdown table: only installed
+            # when the profiler is enabled (the hooks are cheap pre/post
+            # callables but PyTorch still walks the hook list per
+            # forward — keep them off the critical path otherwise).
+            if profiler.enabled:
+                for attr_name, region in (("self_attn", "attn.forward"), ("mlp", "mlp.forward")):
+                    block = getattr(hf_layer, attr_name, None)
+                    if block is None:
+                        continue
+                    pre_fn, handle_cell = _make_block_pre_hook(region, layer_idx)
+                    self._hook_handles.append(
+                        block.register_forward_pre_hook(pre_fn, with_kwargs=False)
+                    )
+                    self._hook_handles.append(
+                        block.register_forward_hook(
+                            _make_block_post_hook(handle_cell), with_kwargs=False
+                        )
+                    )
 
     def __del__(self) -> None:  # pragma: no cover - cleanup
         for h in self._hook_handles:
@@ -666,6 +699,8 @@ def _replace_streamed_linears(
                 out_features=out_f,
                 group_size=group_size,
                 prefer=prefer if prefer != "auto" else "auto",
+                layer_idx=layer_idx,
+                sub_path=sub_path,
             )
             _set_submodule(layer, sub_path, new)
             replacements[sub_path] = new
@@ -740,6 +775,8 @@ def _replace_linears_for_quant_paths(
                 group_size=group_size,
                 prefer=prefer,
                 cache_dense=cache_dense,
+                layer_idx=layer_idx,
+                sub_path=sub_path,
             )
             _set_submodule(layer, sub_path, new)
             replacements[sub_path] = new
@@ -884,21 +921,24 @@ def _make_pre_hook(
     with in :func:`_build_scheduler`.
     """
 
+    profiler = get_profiler()
+
     def hook(_module: nn.Module, _inputs: tuple[Any, ...]) -> None:
         slot_views = scheduler.before_layer(layer_idx)
         if slot_views is None:
             return
-        for sub_path, qlin in qlinears.items():
-            try:
-                qweight = slot_views[f"{sub_path}.qweight"]
-                scales = slot_views[f"{sub_path}.scales"]
-                qzeros = slot_views[f"{sub_path}.qzeros"]
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"slot views missing tensor for {sub_path}: {exc}"
-                ) from exc
-            bias = slot_views.get(f"{sub_path}.bias")
-            qlin.rebind(qweight=qweight, scales=scales, qzeros=qzeros, bias=bias)
+        with profiler.region("hook.rebind", layer_idx=layer_idx):
+            for sub_path, qlin in qlinears.items():
+                try:
+                    qweight = slot_views[f"{sub_path}.qweight"]
+                    scales = slot_views[f"{sub_path}.scales"]
+                    qzeros = slot_views[f"{sub_path}.qzeros"]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"slot views missing tensor for {sub_path}: {exc}"
+                    ) from exc
+                bias = slot_views.get(f"{sub_path}.bias")
+                qlin.rebind(qweight=qweight, scales=scales, qzeros=qzeros, bias=bias)
 
     return hook
 
@@ -906,6 +946,29 @@ def _make_pre_hook(
 def _make_post_hook(scheduler: StreamingScheduler, layer_idx: int):
     def hook(_module: nn.Module, _inputs: tuple[Any, ...], _output: Any) -> None:
         scheduler.after_layer(layer_idx)
+
+    return hook
+
+
+def _make_block_pre_hook(name: str, layer_idx: int):
+    """Pre-hook that opens a profiler region for an inner block (attn or
+    mlp). Paired with :func:`_make_block_post_hook`.
+    """
+    profiler = get_profiler()
+    handle_cell: dict[str, Any] = {"h": None}
+
+    def hook(_module: nn.Module, _inputs: tuple[Any, ...]) -> None:
+        handle_cell["h"] = profiler.start(name, layer_idx=layer_idx)
+
+    return hook, handle_cell
+
+
+def _make_block_post_hook(handle_cell: dict[str, Any]):
+    profiler = get_profiler()
+
+    def hook(_module: nn.Module, _inputs: tuple[Any, ...], _output: Any) -> None:
+        profiler.end(handle_cell["h"])
+        handle_cell["h"] = None
 
     return hook
 

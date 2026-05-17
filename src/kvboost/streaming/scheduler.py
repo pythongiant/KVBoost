@@ -7,6 +7,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import torch
 
 from .awq_loader import LayerSpec, TensorSpec
+from .profile import get_profiler
 from .staging import SlotLayout, StagingArena
 
 logger = logging.getLogger(__name__)
@@ -116,10 +117,11 @@ class StreamingScheduler:
         Must be called from compute-stream context (typically the main
         stream) before any layer pre-hook fires.
         """
-        self.compute_stream = torch.cuda.current_stream(device=self.device)
-        self._layer_to_slot.clear()
-        if self.streamed_indices:
-            self._prime_initial_prefetches()
+        with get_profiler().region("scheduler.begin_forward"):
+            self.compute_stream = torch.cuda.current_stream(device=self.device)
+            self._layer_to_slot.clear()
+            if self.streamed_indices:
+                self._prime_initial_prefetches()
 
     def before_layer(self, layer_idx: int) -> Optional[dict[str, torch.Tensor]]:
         """Block compute on this layer's transfer completion and return its
@@ -129,15 +131,16 @@ class StreamingScheduler:
         if plan.resident:
             return None
 
-        slot_id = self._layer_to_slot.get(layer_idx)
-        if slot_id is None:
-            # Late prefetch (single-slot config, or layer was missed). Stage
-            # synchronously into slot 0 so forward can proceed.
-            slot_id = self._fallback_synchronous_prefetch(layer_idx)
+        with get_profiler().region("scheduler.before_layer", layer_idx=layer_idx):
+            slot_id = self._layer_to_slot.get(layer_idx)
+            if slot_id is None:
+                # Late prefetch (single-slot config, or layer was missed). Stage
+                # synchronously into slot 0 so forward can proceed.
+                slot_id = self._fallback_synchronous_prefetch(layer_idx)
 
-        assert self.compute_stream is not None, "begin_forward not called"
-        self.compute_stream.wait_event(self.xfer_done[layer_idx])
-        return self.arena.slot_views(slot_id)
+            assert self.compute_stream is not None, "begin_forward not called"
+            self.compute_stream.wait_event(self.xfer_done[layer_idx])
+            return self.arena.slot_views(slot_id)
 
     def after_layer(self, layer_idx: int) -> None:
         """Record the compute-done event for this layer and schedule the
@@ -148,22 +151,23 @@ class StreamingScheduler:
         if plan.resident:
             return
 
-        slot_id = self._layer_to_slot.get(layer_idx)
-        if slot_id is None:
-            return
+        with get_profiler().region("scheduler.after_layer", layer_idx=layer_idx):
+            slot_id = self._layer_to_slot.get(layer_idx)
+            if slot_id is None:
+                return
 
-        assert self.compute_stream is not None
-        self.compute_stream.record_event(self.compute_done[layer_idx])
+            assert self.compute_stream is not None
+            self.compute_stream.record_event(self.compute_done[layer_idx])
 
-        # Look ahead by num_slots; that's the next streamed layer eligible to
-        # reuse the slot we're about to free.
-        next_layer = self._next_streamed_after(layer_idx, hops=self.arena.num_slots)
-        if next_layer is not None and next_layer not in self._layer_to_slot:
-            self._prefetch_streamed_layer_into_slot(
-                layer_idx=next_layer,
-                slot_id=slot_id,
-                wait_event=self.compute_done[layer_idx],
-            )
+            # Look ahead by num_slots; that's the next streamed layer eligible to
+            # reuse the slot we're about to free.
+            next_layer = self._next_streamed_after(layer_idx, hops=self.arena.num_slots)
+            if next_layer is not None and next_layer not in self._layer_to_slot:
+                self._prefetch_streamed_layer_into_slot(
+                    layer_idx=next_layer,
+                    slot_id=slot_id,
+                    wait_event=self.compute_done[layer_idx],
+                )
 
     # ── Legacy all-in-one driver ────────────────────────────────────────────
 
