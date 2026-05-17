@@ -38,6 +38,27 @@ def test_double_buffering_requires_two_slots():
         cfg.validate()
 
 
+def test_n_staging_slots_zero_is_auto_sentinel():
+    """0 = 'pick at load time based on free VRAM'. Validate() must accept
+    it and the summary must call it out so traces are readable.
+    """
+    cfg = StreamingConfig(n_staging_slots=0)
+    cfg.validate()  # must not raise
+    assert "slots=auto" in cfg.summary()
+
+
+def test_negative_n_staging_slots_rejected():
+    with pytest.raises(ValueError):
+        StreamingConfig(n_staging_slots=-1).validate()
+
+
+def test_auto_slots_bounds_validated():
+    with pytest.raises(ValueError):
+        StreamingConfig(auto_slots_margin_gb=-0.5).validate()
+    with pytest.raises(ValueError):
+        StreamingConfig(auto_slots_max=1).validate()
+
+
 def test_mode_helpers():
     assert StreamingConfig(residency_mode="full_stream").use_full_streaming
     assert StreamingConfig(residency_mode="ffn_only_stream").use_ffn_only_streaming

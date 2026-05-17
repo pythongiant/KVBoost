@@ -878,12 +878,19 @@ def _build_scheduler(
             if "proj" in k
         }
 
+    device = torch.device("cuda")
+    num_slots = _resolve_num_slots(
+        layer_specs_streaming,
+        device=device,
+        streaming_config=streaming_config,
+    )
+
     try:
         return StreamingScheduler(
             layer_specs=layer_specs_streaming,
             prefetch_source_fn=prefetch_source_fn,
-            device=torch.device("cuda"),
-            num_slots=streaming_config.n_staging_slots,
+            device=device,
+            num_slots=num_slots,
         )
     except Exception as exc:
         # Hard fail. A silent fallback here leaves the model with mostly
@@ -894,6 +901,66 @@ def _build_scheduler(
             "The streamed model would have undefined weights; refusing to "
             "return a broken wrapper."
         ) from exc
+
+
+def _resolve_num_slots(
+    layer_specs_streaming: list[LayerSpec],
+    *,
+    device: torch.device,
+    streaming_config: StreamingConfig,
+) -> int:
+    """Decide how many staging slots the scheduler should allocate.
+
+    Behavior:
+
+    - If ``streaming_config.n_staging_slots > 0``, use it verbatim — explicit
+      user choice always wins.
+    - If ``0``, probe free VRAM via ``torch.cuda.mem_get_info``, divide by
+      per-slot bytes (computed from the same SlotLayout the scheduler will
+      build), reserve ``auto_slots_margin_gb`` for KV cache + activations,
+      and clamp to ``[2, auto_slots_max]``.
+
+    The "auto" path errs toward fewer slots when VRAM is tight — clamps at 2
+    (the minimum for the double-buffer pipeline), at most ``auto_slots_max``
+    (default 4; past that the look-ahead gain falls off fast).
+    """
+    explicit = streaming_config.n_staging_slots
+    if explicit > 0:
+        logger.info("staging slots: %d (explicit)", explicit)
+        return explicit
+
+    # Build the SAME layout the scheduler will use, so slot_bytes matches
+    # exactly. SlotLayout.from_layer_specs is pure metadata — no allocation.
+    from .staging import SlotLayout
+
+    layout = SlotLayout.from_layer_specs(
+        layer_specs_streaming, alignment=16, streamed_only=True
+    )
+    slot_bytes = layout.slot_bytes
+
+    if slot_bytes == 0:
+        # No streamed tensors → no streaming. Return the minimum so the
+        # scheduler still constructs cleanly.
+        logger.info("staging slots: 2 (no streamed tensors, minimum)")
+        return 2
+
+    free_bytes = torch.cuda.mem_get_info(device)[0]
+    margin_bytes = int(streaming_config.auto_slots_margin_gb * (1 << 30))
+    usable = max(0, free_bytes - margin_bytes)
+    affordable = usable // slot_bytes
+
+    chosen = max(2, min(int(affordable), streaming_config.auto_slots_max))
+    logger.info(
+        "staging slots: %d (auto; slot_bytes=%.1f MB, "
+        "free=%.2f GB, margin=%.2f GB, affordable=%d, cap=%d)",
+        chosen,
+        slot_bytes / (1 << 20),
+        free_bytes / (1 << 30),
+        margin_bytes / (1 << 30),
+        affordable,
+        streaming_config.auto_slots_max,
+    )
+    return chosen
 
 
 def _strip_layer_prefix(name: str, layer_idx: int) -> str:

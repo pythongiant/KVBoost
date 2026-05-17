@@ -68,7 +68,14 @@ class StreamingConfig:
     # Streaming pipeline
     #
 
-    n_staging_slots: int = 2
+    # 0 = auto-size at load time: probe free VRAM, divide by per-slot bytes,
+    # leave ``auto_slots_margin_gb`` free for KV cache + activations, then
+    # clamp to ``[2, auto_slots_max]``. Any positive int is taken as an
+    # explicit user override and skips auto-sizing entirely.
+    n_staging_slots: int = 0
+    auto_slots_margin_gb: float = 1.0
+    auto_slots_max: int = 4
+
     enable_double_buffering: bool = True
     enable_async_prefetch: bool = True
 
@@ -156,19 +163,28 @@ class StreamingConfig:
         if self.keep_last_k < 0:
             raise ValueError("keep_last_k must be >= 0")
 
-        if self.n_staging_slots < 1:
-            raise ValueError("n_staging_slots must be >= 1")
+        if self.n_staging_slots < 0:
+            raise ValueError(
+                "n_staging_slots must be >= 0 (0 = auto-size at load time)"
+            )
 
         if self.prefetch_layers_ahead < 0:
             raise ValueError("prefetch_layers_ahead must be >= 0")
 
+        # 0 (auto) is fine for double buffering — auto-sizing clamps the
+        # minimum to 2. Only reject an explicit 1 here.
         if (
             self.enable_double_buffering
-            and self.n_staging_slots < 2
+            and 0 < self.n_staging_slots < 2
         ):
             raise ValueError(
                 "double buffering requires at least 2 staging slots"
             )
+
+        if self.auto_slots_margin_gb < 0:
+            raise ValueError("auto_slots_margin_gb must be >= 0")
+        if self.auto_slots_max < 2:
+            raise ValueError("auto_slots_max must be >= 2")
 
         if self.max_pinned_host_memory_gb is not None:
             if self.max_pinned_host_memory_gb <= 0:
@@ -181,12 +197,13 @@ class StreamingConfig:
         Human-readable runtime summary.
         """
 
+        slots_str = "auto" if self.n_staging_slots == 0 else str(self.n_staging_slots)
         return (
             "StreamingConfig("
             f"mode={self.residency_mode}, "
             f"keep_first_k={self.keep_first_k}, "
             f"keep_last_k={self.keep_last_k}, "
-            f"slots={self.n_staging_slots}, "
+            f"slots={slots_str}, "
             f"kernel={self.quant_kernel}"
             ")"
         )
