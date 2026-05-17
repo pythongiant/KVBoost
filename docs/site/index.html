@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KVBoost — a tour of the codebase</title>
+    <meta name="description"
+          content="Chunk-level KV cache reuse, FlashAttention-2, CPU paged decoding, and AWQ layer streaming for HuggingFace inference. Click around the codebase." />
+    <link rel="icon" type="image/svg+xml" href="kvboost.svg" />
+    <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet"
+          href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-light.min.css" />
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" defer></script>
+    <!-- manifest.js assigns window.MANIFEST synchronously. Must load
+         before app.js. Using a regular <script> (no fetch) so the site
+         also works when opened directly via file:// where fetch is blocked. -->
+    <script src="manifest.js" defer></script>
+    <script src="app.js" defer></script>
+</head>
+<body>
+    <button id="theme-toggle" aria-label="Toggle theme">🌓</button>
+
+    <header class="hero">
+        <nav class="topnav">
+            <a href="#top" class="brand">
+                <img src="kvboost.svg" alt="" width="28" height="28" />
+                <span>KVBoost</span>
+            </a>
+            <div class="nav-links">
+                <a href="#features">Features</a>
+                <a href="#explore">Explore code</a>
+                <a href="#benchmarks">Benchmarks</a>
+                <a href="#quickstart">Quickstart</a>
+                <a href="https://github.com/pythongiant/kvboost" class="ghost">GitHub →</a>
+            </div>
+        </nav>
+
+        <div class="hero-content" id="top">
+            <span class="eyebrow">open source · MIT</span>
+            <h1>
+                Reuse what you've already computed.<br />
+                <span class="grad">Run what wouldn't otherwise fit.</span>
+            </h1>
+            <p class="lede">
+                <strong>KVBoost</strong> is a chunk-level KV-cache reuse engine for HuggingFace causal LMs.
+                It hashes prompt chunks so repeated prefixes skip prefill, and now ships a streaming AWQ
+                runtime that fits 32B-class models onto 8&nbsp;GB GPUs.
+            </p>
+
+            <div class="install">
+                <code id="install-cmd">pip install kvboost</code>
+                <button data-copy="#install-cmd" aria-label="Copy install command">📋</button>
+            </div>
+
+            <div class="stat-row" id="hero-stats">
+                <!-- filled by app.js -->
+            </div>
+        </div>
+
+        <div class="hero-glow" aria-hidden="true"></div>
+    </header>
+
+    <main>
+        <!-- ────────────────────────────────────────── Features ─────────────── -->
+        <section id="features" class="section">
+            <div class="section-head">
+                <h2>What's in the box</h2>
+                <p>Six feature areas. Each card jumps you into the relevant code.</p>
+            </div>
+            <div id="feature-grid" class="feature-grid">
+                <!-- filled by app.js from manifest.feature_groups -->
+            </div>
+        </section>
+
+        <!-- ────────────────────────────────────────── AWQ Streaming spotlight ─ -->
+        <section id="awq-spotlight" class="section spotlight">
+            <div class="spotlight-grid">
+                <div>
+                    <span class="eyebrow purple">🌊 AWQ Layer Streaming</span>
+                    <h2>Run models bigger than your VRAM.</h2>
+                    <p>
+                        Pinned-host AWQ weights, two CUDA staging slots, layer-by-layer DMA on a dedicated
+                        transfer stream. Per-forward chunked dequant keeps peak GPU memory bounded
+                        regardless of layer size.
+                    </p>
+                    <ul class="checklist">
+                        <li>Qwen2.5-32B-AWQ end-to-end on an 8&nbsp;GB GPU</li>
+                        <li>~5.65 GB peak VRAM after load, ~6.13 GB during decode</li>
+                        <li>Honest tradeoff: PCIe-bound, ~0.1–3 tok/s — built for VRAM savings, not throughput</li>
+                    </ul>
+                    <a href="#explore?group=streaming" class="cta" data-jump-group="streaming">
+                        Explore the streaming code →
+                    </a>
+                </div>
+                <div class="terminal" aria-label="Live demo output">
+                    <div class="terminal-bar">
+                        <span class="dot red"></span>
+                        <span class="dot yellow"></span>
+                        <span class="dot green"></span>
+                        <span class="terminal-title">demo_partial_8b.py — Qwen2.5-32B on 8GB</span>
+                    </div>
+                    <pre><code class="language-bash">$ python -m kvboost.streaming.demo_partial_8b \
+    --model Qwen/Qwen2.5-32B-Instruct-AWQ \
+    --keep-first-k 4 --keep-last-k 4 \
+    --max-new-tokens 32
+
+INFO: Replaced projections:
+  56 resident across 8 layers,
+  392 streamed across 56 layers
+  load_time: 10.7s
+  peak_vram_after_load: 5.65 GB
+  prefill_time: 67.71s
+
+--- generation ---
+ Ent
+  [  1/32] Δ_last= 12059ms  running= 0.08 tok/s
+ropy is a measure of the disorder
+  [  8/32] Δ_last= 10551ms  running= 0.11 tok/s
+ or randomness in a system. It can
+  [ 16/32] Δ_last=  9729ms  running= 0.11 tok/s
+ also be thought of as the amount of
+  [ 24/32] Δ_last=  7595ms  running= 0.11 tok/s
+ energy in a system that is unavailable for
+  [ 32/32] Δ_last=  7758ms  running= 0.11 tok/s
+
+--- summary ---
+  new_tokens:              32
+  avg_tok_per_s:           0.11
+  peak_vram_during_decode: 6.13 GB</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- ────────────────────────────────────────── Codebase explorer ──────── -->
+        <section id="explore" class="section">
+            <div class="section-head">
+                <h2>Browse the codebase</h2>
+                <p>
+                    43 Python modules, ~10K lines. Filter by feature, search by name, click a file to
+                    see what it does and what's inside.
+                </p>
+            </div>
+
+            <div class="explorer">
+                <aside class="explorer-side">
+                    <input type="search" id="module-search" placeholder="Search modules, classes…"
+                           autocomplete="off" />
+                    <div id="group-filter" class="group-filter">
+                        <!-- filled by app.js -->
+                    </div>
+                    <ul id="module-list" class="module-list">
+                        <!-- filled by app.js -->
+                    </ul>
+                </aside>
+                <article id="module-detail" class="module-detail" aria-live="polite">
+                    <div class="empty-state">
+                        <p>👈 Pick a module on the left, or <button class="linkish" id="random-pick">
+                            spin the wheel
+                        </button> to land on a random one.</p>
+                    </div>
+                </article>
+            </div>
+        </section>
+
+        <!-- ────────────────────────────────────────── Benchmarks ──────────────── -->
+        <section id="benchmarks" class="section dim">
+            <div class="section-head">
+                <h2>Benchmarks &amp; figures</h2>
+                <p>
+                    Generated from the test suite via
+                    <code>docs/figures/generate_figures.py</code>. Hover for the full-size version.
+                </p>
+            </div>
+            <div class="bench-grid">
+                <figure><img src="figures/speedup_summary.png" alt="Speedup summary" loading="lazy" /><figcaption>Overall speedup vs HF baseline</figcaption></figure>
+                <figure><img src="figures/ttft_modes.png" alt="TTFT across modes" loading="lazy" /><figcaption>TTFT across baseline / prefix / chunk-reuse</figcaption></figure>
+                <figure><img src="figures/multi_turn.png" alt="Multi-turn cache hit rate" loading="lazy" /><figcaption>Multi-turn cache hit rate</figcaption></figure>
+                <figure><img src="figures/latency_breakdown.png" alt="Latency breakdown" loading="lazy" /><figcaption>Latency breakdown by phase</figcaption></figure>
+                <figure><img src="figures/cache_warmup.png" alt="Cache warmup" loading="lazy" /><figcaption>Warm vs cold reuse</figcaption></figure>
+                <figure><img src="figures/accuracy_vs_reuse.png" alt="Accuracy vs reuse" loading="lazy" /><figcaption>Accuracy vs cache reuse</figcaption></figure>
+            </div>
+        </section>
+
+        <!-- ────────────────────────────────────────── Quickstart ──────────────── -->
+        <section id="quickstart" class="section">
+            <div class="section-head">
+                <h2>Quickstart</h2>
+                <p>Two minutes to a working chunk-reuse generation.</p>
+            </div>
+
+            <div class="codecard">
+                <header>
+                    <span>Python</span>
+                    <button data-copy="#qs-snippet" aria-label="Copy">📋</button>
+                </header>
+                <pre><code id="qs-snippet" class="language-python">from kvboost import KVBoost
+
+engine = KVBoost.from_pretrained("Qwen/Qwen2.5-3B")
+
+# Warm a shared prefix once
+engine.warm("You are a helpful coding assistant. Always be concise...")
+
+# Subsequent generates reuse cached chunks automatically
+result = engine.generate(
+    "You are a helpful coding assistant. Always be concise...\n\n"
+    "User: How do I reverse a linked list?\nAssistant:",
+    max_new_tokens=128,
+)
+
+print(result.output_text)
+print(f"TTFT: {result.ttft_ms:.1f} ms  |  cache reuse: {result.kv_reuse_ratio:.0%}")</code></pre>
+            </div>
+
+            <div class="codecard">
+                <header>
+                    <span>Streaming AWQ — one line different</span>
+                    <button data-copy="#qs-stream" aria-label="Copy">📋</button>
+                </header>
+                <pre><code id="qs-stream" class="language-python">from kvboost import KVBoost
+from kvboost.streaming import StreamingConfig
+
+# Adds the streaming runtime — same engine API.
+engine = KVBoost.from_pretrained(
+    "Qwen/Qwen2.5-32B-Instruct-AWQ",
+    streaming_config=StreamingConfig(keep_first_k=4, keep_last_k=4),
+    max_cache_bytes=1 * 1024**3,
+)
+print(engine.generate("Explain entropy.", max_new_tokens=64).output_text)</code></pre>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <div class="footer-inner">
+            <div>
+                <strong>KVBoost</strong> · MIT license ·
+                built by <a href="https://github.com/pythongiant">@pythongiant</a>
+            </div>
+            <div class="footer-meta">
+                <span id="git-info">…</span>
+                <a href="https://github.com/pythongiant/kvboost">GitHub</a>
+                <a href="https://pypi.org/project/kvboost/">PyPI</a>
+                <a href="https://kvboost.readthedocs.io">RTD docs</a>
+            </div>
+        </div>
+    </footer>
+</body>
+</html>
