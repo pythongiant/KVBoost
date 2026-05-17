@@ -58,6 +58,9 @@ def marlin_awq_available() -> bool:
     return _GEMM_FN is not None and torch.cuda.is_available()
 
 
+_SPLIT_K_ITERS = 8  # autoawq's default; tunes K-dim parallelism, not correctness
+
+
 def marlin_awq_linear(
     x: torch.Tensor,
     qweight: torch.Tensor,
@@ -69,20 +72,30 @@ def marlin_awq_linear(
 ) -> torch.Tensor:
     """Invoke the resolved Marlin/AWQ GEMM kernel.
 
-    The first kernel signature we try is the historical AutoAWQ one:
-    ``gemm_forward_cuda(x, qweight, scales, qzeros, group_size)``. If that
-    fails (e.g. vLLM's awq_marlin_gemm uses a different argument order),
-    we let the caller decide whether to fall back.
+    autoawq's ``gemm_forward_cuda`` expects a flat 2-D activation
+    ``(M, in_features)`` and the parallelism knob ``split_k_iters`` as
+    the last argument — NOT ``group_size`` (group_size is implicit in
+    the shape of ``scales``). Passing group_size here causes a SIGFPE
+    inside the kernel.
+
+    We reshape ``x`` down to 2-D for the call and lift the output back
+    to ``x.shape[:-1] + (out_features,)``.
     """
     if _GEMM_FN is None:
         raise RuntimeError("no Marlin/AWQ GEMM kernel available")
 
-    try:
-        out = _GEMM_FN(x, qweight, scales, qzeros, group_size)
-    except TypeError:
-        # Try the vLLM-style signature.
-        out = _GEMM_FN(x, qweight, qzeros, scales, group_size)
+    pack = 8
+    out_features = qweight.shape[1] * pack
+    out_shape = x.shape[:-1] + (out_features,)
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
 
+    try:
+        out = _GEMM_FN(x_2d, qweight, scales, qzeros, _SPLIT_K_ITERS)
+    except TypeError:
+        # vLLM's awq_marlin_gemm uses (x, qweight, qzeros, scales, group_size).
+        out = _GEMM_FN(x_2d, qweight, qzeros, scales, group_size)
+
+    out = out.reshape(out_shape)
     if bias is not None:
         out = out + bias.to(out.dtype)
     return out
