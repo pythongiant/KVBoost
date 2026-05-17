@@ -312,17 +312,29 @@ class AWQLoader:
         self,
         layer_idx: int,
     ) -> dict[str, torch.Tensor]:
+        """Return a layer's streamed tensors as pinned-host tensors.
+
+        Cached: on the second call for the same layer we hand back the
+        already-pinned tensors and skip the safetensors read entirely. The
+        streaming scheduler calls this once per layer per token, so missing
+        the cache pays full disk I/O on every decode step — that's a 3+
+        second per-token regression on a 32B model.
+        """
 
         assert self.index is not None
 
         layer = self.index.layers[layer_idx]
+        needed = [s for s in layer.tensors.values() if not s.is_resident]
+
+        # Cache hit: every needed tensor is already in _pinned_tensors.
+        # Strict all-or-nothing — partial hits force a re-read so we don't
+        # mix tensors from different load passes (defensive; in practice
+        # we either pinned the whole layer or none of it).
+        if needed and all(s.name in self._pinned_tensors for s in needed):
+            return {s.name: self._pinned_tensors[s.name] for s in needed}
 
         grouped: dict[Path, list[TensorSpec]] = {}
-
-        for spec in layer.tensors.values():
-            if spec.is_resident:
-                continue
-
+        for spec in needed:
             grouped.setdefault(spec.path, []).append(spec)
 
         out: dict[str, torch.Tensor] = {}
