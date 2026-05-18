@@ -470,35 +470,70 @@ class AWQLoader:
         assert self.index is not None
         target_device = device if device is not None else self.device_spec.device
 
+        # Resolve each sub_path to the safetensors source paths it needs.
+        # For the SwiGLU-fused module ``mlp.gate_up_proj``, the checkpoint
+        # has no key under that name — instead pull from ``mlp.gate_proj``
+        # and ``mlp.up_proj`` and concat along ``dim=-1`` on the host
+        # before binding. Bias is rare in AWQ MLPs, so handle the all-or-
+        # nothing case (both present → concat; both absent → None).
+        def _source_sub_paths(sub_path: str) -> list[str]:
+            if sub_path == _FUSED_SUB_PATH:
+                return [_GATE_SUB_PATH, _UP_SUB_PATH]
+            return [sub_path]
+
         # Group every needed tensor by its shard for one open per shard.
-        by_shard: dict[Path, list[tuple[int, str, str, TensorSpec]]] = {}
+        # The tuple now carries (layer_idx, fused_or_real_sub_path,
+        # source_sub_path, kind, spec) so the loader knows which fused
+        # slot the loaded tensor will eventually concat into.
+        by_shard: dict[Path, list[tuple[int, str, str, str, TensorSpec]]] = {}
         for layer_idx, qlinears in layer_replacements.items():
             for sub_path in qlinears:
-                base = f"model.layers.{layer_idx}.{sub_path}"
-                for kind in ("qweight", "scales", "qzeros", "bias"):
-                    tensor_name = f"{base}.{kind}"
-                    spec = self.index.tensors.get(tensor_name)
-                    if spec is None:
-                        continue  # bias is often absent in AWQ checkpoints
-                    by_shard.setdefault(spec.path, []).append(
-                        (layer_idx, sub_path, kind, spec)
-                    )
+                for src in _source_sub_paths(sub_path):
+                    base = f"model.layers.{layer_idx}.{src}"
+                    for kind in ("qweight", "scales", "qzeros", "bias"):
+                        tensor_name = f"{base}.{kind}"
+                        spec = self.index.tensors.get(tensor_name)
+                        if spec is None:
+                            continue  # bias is often absent in AWQ
+                        by_shard.setdefault(spec.path, []).append(
+                            (layer_idx, sub_path, src, kind, spec)
+                        )
 
-        loaded: dict[tuple[int, str, str], torch.Tensor] = {}
+        # Keyed by (layer_idx, target_sub_path, source_sub_path, kind) so
+        # we can pull both halves of a fused module back out in order.
+        loaded: dict[tuple[int, str, str, str], torch.Tensor] = {}
         for shard_path, items in by_shard.items():
             with safe_open(shard_path, framework="pt", device="cpu") as f:
-                for layer_idx, sub_path, kind, spec in items:
+                for layer_idx, sub_path, src, kind, spec in items:
                     tensor = f.get_tensor(spec.name).to(target_device)
-                    loaded[(layer_idx, sub_path, kind)] = tensor
+                    loaded[(layer_idx, sub_path, src, kind)] = tensor
 
         for layer_idx, qlinears in layer_replacements.items():
             for sub_path, qlin in qlinears.items():
-                key = (layer_idx, sub_path)
+                sources = _source_sub_paths(sub_path)
+
+                def _gather(kind: str) -> Optional[torch.Tensor]:
+                    parts = [
+                        loaded.get((layer_idx, sub_path, src, kind))
+                        for src in sources
+                    ]
+                    if all(p is None for p in parts):
+                        return None
+                    if any(p is None for p in parts):
+                        raise RuntimeError(
+                            f"layer {layer_idx} {sub_path}.{kind}: partial "
+                            f"presence across sources {sources} — refuse to "
+                            f"bind a half-fused tensor."
+                        )
+                    if len(parts) == 1:
+                        return parts[0]
+                    return torch.cat(parts, dim=-1)  # type: ignore[arg-type]
+
                 qlin.rebind(
-                    qweight=loaded[(*key, "qweight")],
-                    scales=loaded[(*key, "scales")],
-                    qzeros=loaded[(*key, "qzeros")],
-                    bias=loaded.get((*key, "bias")),
+                    qweight=_gather("qweight"),
+                    scales=_gather("scales"),
+                    qzeros=_gather("qzeros"),
+                    bias=_gather("bias"),
                 )
 
     # =========================================================================
@@ -981,3 +1016,129 @@ def _assign_dotted_attribute(
         parent._buffers[leaf] = value
     else:
         setattr(parent, leaf, value)
+
+
+# =============================================================================
+# SwiGLU fusion helpers
+# =============================================================================
+
+
+_GATE_SUB_PATH = "mlp.gate_proj"
+_UP_SUB_PATH = "mlp.up_proj"
+_FUSED_SUB_PATH = "mlp.gate_up_proj"
+
+
+def fuse_gate_up_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    key_prefix: str = "",
+) -> dict[str, torch.Tensor]:
+    """Concat ``mlp.gate_proj.{kind}`` + ``mlp.up_proj.{kind}`` along
+    ``dim=1`` into a single ``mlp.gate_up_proj.{kind}`` entry, for each
+    AWQ tensor kind present (qweight, scales, qzeros, bias).
+
+    AWQ packs 8 four-bit nibbles per int32 along ``out_features``, so
+    concatenating ``dim=1`` is byte-safe when both gate_out and up_out
+    are multiples of 8 (always true for SwiGLU intermediate sizes).
+
+    Tensors not belonging to gate/up are passed through unchanged.
+
+    ``key_prefix`` is prepended to all three of ``{gate, up, fused}``
+    sub-paths when the loader is using full safetensors keys
+    (``model.layers.{i}.mlp.gate_proj.qweight``). For layer-relative
+    keys (``mlp.gate_proj.qweight``), pass ``""``.
+    """
+    gate_prefix = f"{key_prefix}{_GATE_SUB_PATH}."
+    up_prefix = f"{key_prefix}{_UP_SUB_PATH}."
+    fused_prefix = f"{key_prefix}{_FUSED_SUB_PATH}."
+
+    # Collect gate/up per kind so we can decide which fused keys to emit.
+    gate_by_kind: dict[str, torch.Tensor] = {}
+    up_by_kind: dict[str, torch.Tensor] = {}
+    passthrough: dict[str, torch.Tensor] = {}
+
+    for key, tensor in tensors.items():
+        if key.startswith(gate_prefix):
+            gate_by_kind[key[len(gate_prefix):]] = tensor
+        elif key.startswith(up_prefix):
+            up_by_kind[key[len(up_prefix):]] = tensor
+        else:
+            passthrough[key] = tensor
+
+    if not gate_by_kind and not up_by_kind:
+        return passthrough
+
+    if set(gate_by_kind.keys()) != set(up_by_kind.keys()):
+        # Defensive: a partial schema would silently emit a half-fused
+        # tensor and we'd hit a CUDA shape error mid-forward. Better
+        # to fail with the names so the user can fix the bind input.
+        raise ValueError(
+            f"gate/up kind mismatch — gate has {sorted(gate_by_kind)}, "
+            f"up has {sorted(up_by_kind)}. Did you skip the bias on one side?"
+        )
+
+    fused: dict[str, torch.Tensor] = dict(passthrough)
+    for kind, g_tensor in gate_by_kind.items():
+        u_tensor = up_by_kind[kind]
+        # bias is 1-D ``(out_features,)``; everything else is 2-D with
+        # out_features on dim=1. Concat on the last dim either way.
+        fused[fused_prefix + kind] = torch.cat([g_tensor, u_tensor], dim=-1)
+    return fused
+
+
+def fuse_gate_up_layer_spec(layer: "LayerSpec") -> "LayerSpec":
+    """Return a new ``LayerSpec`` with gate_proj/up_proj TensorSpecs
+    merged into a single ``mlp.gate_up_proj.{kind}`` entry.
+
+    Slot layout drives byte placement from these specs; if the layout
+    sees two separate gate/up entries while the loader emits a fused
+    tensor, the arena will try to memcpy a too-big tensor into a too-
+    small slot region. Keep them in lockstep by transforming both
+    sides via this helper.
+
+    Layer-relative keys only (sub_path form, no ``model.layers.{i}.``).
+    """
+    gate_specs: dict[str, "TensorSpec"] = {}
+    up_specs: dict[str, "TensorSpec"] = {}
+    passthrough: dict[str, "TensorSpec"] = {}
+
+    for name, spec in layer.tensors.items():
+        if name.startswith(_GATE_SUB_PATH + "."):
+            gate_specs[name[len(_GATE_SUB_PATH) + 1:]] = spec
+        elif name.startswith(_UP_SUB_PATH + "."):
+            up_specs[name[len(_UP_SUB_PATH) + 1:]] = spec
+        else:
+            passthrough[name] = spec
+
+    if not gate_specs or not up_specs:
+        return layer
+
+    merged: dict[str, "TensorSpec"] = dict(passthrough)
+    for kind, g_spec in gate_specs.items():
+        u_spec = up_specs[kind]
+        if g_spec.dtype != u_spec.dtype:
+            raise ValueError(
+                f"gate/up dtype mismatch for {kind}: "
+                f"{g_spec.dtype} vs {u_spec.dtype}"
+            )
+        # Stack along dim=-1 (out_features). Both 1-D bias and 2-D
+        # qweight/scales/qzeros work the same way — last dim grows.
+        new_shape = list(g_spec.shape)
+        new_shape[-1] = g_spec.shape[-1] + u_spec.shape[-1]
+        merged_name = f"{_FUSED_SUB_PATH}.{kind}"
+        merged[merged_name] = TensorSpec(
+            name=merged_name,
+            path=g_spec.path,  # not load-source-of-truth post-fusion
+            shape=tuple(new_shape),
+            dtype=g_spec.dtype,
+            layer_idx=g_spec.layer_idx,
+            is_quantized=g_spec.is_quantized,
+            is_resident=g_spec.is_resident,
+            nbytes=g_spec.nbytes + u_spec.nbytes,
+        )
+
+    return LayerSpec(
+        layer_idx=layer.layer_idx,
+        tensors=merged,
+        resident=layer.resident,
+    )

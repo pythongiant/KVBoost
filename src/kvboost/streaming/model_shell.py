@@ -37,10 +37,12 @@ from .awq_loader import (
     TensorSpec,
     _assign_dotted_attribute,
     _resolve_dotted_attribute,
+    fuse_gate_up_layer_spec,
+    fuse_gate_up_tensors,
 )
 from .config import StreamingConfig
 from .profile import get_profiler
-from .qkv_proj import StreamingQLinear
+from .qkv_proj import StreamingQLinear, StreamingQLinearGateUp
 from .scheduler import StreamingScheduler
 
 logger = logging.getLogger(__name__)
@@ -237,6 +239,25 @@ class StreamingCausalLM(nn.Module):
             total_streamed, len(streamed_qlinears),
         )
 
+        # 2b. SwiGLU gate+up fusion (opt-in via StreamingConfig). Must run
+        #     BEFORE bind_streaming_qlinears (which inspects which sub_paths
+        #     are present) and BEFORE _build_scheduler (which builds the
+        #     slot layout from the per-layer tensor schema). The fusion
+        #     mutates the hf_model tree (mlp.gate_up_proj installed,
+        #     .mlp wrapped in StreamingMLP) and returns updated qlinears
+        #     dicts keyed on the fused sub_path.
+        if streaming_config.fuse_gate_up:
+            streamed_qlinears = _apply_gate_up_fusion(
+                hf_model,
+                layer_replacements=streamed_qlinears,
+                group_size=group_size,
+            )
+            resident_qlinears = _apply_gate_up_fusion(
+                hf_model,
+                layer_replacements=resident_qlinears,
+                group_size=group_size,
+            )
+
         # 3. Materialize non-quant resident tensors (embeds, lm_head,
         #    final norm, per-layer layernorms, qkv biases on resident
         #    layers) onto GPU. Quant projection tensors (qweight/scales/
@@ -346,6 +367,17 @@ class StreamingCausalLM(nn.Module):
             prefer="torch",
             cache_dense=cache_dense,
         )
+
+        # 3b. SwiGLU fusion before bind — same reasoning as the CUDA
+        #     path. bind_streaming_qlinears below knows how to assemble
+        #     the fused mlp.gate_up_proj from gate_proj+up_proj source
+        #     tensors in the checkpoint.
+        if streaming_config.fuse_gate_up:
+            replacements = _apply_gate_up_fusion(
+                hf_model,
+                layer_replacements=replacements,
+                group_size=group_size,
+            )
 
         # 4. Materialize the resident parts (embeddings, lm_head, norms,
         #    per-layer layernorms) onto MPS.
@@ -784,6 +816,109 @@ def _replace_linears_for_quant_paths(
     return out
 
 
+class StreamingMLP(nn.Module):
+    """SwiGLU MLP wired to a fused ``gate_up_proj`` + ``down_proj``.
+
+    Replaces HF's ``Qwen2MLP`` / ``LlamaMLP`` on any layer where we
+    fused gate_proj and up_proj. Forward pattern is the standard
+    SwiGLU contract — ``down(silu(gate(x)) * up(x))`` — only the
+    matmul-and-elementwise sequence is collapsed into one fused
+    call via :meth:`StreamingQLinearGateUp.forward_silu_mul`.
+
+    The replacement carries no parameters of its own; both child
+    projections are :class:`StreamingQLinear` instances that hold
+    references to slot views (streamed layers) or resident weights.
+    """
+
+    def __init__(
+        self,
+        gate_up_proj: StreamingQLinearGateUp,
+        down_proj: StreamingQLinear,
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = gate_up_proj
+        self.down_proj = down_proj
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.gate_up_proj.forward_silu_mul(x))
+
+
+def _apply_gate_up_fusion(
+    hf_model: nn.Module,
+    *,
+    layer_replacements: dict[int, dict[str, StreamingQLinear]],
+    group_size: int,
+) -> dict[int, dict[str, StreamingQLinear]]:
+    """For every layer in ``layer_replacements``, merge ``mlp.gate_proj``
+    and ``mlp.up_proj`` into a single ``mlp.gate_up_proj`` of type
+    :class:`StreamingQLinearGateUp`, then swap the layer's ``.mlp``
+    submodule for a :class:`StreamingMLP` that drives the fused path.
+
+    Returns a NEW replacements dict where each layer's ``mlp.gate_proj``
+    and ``mlp.up_proj`` entries are gone, replaced by a single
+    ``mlp.gate_up_proj`` entry. Layers without both projections (resident
+    layers in modes where MLP isn't touched, or hybrid architectures)
+    are passed through unchanged.
+
+    The caller still uses the returned dict to drive the loader bind /
+    scheduler rebind — both have been taught to handle ``mlp.gate_up_proj``
+    as a fused module.
+    """
+    fused_replacements: dict[int, dict[str, StreamingQLinear]] = {}
+    decoder_layers = dict(_iter_decoder_layers(hf_model))
+
+    for layer_idx, qlinears in layer_replacements.items():
+        gate = qlinears.get("mlp.gate_proj")
+        up = qlinears.get("mlp.up_proj")
+        if gate is None or up is None:
+            # Nothing to fuse on this layer — keep its qlinears as-is.
+            fused_replacements[layer_idx] = dict(qlinears)
+            continue
+
+        if gate.in_features != up.in_features:
+            raise ValueError(
+                f"layer {layer_idx}: gate.in_features ({gate.in_features}) "
+                f"!= up.in_features ({up.in_features}); cannot fuse"
+            )
+
+        fused = StreamingQLinearGateUp(
+            in_features=gate.in_features,
+            gate_out=gate.out_features,
+            up_out=up.out_features,
+            group_size=group_size,
+            prefer=gate.prefer,
+            cache_dense=gate.cache_dense,
+            layer_idx=layer_idx,
+            sub_path="mlp.gate_up_proj",
+        )
+
+        hf_layer = decoder_layers[layer_idx]
+        # Plant the fused module at mlp.gate_up_proj. The walker doesn't
+        # need to delete the old gate_proj / up_proj attrs — wrapping
+        # ``.mlp`` in StreamingMLP below makes them unreachable.
+        _set_submodule(hf_layer, "mlp.gate_up_proj", fused)
+
+        down = qlinears.get("mlp.down_proj")
+        if down is None:
+            raise RuntimeError(
+                f"layer {layer_idx}: gate_up fused but mlp.down_proj is "
+                f"missing — refusing to leave the MLP in a half-built state."
+            )
+
+        # Drop in StreamingMLP — HF's forward will now call our compact
+        # path instead of its own gate/silu/up/mul/down sequence.
+        _set_submodule(hf_layer, "mlp", StreamingMLP(fused, down))
+
+        new_qlinears = {
+            k: v for k, v in qlinears.items()
+            if k not in ("mlp.gate_proj", "mlp.up_proj")
+        }
+        new_qlinears["mlp.gate_up_proj"] = fused
+        fused_replacements[layer_idx] = new_qlinears
+
+    return fused_replacements
+
+
 def _materialize_meta_buffers(
     hf_model: nn.Module,
     *,
@@ -865,6 +1000,11 @@ def _build_scheduler(
             tensors=normalized,
             resident=False,
         )
+        # SwiGLU fusion: collapse mlp.gate_proj + mlp.up_proj into a
+        # single mlp.gate_up_proj TensorSpec so the slot layout
+        # allocates one contiguous region for the fused tensors.
+        if streaming_config.fuse_gate_up:
+            proj_only = fuse_gate_up_layer_spec(proj_only)
         layer_specs_streaming.append(proj_only)
 
     def prefetch_source_fn(layer_idx: int) -> dict[str, torch.Tensor]:
@@ -872,11 +1012,16 @@ def _build_scheduler(
         # ("model.layers.{i}.self_attn.q_proj.qweight"). Normalize to the
         # same layer-relative form the slot layout was built with.
         raw = loader.pin_layer(layer_idx)
-        return {
+        layer_relative = {
             _strip_layer_prefix(k, layer_idx): v
             for k, v in raw.items()
             if "proj" in k
         }
+        if streaming_config.fuse_gate_up:
+            # Concat mlp.gate_proj/up_proj into mlp.gate_up_proj host-side
+            # before the DMA — matches the fused slot layout key schema.
+            layer_relative = fuse_gate_up_tensors(layer_relative)
+        return layer_relative
 
     device = torch.device("cuda")
     num_slots = _resolve_num_slots(

@@ -99,6 +99,18 @@ class StreamingConfig:
     quant_kernel: Literal["marlin", "exllama_v2", "auto"] = "auto"
 
     #
+    # Fusion
+    #
+
+    # Merge SwiGLU's gate_proj and up_proj into a single matmul with
+    # 2× out_features, then split + silu+mul afterward. Saves one kernel
+    # launch and one HBM read of the activation per layer. Profile-driven
+    # win when ``qlinear.forward::{gate_proj,up_proj}`` exceeds 25% of
+    # total per-token time. Default on; set False to A/B against the
+    # unfused path with the same trace.
+    fuse_gate_up: bool = True
+
+    #
     # Runtime behavior
     #
 
@@ -204,6 +216,7 @@ class StreamingConfig:
             f"keep_first_k={self.keep_first_k}, "
             f"keep_last_k={self.keep_last_k}, "
             f"slots={slots_str}, "
-            f"kernel={self.quant_kernel}"
+            f"kernel={self.quant_kernel}, "
+            f"fuse_gate_up={self.fuse_gate_up}"
             ")"
         )

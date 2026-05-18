@@ -164,4 +164,67 @@ class StreamingQLinear(nn.Module):
         )
 
 
-__all__ = ["StreamingQLinear"]
+class StreamingQLinearGateUp(StreamingQLinear):
+    """SwiGLU fusion: gate_proj and up_proj as one stacked AWQ GEMM.
+
+    The two projections in a SwiGLU MLP take the same input ``x`` and
+    write outputs of the same width (``intermediate_size``). Packing
+    them along ``dim=1`` (out_features) lets a single ``awq_linear``
+    call replace two — saves one kernel launch and one HBM read of
+    ``x`` per layer.
+
+    The fused module carries ``out_features = gate_out + up_out``. The
+    split + silu*mul happens in :meth:`forward_silu_mul`. ``forward``
+    is kept as the unsplit matmul so callers that want raw access
+    (debug, parity tests) still get the concat'd matrix.
+
+    Binding contract: same as ``StreamingQLinear``, but the four AWQ
+    tensors must already be concatenated host-side. See
+    :func:`awq_loader.fuse_gate_up_tensors` for the concat helper.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        gate_out: int,
+        up_out: int,
+        *,
+        group_size: int,
+        prefer: str = "auto",
+        cache_dense: bool = False,
+        layer_idx: Optional[int] = None,
+        sub_path: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            in_features=in_features,
+            out_features=gate_out + up_out,
+            group_size=group_size,
+            prefer=prefer,
+            cache_dense=cache_dense,
+            layer_idx=layer_idx,
+            sub_path=sub_path,
+        )
+        self.gate_out = gate_out
+        self.up_out = up_out
+
+    def forward_silu_mul(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the fused matmul, split into (gate, up), apply SwiGLU.
+
+        Returns ``silu(gate) * up`` — the input to ``down_proj``.
+        """
+        gu = self.forward(x)
+        gate, up = gu.split([self.gate_out, self.up_out], dim=-1)
+        return torch.nn.functional.silu(gate) * up
+
+    def extra_repr(self) -> str:
+        mode = "dense" if self.cache_dense else "streaming"
+        return (
+            f"in_features={self.in_features}, "
+            f"gate_out={self.gate_out}, up_out={self.up_out}, "
+            f"group_size={self.group_size}, "
+            f"mode={mode}, "
+            f"bound={self.is_bound}"
+        )
+
+
+__all__ = ["StreamingQLinear", "StreamingQLinearGateUp"]
