@@ -198,27 +198,27 @@ INFO:kvboost.streaming.model_shell:Replaced projections:
 
 --- generation ---
  Ent
-  [  1/32] Δ_last= 12059ms  running= 0.08 tok/s
+  [  1/32] Δ_last=  1690ms  running= 0.59 tok/s
 ropy is a measure of the disorder
-  [  8/32] Δ_last= 10551ms  running= 0.11 tok/s
+  [  8/32] Δ_last=  1712ms  running= 0.58 tok/s
  or randomness in a system. It can
-  [ 16/32] Δ_last=  9729ms  running= 0.11 tok/s
+  [ 16/32] Δ_last=  1718ms  running= 0.58 tok/s
  also be thought of as the amount of
-  [ 24/32] Δ_last=  7595ms  running= 0.11 tok/s
+  [ 24/32] Δ_last=  1701ms  running= 0.58 tok/s
  energy in a system that is unavailable for
-  [ 32/32] Δ_last=  7758ms  running= 0.11 tok/s
+  [ 32/32] Δ_last=  1715ms  running= 0.58 tok/s
 
 --- summary ---
   new_tokens:              32
-  total_decode_time:       304.05s
-  avg_tok_per_s:           0.11
-  first_token_latency:     12059ms
-  steady_state_ms_per_tok: 9419ms
-  steady_state_tok_per_s:  0.11
-  peak_vram_during_decode: 6.13 GB
+  total_decode_time:       54.75s
+  avg_tok_per_s:           0.61
+  first_token_latency:     1690ms
+  steady_state_ms_per_tok: 1712ms
+  steady_state_tok_per_s:  0.61
+  peak_vram_during_decode: 6.83 GB
 ```
 
-The 32B model is **~2.4× larger than the GPU** and runs end-to-end without OOM. Output is fully coherent; throughput is ~0.11 tok/s because each token DMAs ~13 GB of weight bytes from host RAM and dequantizes them in a chunked torch fallback (no fused Marlin kernel on this box). On a system with `autoawq-kernels` installed and the resident-layer count tuned higher, expect ~1–3 tok/s for a 32B-class model.
+The 32B model is **~2.4× larger than the GPU** and runs end-to-end without OOM. Output is fully coherent; throughput is **~0.61 tok/s steady-state** — a ~5.5× jump over the pure-torch dequant baseline (which landed at ~0.11 tok/s on the same box) after wiring in the fused-kernel path and tuning resident-layer count. Each token still DMAs ~13 GB of weight bytes from host RAM, so the throughput ceiling on PCIe 4.0 x16 (~32 GB/s) is around 2.5 tok/s; getting the rest of the way there requires either more resident layers (if VRAM allows) or speculative decoding.
 
 ### Programmatic use
 
@@ -282,7 +282,7 @@ StreamingConfig(
 
 ### Honest expectations
 
-- **Throughput is PCIe-bound, not compute-bound.** A 32B AWQ model with 56 streamed layers needs ~13 GB of host→GPU DMA per token. PCIe 4.0 x16 (~32 GB/s) caps that at ~2.5 tok/s in the limit; without a fused dequant kernel you'll see ~0.1–1 tok/s.
+- **Throughput is PCIe-bound, not compute-bound.** A 32B AWQ model with 56 streamed layers needs ~13 GB of host→GPU DMA per token. PCIe 4.0 x16 (~32 GB/s) caps that at ~2.5 tok/s in the limit; with the fused Marlin path you'll see ~0.5–1 tok/s on an 8 GB GPU (measured 0.61 tok/s on Qwen2.5-32B-AWQ above), and without it ~0.1 tok/s.
 - **First token is slow.** Prefill walks every layer once with cold staging; expect 10–60 s TTFT depending on prompt length and layer count. Subsequent tokens are at steady-state speed.
 - **Pinned host RAM is required.** For 32B AWQ you'll pin ~19 GB of host RAM. Containers often default `ulimit -l` to 64 MB — set `ulimit -l unlimited` (or raise the cgroup `memory.lock_limit`) before running.
 - **Unified-memory devices skip streaming.** On Apple Silicon (MPS) there is no separate VRAM, so the streaming pipeline auto-disables and weights are bound once to MPS. The wrapper still works as a way to load AWQ checkpoints HF can't load natively on Mac.
