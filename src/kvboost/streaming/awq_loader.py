@@ -319,6 +319,13 @@ class AWQLoader:
         streaming scheduler calls this once per layer per token, so missing
         the cache pays full disk I/O on every decode step — that's a 3+
         second per-token regression on a 32B model.
+
+        When ``streaming_config.fuse_gate_up`` is set, the returned dict
+        contains a pre-fused, pinned ``mlp.gate_up_proj.{kind}`` entry in
+        place of the source ``mlp.gate_proj.{kind}`` + ``mlp.up_proj.{kind}``
+        entries. The fusion buffer is allocated once per layer and the
+        source entries in ``_pinned_tensors`` are rewritten as ``.narrow()``
+        views into it, so subsequent calls are pure dict lookups.
         """
 
         assert self.index is not None
@@ -326,12 +333,17 @@ class AWQLoader:
         layer = self.index.layers[layer_idx]
         needed = [s for s in layer.tensors.values() if not s.is_resident]
 
+        fuse = self.streaming_config.fuse_gate_up
+
         # Cache hit: every needed tensor is already in _pinned_tensors.
         # Strict all-or-nothing — partial hits force a re-read so we don't
         # mix tensors from different load passes (defensive; in practice
         # we either pinned the whole layer or none of it).
         if needed and all(s.name in self._pinned_tensors for s in needed):
-            return {s.name: self._pinned_tensors[s.name] for s in needed}
+            cached = {s.name: self._pinned_tensors[s.name] for s in needed}
+            if fuse:
+                return self._with_fused_view(cached, layer_idx)
+            return cached
 
         grouped: dict[Path, list[TensorSpec]] = {}
         for spec in needed:
@@ -359,7 +371,103 @@ class AWQLoader:
 
         self._pinned_tensors.update(out)
 
+        if fuse:
+            return self._with_fused_view(out, layer_idx)
         return out
+
+    def _with_fused_view(
+        self,
+        tensors: dict[str, torch.Tensor],
+        layer_idx: int,
+    ) -> dict[str, torch.Tensor]:
+        """Replace source ``mlp.gate_proj.{kind}`` + ``mlp.up_proj.{kind}``
+        entries with a single pre-fused, pinned ``mlp.gate_up_proj.{kind}``
+        entry per kind.
+
+        The fused buffer is allocated once per (layer, kind) on first call
+        and stashed in ``_pinned_tensors`` under the fused key. The source
+        entries in ``_pinned_tensors`` are rebound to ``.narrow()`` views
+        of the fused buffer; this keeps the cache-hit check valid (source
+        names still resolve) while freeing the standalone source pinned
+        allocations.
+
+        Returned dict has the fused key and no gate/up sources, so the
+        downstream slot layout (built with the fused schema) finds the
+        tensors it expects without any per-token ``torch.cat``.
+        """
+        gate_prefix = f"model.layers.{layer_idx}.{_GATE_SUB_PATH}."
+        up_prefix = f"model.layers.{layer_idx}.{_UP_SUB_PATH}."
+        fused_prefix = f"model.layers.{layer_idx}.{_FUSED_SUB_PATH}."
+
+        gate_by_kind: dict[str, torch.Tensor] = {}
+        up_by_kind: dict[str, torch.Tensor] = {}
+        passthrough: dict[str, torch.Tensor] = {}
+
+        for name, tensor in tensors.items():
+            if name.startswith(gate_prefix):
+                gate_by_kind[name[len(gate_prefix):]] = tensor
+            elif name.startswith(up_prefix):
+                up_by_kind[name[len(up_prefix):]] = tensor
+            else:
+                passthrough[name] = tensor
+
+        if not gate_by_kind and not up_by_kind:
+            return passthrough
+
+        if set(gate_by_kind.keys()) != set(up_by_kind.keys()):
+            raise ValueError(
+                f"gate/up kind mismatch — gate has {sorted(gate_by_kind)}, "
+                f"up has {sorted(up_by_kind)}. Did you skip the bias on one side?"
+            )
+
+        result = dict(passthrough)
+        for kind, gate in gate_by_kind.items():
+            up = up_by_kind[kind]
+            fused_name = fused_prefix + kind
+            fused = self._pinned_tensors.get(fused_name)
+            if fused is None:
+                fused = self._build_fused_pinned(gate, up)
+                self._pinned_tensors[fused_name] = fused
+                # Rebind source entries to views of the fused buffer so the
+                # cache-hit path in pin_layer() still resolves them, and
+                # release the original standalone source allocations.
+                gate_size = gate.shape[-1]
+                up_size = up.shape[-1]
+                self._pinned_tensors[gate_prefix + kind] = fused.narrow(-1, 0, gate_size)
+                self._pinned_tensors[up_prefix + kind] = fused.narrow(-1, gate_size, up_size)
+            result[fused_name] = fused
+
+        return result
+
+    def _build_fused_pinned(
+        self,
+        gate: torch.Tensor,
+        up: torch.Tensor,
+    ) -> torch.Tensor:
+        """Allocate a pinned tensor sized for ``cat([gate, up], dim=-1)``
+        and copy both halves into it. One pinned alloc + two memcpys total,
+        amortized across the lifetime of the loader.
+        """
+        if gate.shape[:-1] != up.shape[:-1]:
+            raise ValueError(
+                f"gate/up shape mismatch on non-cat dims: "
+                f"{tuple(gate.shape)} vs {tuple(up.shape)}"
+            )
+        if gate.dtype != up.dtype:
+            raise ValueError(
+                f"gate/up dtype mismatch: {gate.dtype} vs {up.dtype}"
+            )
+
+        fused_shape = list(gate.shape)
+        fused_shape[-1] = gate.shape[-1] + up.shape[-1]
+        fused = torch.empty(
+            fused_shape,
+            dtype=gate.dtype,
+            pin_memory=self.device_spec.use_pinned_memory,
+        )
+        fused.narrow(-1, 0, gate.shape[-1]).copy_(gate)
+        fused.narrow(-1, gate.shape[-1], up.shape[-1]).copy_(up)
+        return fused
 
     def get_resident_tensor(
         self,

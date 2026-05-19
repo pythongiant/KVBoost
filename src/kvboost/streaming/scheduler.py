@@ -255,7 +255,8 @@ class StreamingScheduler:
         if wait_event is not None:
             self.transfer_stream.wait_event(wait_event)
 
-        layer_tensors = self.prefetch_source_fn(layer_idx)
+        with get_profiler().region("scheduler.prefetch_source_fn", layer_idx=layer_idx):
+            layer_tensors = self.prefetch_source_fn(layer_idx)
 
         with torch.cuda.stream(self.transfer_stream):
             self.arena.copy_layer_into_slot(slot_id, layer_tensors)

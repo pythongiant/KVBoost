@@ -38,7 +38,6 @@ from .awq_loader import (
     _assign_dotted_attribute,
     _resolve_dotted_attribute,
     fuse_gate_up_layer_spec,
-    fuse_gate_up_tensors,
 )
 from .config import StreamingConfig
 from .profile import get_profiler
@@ -1009,19 +1008,17 @@ def _build_scheduler(
 
     def prefetch_source_fn(layer_idx: int) -> dict[str, torch.Tensor]:
         # AWQLoader.pin_layer returns full safetensors keys
-        # ("model.layers.{i}.self_attn.q_proj.qweight"). Normalize to the
-        # same layer-relative form the slot layout was built with.
+        # ("model.layers.{i}.self_attn.q_proj.qweight"). When fuse_gate_up
+        # is set, it also returns the pre-fused, pinned
+        # ``mlp.gate_up_proj.{kind}`` entry in place of the gate/up sources —
+        # so this path is a pure dict comprehension on the hot path, no
+        # per-token allocation or torch.cat.
         raw = loader.pin_layer(layer_idx)
-        layer_relative = {
+        return {
             _strip_layer_prefix(k, layer_idx): v
             for k, v in raw.items()
             if "proj" in k
         }
-        if streaming_config.fuse_gate_up:
-            # Concat mlp.gate_proj/up_proj into mlp.gate_up_proj host-side
-            # before the DMA — matches the fused slot layout key schema.
-            layer_relative = fuse_gate_up_tensors(layer_relative)
-        return layer_relative
 
     device = torch.device("cuda")
     num_slots = _resolve_num_slots(
