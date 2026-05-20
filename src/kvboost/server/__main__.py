@@ -137,6 +137,26 @@ def parse_args():
                    help="AWQ GEMM kernel preference (default: auto — "
                         "probes Marlin → ExLlamaV2 → pure-torch fallback)")
 
+    # Speculative decoding — small draft model proposes K tokens per
+    # round, target verifies in one batched forward. Disabled by default.
+    p.add_argument("--speculative-draft-model", default=None,
+                   help="HuggingFace model id of the draft model. When set, "
+                        "speculative decoding is enabled. The draft must share "
+                        "a tokenizer family with the target (e.g. Qwen2.5-1.5B "
+                        "draft against Qwen2.5-32B target).")
+    p.add_argument("--speculative-gamma", type=int, default=5,
+                   help="Number of tokens the draft proposes per verification "
+                        "round (default: 5). Higher K = larger speedup when "
+                        "acceptance is high, but more wasted work when low.")
+    p.add_argument("--speculative-mode", default="greedy",
+                   choices=["greedy", "sampling"],
+                   help="Verification strategy. 'greedy' matches non-speculative "
+                        "greedy decode bit-for-bit. 'sampling' uses rejection "
+                        "sampling (Leviathan et al. 2023) for temperature > 0.")
+    p.add_argument("--speculative-temperature", type=float, default=1.0,
+                   help="Temperature applied to target logits in sampling mode "
+                        "(default: 1.0). Ignored in greedy mode.")
+
     # Server
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
@@ -299,6 +319,7 @@ def load_engine(args):
                 args.streaming_mode, args.keep_first_k, args.keep_last_k,
                 args.streaming_quant_kernel,
             )
+            speculative_cfg = _build_speculative_config(args)
             engine = InferenceEngine.from_pretrained(
                 args.model,
                 streaming_config=streaming_config,
@@ -310,6 +331,7 @@ def load_engine(args):
                 overlap_k=args.overlap_k,
                 prefill_chunk_size=args.prefill_chunk_size,
                 device=device,
+                speculative_config=speculative_cfg,
             )
             log.info("Model loaded.")
             return engine
@@ -355,10 +377,25 @@ def load_engine(args):
             overlap_k=args.overlap_k,
             prefill_chunk_size=args.prefill_chunk_size,
             device=device,
+            speculative_config=_build_speculative_config(args),
         )
 
     log.info("Model loaded.")
     return engine
+
+
+def _build_speculative_config(args):
+    """Build a SpeculativeConfig from parsed CLI args, or return None when
+    speculative decoding is disabled (no --speculative-draft-model)."""
+    if not getattr(args, "speculative_draft_model", None):
+        return None
+    from ..speculative import SpeculativeConfig
+    return SpeculativeConfig(
+        draft_model_id=args.speculative_draft_model,
+        draft_k=args.speculative_gamma,
+        mode=args.speculative_mode,
+        temperature=args.speculative_temperature,
+    )
 
 
 def main():

@@ -129,6 +129,11 @@ class StreamingConfig:
     # Experimental
     #
 
+    # DEPRECATED — this placeholder was never wired up to any code path.
+    # Speculative decoding now lives in ``kvboost.speculative.SpeculativeConfig``
+    # and is enabled via ``KVBoost.from_pretrained(..., speculative_config=...)``.
+    # Setting this flag emits a deprecation warning at validation time and
+    # otherwise has no effect.
     speculative_decode: bool = False
     paged_kv_cache: bool = False
 
@@ -203,6 +208,18 @@ class StreamingConfig:
                 raise ValueError(
                     "max_pinned_host_memory_gb must be positive"
                 )
+
+        if self.speculative_decode:
+            import warnings
+            warnings.warn(
+                "StreamingConfig.speculative_decode is a deprecated "
+                "placeholder and has no effect. Use "
+                "`kvboost.speculative.SpeculativeConfig` and pass "
+                "`speculative_config=...` to `KVBoost.from_pretrained` "
+                "instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
 
     def summary(self) -> str:
         """

@@ -303,9 +303,13 @@ class EngineWorker:
 
     def stats(self) -> dict:
         cache_stats = self.engine.cache_manager.stats()
-        return {
+        out = {
             "model": self._model_name,
             "device": self.engine.device,
             "queue": self.queue.stats(),
             "cache": cache_stats,
         }
+        spec_stats = self.engine.speculative_stats()
+        if spec_stats:
+            out["speculative"] = spec_stats
+        return out
