@@ -135,6 +135,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep-first-k", type=int, default=2)
     parser.add_argument("--keep-last-k", type=int, default=2)
     parser.add_argument(
+        "--n-staging-slots",
+        type=int,
+        default=0,
+        help="Number of staging slots; 0 = auto (clamped by auto_slots_max).",
+    )
+    parser.add_argument(
         "--mode",
         choices=("partial_resident", "ffn_only_stream", "full_stream", "full_resident"),
         default="partial_resident",
@@ -163,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         residency_mode=args.mode,
         keep_first_k=args.keep_first_k,
         keep_last_k=args.keep_last_k,
+        n_staging_slots=args.n_staging_slots,
     )
 
     print(f"Loading {args.model} ({cfg.summary()}) …", file=sys.stderr)
