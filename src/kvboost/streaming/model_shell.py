@@ -208,6 +208,17 @@ class StreamingCausalLM(nn.Module):
             layer_indices=resident_indices,
         )
 
+        # ffn_only_stream tags every layer as "streamed" because every layer
+        # has at least one non-resident projection (the FFN). But the attention
+        # projections in those layers are flagged is_resident=True at the
+        # tensor level. Partition them out and merge into resident_qlinears so
+        # they get bound once at load time and skip the streaming hook.
+        streamed_qlinears, hybrid_resident_qlinears = _partition_streamed_by_residency(
+            loader, streamed_qlinears
+        )
+        for layer_idx, qlinears in hybrid_resident_qlinears.items():
+            resident_qlinears.setdefault(layer_idx, {}).update(qlinears)
+
         total_streamed = sum(len(v) for v in streamed_qlinears.values())
         total_resident = sum(len(v) for v in resident_qlinears.values())
         if (streamed_indices or resident_indices) and (total_streamed + total_resident) == 0:
@@ -737,6 +748,70 @@ def _replace_streamed_linears(
             replacements[sub_path] = new
         out[layer_idx] = replacements
     return out
+
+
+def _partition_streamed_by_residency(
+    loader: AWQLoader,
+    streamed_qlinears: dict[int, dict[str, StreamingQLinear]],
+) -> tuple[
+    dict[int, dict[str, StreamingQLinear]],
+    dict[int, dict[str, StreamingQLinear]],
+]:
+    """Split a nominally-streamed qlinears dict by per-tensor residency.
+
+    ``streamed_layer_indices()`` returns any layer with at least one streamed
+    projection — under ``ffn_only_stream`` that's every layer, even though
+    attention projections are pinned resident. ``_replace_linears_for_quant_paths``
+    then replaces all 6 projections per layer, so the resulting
+    ``streamed_qlinears`` mixes truly-streamed FFN qlinears with effectively-
+    resident attention qlinears. The streaming pre-hook iterates over every
+    entry and looks each up in the slot views; the resident ones aren't in
+    the slot layout and raise ``KeyError``.
+
+    This helper checks each ``sub_path``'s underlying ``TensorSpec.is_resident``
+    flags and partitions accordingly. Must run **before** ``_apply_gate_up_fusion``
+    because fusion replaces ``mlp.gate_proj`` + ``mlp.up_proj`` with a synthetic
+    ``mlp.gate_up_proj`` sub_path that has no safetensors index entry.
+    """
+    assert loader.index is not None
+    truly_streamed: dict[int, dict[str, StreamingQLinear]] = {}
+    hybrid_resident: dict[int, dict[str, StreamingQLinear]] = {}
+
+    for layer_idx, qlinears in streamed_qlinears.items():
+        layer_spec = loader.index.layers.get(layer_idx)
+        if layer_spec is None:
+            truly_streamed[layer_idx] = dict(qlinears)
+            continue
+
+        prefix = f"model.layers.{layer_idx}."
+        streamed_subs: dict[str, StreamingQLinear] = {}
+        resident_subs: dict[str, StreamingQLinear] = {}
+
+        for sub_path, qlin in qlinears.items():
+            sub_prefix = f"{prefix}{sub_path}."
+            any_streamed = False
+            saw_match = False
+            for full_name, spec in layer_spec.tensors.items():
+                if not full_name.startswith(sub_prefix):
+                    continue
+                saw_match = True
+                if not spec.is_resident:
+                    any_streamed = True
+                    break
+            # If no tensors matched the sub_path (shouldn't happen for real
+            # projections), default to treating it as streamed so behavior
+            # matches the pre-fix path.
+            if any_streamed or not saw_match:
+                streamed_subs[sub_path] = qlin
+            else:
+                resident_subs[sub_path] = qlin
+
+        if streamed_subs:
+            truly_streamed[layer_idx] = streamed_subs
+        if resident_subs:
+            hybrid_resident[layer_idx] = resident_subs
+
+    return truly_streamed, hybrid_resident
 
 
 def _replace_linears_for_quant_paths(

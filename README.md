@@ -218,7 +218,18 @@ ropy is a measure of the disorder
   peak_vram_during_decode: 6.83 GB
 ```
 
-The 32B model is **~2.4× larger than the GPU** and runs end-to-end without OOM. Output is fully coherent; throughput is **~0.61 tok/s steady-state** — a ~5.5× jump over the pure-torch dequant baseline (which landed at ~0.11 tok/s on the same box) after wiring in the fused-kernel path and tuning resident-layer count. Each token still DMAs ~13 GB of weight bytes from host RAM, so the throughput ceiling on PCIe 4.0 x16 (~32 GB/s) is around 2.5 tok/s; getting the rest of the way there requires either more resident layers (if VRAM allows) or speculative decoding.
+The 32B model is **~2.4× larger than the GPU** and runs end-to-end without OOM. Output is fully coherent.
+
+**Honest throughput by hardware tier** (Qwen2.5-32B-Instruct-AWQ, 22/64 layers resident):
+
+| GPU class | Compute | Real Marlin | Realistic tok/s | Per-token DMA |
+|---|---|---|---|---|
+| **Turing laptop** (RTX 20-series, T4, RTX 5000) | sm_75, PCIe 3.0 | ✗ (falls back to `gemv_cuda`) | **~0.5 tok/s (≈30 tok/min)** | ~10 GB |
+| **Ampere+ desktop/data center** (RTX 30/40, A100, L4) | sm_80+, PCIe 4.0+ | ✓ | ~2-5 tok/s | ~10 GB |
+
+On laptop-class Turing hardware, **the floor is the INT4 GEMM, not PCIe**: Turing's 2nd-gen tensor cores can't run Marlin's tensor-core path, so each layer's quantized matmul runs on autoawq's `gemv_cuda` — correct but ~5-10× slower than Marlin on Ampere. The streaming pipeline successfully hides most of the PCIe transfer behind compute; the per-token cost is dominated by the GEMM kernel itself.
+
+This is the point of the feature: **you trade tok/s for the ability to run a model that doesn't fit at all.** On the same Turing hardware, you can pick between "0.5 tok/s on Qwen-32B" or "no Qwen-32B." There's no software trick that turns a 2060/T4 into an A100.
 
 ### Programmatic use
 
@@ -277,12 +288,12 @@ StreamingConfig(
 | Knob | Effect |
 |---|---|
 | `keep_first_k` / `keep_last_k` | More resident = faster, more VRAM. With 32B on 8 GB the sweet spot is ~4 each; on a 4 GB GPU drop to 2 each |
-| `residency_mode="ffn_only_stream"` | Attention weights resident, FFN weights streamed (FFN dominates layer bytes 2:1) — less peak VRAM at the same throughput |
+| `residency_mode="ffn_only_stream"` | Attention weights resident, FFN weights streamed (FFN domi`nates layer bytes 2:1) — less peak VRAM at the same throughput |
 | `quant_kernel="auto"` | Probes for Marlin / ExLlamaV2 at import time, falls back to a pure-torch chunked dequant if neither is available |
 
 ### Honest expectations
 
-- **Throughput is PCIe-bound, not compute-bound.** A 32B AWQ model with 56 streamed layers needs ~13 GB of host→GPU DMA per token. PCIe 4.0 x16 (~32 GB/s) caps that at ~2.5 tok/s in the limit; with the fused Marlin path you'll see ~0.5–1 tok/s on an 8 GB GPU (measured 0.61 tok/s on Qwen2.5-32B-AWQ above), and without it ~0.1 tok/s.
+- **Throughput is hardware-bound, with the bottleneck depending on tier.** On Ampere+ with real Marlin tensor-core GEMM, the floor is PCIe (~13 GB DMA / token; ceiling ~2.5 tok/s on PCIe 4.0 x16). On Turing (RTX 20-series, T4, sm_75) the floor is the INT4 GEMM itself — Marlin's tensor-core path doesn't engage on 2nd-gen tensor cores, so `gemv_cuda` runs the matmul at ~5-10× the latency of Marlin on Ampere. Expect **~0.5 tok/s (30 tok/min)** on laptop-class Turing, **~2-5 tok/s** on Ampere+. The streaming pipeline correctly overlaps transfer with compute; the gap to fully resident is the cost of the hardware not being able to absorb 32B-class weights any faster.
 - **First token is slow.** Prefill walks every layer once with cold staging; expect 10–60 s TTFT depending on prompt length and layer count. Subsequent tokens are at steady-state speed.
 - **Pinned host RAM is required.** For 32B AWQ you'll pin ~19 GB of host RAM. Containers often default `ulimit -l` to 64 MB — set `ulimit -l unlimited` (or raise the cgroup `memory.lock_limit`) before running.
 - **Unified-memory devices skip streaming.** On Apple Silicon (MPS) there is no separate VRAM, so the streaming pipeline auto-disables and weights are bound once to MPS. The wrapper still works as a way to load AWQ checkpoints HF can't load natively on Mac.
