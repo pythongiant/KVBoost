@@ -42,6 +42,7 @@ from .prompt_assembler import AssemblyMode, PromptAssembler
 from .selective_recompute import SelectiveRecompute
 from .cacheblend import CacheBlendRecompute
 from .compat import check_model_compatibility, default_device, last_logit_only, SUPPORTED_ARCHITECTURES
+from .speculative.config import SpeculativeConfig
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +98,8 @@ class InferenceEngine:
         sink_tokens: int = 0,
         # Chunked prefill (0 = disabled, single-shot prefill)
         prefill_chunk_size: int = 0,
+        # Speculative decoding (None = disabled, baseline decode path)
+        speculative_config: Optional["SpeculativeConfig"] = None,
     ):
         if device is None:
             device = default_device()
@@ -153,6 +156,35 @@ class InferenceEngine:
             recompute_ratio=recompute_ratio,
             device="cpu",
         )
+
+        # Speculative decoding (decode-phase orthogonal to recompute_strategy).
+        # CacheBlend handles prefill; speculative handles decode. They stack.
+        self.speculative_config = speculative_config
+        self.speculative_engine = None
+        if speculative_config is not None:
+            speculative_config.validate()
+            from .speculative.draft import DraftModel
+            from .speculative.engine import SpeculativeEngine
+            from .speculative.stats import SpeculativeStats
+            from .speculative.verifier import TargetVerifier
+
+            log.info(
+                "Speculative decoding enabled: %s",
+                speculative_config.summary(),
+            )
+            self._speculative_stats = SpeculativeStats()
+            draft = DraftModel(
+                speculative_config, target_tokenizer=tokenizer
+            )
+            verifier = TargetVerifier(self.model, device=device)
+            self.speculative_engine = SpeculativeEngine(
+                cfg=speculative_config,
+                target_verifier=verifier,
+                draft_model=draft,
+                stats=self._speculative_stats,
+            )
+        else:
+            self._speculative_stats = None
 
         # Install flash attention (no-op if kernel not available)
         from .flash_attn_ext import install_flash_attention
@@ -779,9 +811,62 @@ class InferenceEngine:
             if on_token is not None:
                 on_token(next_token)
 
+        # ----- speculative-decode handoff (if enabled) ------------------
+        # Prefill produced exactly one token in `generated`. Speculative
+        # takes it from here and replaces the autoregressive loop below.
+        # We extend past_kv by one forward to cover that first sampled
+        # token, then hand off — speculative's invariant is that past_kv
+        # exactly covers the input prompt_ids.
+        if self.speculative_engine is not None and len(generated) < max_new_tokens:
+            extended_pos = cached_len + len(live_ids)
+            first_t = torch.tensor(
+                [[generated[-1]]], dtype=torch.long, device=self.device
+            )
+            pos_ids = torch.tensor(
+                [[extended_pos]], dtype=torch.long, device=self.device
+            )
+            with torch.no_grad(), last_logit_only(self.model):
+                out = self.model(
+                    input_ids=first_t,
+                    past_key_values=self._as_cache(past_kv),
+                    position_ids=pos_ids,
+                    use_cache=True,
+                )
+            past_kv = self._normalize_past_kv(out.past_key_values)
+            extended_prompt_ids = list(full_token_ids) + [generated[-1]]
+            from .speculative.bridge import run_speculative_decode
+
+            spec_generated, past_kv = run_speculative_decode(
+                full_token_ids=extended_prompt_ids,
+                target_past_kv=past_kv,
+                cached_length=len(extended_prompt_ids),
+                spec_engine=self.speculative_engine,
+                max_new_tokens=max_new_tokens - len(generated),
+                eos_token_id=self.tokenizer.eos_token_id,
+                on_token=on_token,
+            )
+            generated.extend(spec_generated)
+            # Cache-commit invariant: final past_kv length must equal
+            # (cached_len + len(live_ids)) - 1 + len(generated). In dev
+            # we assert this loudly to catch rollback bugs early.
+            if __debug__:
+                expected_len = cached_len + len(live_ids) - 1 + len(generated)
+                actual_len = KVCacheManager.kv_seq_len(past_kv) if past_kv is not None else 0
+                if actual_len != expected_len:
+                    log.warning(
+                        "speculative cache-commit invariant: past_kv len %d "
+                        "!= expected %d (cached=%d live=%d gen=%d)",
+                        actual_len, expected_len,
+                        cached_len, len(live_ids), len(generated),
+                    )
+            # Skip the baseline autoregressive loop below.
+            goto_done = True
+        else:
+            goto_done = False
+
         # ----- autoregressive decode ------------------------------------
         cur_pos = cached_len + len(live_ids)
-        while len(generated) < max_new_tokens:
+        while not goto_done and len(generated) < max_new_tokens:
             if generated[-1] == self.tokenizer.eos_token_id:
                 break
             cur_ids = torch.tensor([[generated[-1]]], dtype=torch.long, device=self.device)
@@ -1062,6 +1147,19 @@ class InferenceEngine:
 
     def cache_stats(self) -> Dict:
         return self.cache_manager.stats()
+
+    def speculative_stats(self) -> Dict:
+        """Acceptance counters from the speculative decoder, if enabled.
+
+        Returns an empty dict when speculative decoding is disabled,
+        otherwise a per-engine running summary suitable for ``/v1/stats``:
+        rounds, accepted_total, committed_total, bonus_rounds,
+        target_forwards, acceptance_rate, avg_committed_per_round, and
+        the per-K histogram.
+        """
+        if self._speculative_stats is None:
+            return {}
+        return self._speculative_stats.summary()
 
     def verify_correctness(self, max_new_tokens: int = 32) -> bool:
         """
