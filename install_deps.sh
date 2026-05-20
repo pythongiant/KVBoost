@@ -62,9 +62,11 @@ if (( CPU_ONLY == 0 )); then
     GPU_LINE="$(nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader | head -1)"
     log "  GPU:    ${GPU_LINE}"
 
+    NVCC_MAJOR=""
     if command -v nvcc >/dev/null; then
         NVCC_VER="$(nvcc --version | grep release | sed -E 's/.*release ([0-9.]+).*/\1/')"
-        log "  nvcc:   ${NVCC_VER}"
+        NVCC_MAJOR="${NVCC_VER%%.*}"
+        log "  nvcc:   ${NVCC_VER} (major ${NVCC_MAJOR})"
     else
         log "  nvcc:   (not in PATH — autoawq build will fail without it)"
     fi
@@ -73,6 +75,20 @@ if (( CPU_ONLY == 0 )); then
     COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' ')"
     TORCH_ARCH="${COMPUTE_CAP}"   # autoawq wants form like "7.5"
     log "  TORCH_CUDA_ARCH_LIST will be: ${TORCH_ARCH}"
+
+    # Pick a torch wheel tag matching nvcc's MAJOR version. cpp_extension
+    # rejects builds across major versions (e.g. nvcc 12.x with torch
+    # cu13.x), so this match has to be exact at the major level.
+    if [[ -z "${TORCH_CUDA_TAG:-}" ]]; then
+        case "${NVCC_MAJOR}" in
+            11) TORCH_CUDA_TAG="cu118" ;;
+            12) TORCH_CUDA_TAG="cu128" ;;
+            13) TORCH_CUDA_TAG="cu130" ;;
+            "") TORCH_CUDA_TAG="cu128" ;;   # no nvcc — default to recent cu12
+            *)  fail "Unsupported CUDA major: ${NVCC_MAJOR}. Override with TORCH_CUDA_TAG=..." ;;
+        esac
+        log "  torch wheel tag auto-selected: ${TORCH_CUDA_TAG} (override with TORCH_CUDA_TAG=...)"
+    fi
 fi
 
 # ── 2. Virtualenv ────────────────────────────────────────────────────────────
@@ -98,16 +114,28 @@ else
     #   cu121 -> CUDA 12.1
     #   cu124 -> CUDA 12.4
     #   cu128 -> CUDA 12.8 (latest stable as of early 2026)
-    TORCH_CUDA_TAG="${TORCH_CUDA_TAG:-cu128}"
     log "  using torch wheel tag: ${TORCH_CUDA_TAG}"
+    # --index-url (not --extra-index-url): force the PyTorch index so pip
+    # cannot shadow our pinned CUDA build with a newer PyPI default that
+    # ships a different CUDA major. This is the exact bug that produced a
+    # cu13 torch on a cu12 nvcc system.
     pip install --upgrade \
-        --extra-index-url "https://download.pytorch.org/whl/${TORCH_CUDA_TAG}" \
+        --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_TAG}" \
         "torch" "torchvision"
 fi
 
 TORCH_VER="$(python -c 'import torch; print(torch.__version__)')"
 TORCH_CUDA="$(python -c 'import torch; print(torch.version.cuda or "none")')"
 log "  torch installed: ${TORCH_VER} (CUDA ${TORCH_CUDA})"
+
+# Fail loudly if torch's CUDA major doesn't match nvcc's. autoawq build
+# will fail downstream otherwise with a confusing CUDA_MISMATCH_MESSAGE.
+if (( CPU_ONLY == 0 )) && [[ -n "${NVCC_MAJOR:-}" && "${TORCH_CUDA}" != "none" ]]; then
+    TORCH_CUDA_MAJOR="${TORCH_CUDA%%.*}"
+    if [[ "${TORCH_CUDA_MAJOR}" != "${NVCC_MAJOR}" ]]; then
+        fail "torch CUDA ${TORCH_CUDA} (major ${TORCH_CUDA_MAJOR}) does not match nvcc ${NVCC_VER} (major ${NVCC_MAJOR}). Either install a matching CUDA toolkit, or set TORCH_CUDA_TAG to align (e.g. cu118 / cu128 / cu130) and re-run."
+    fi
+fi
 
 # ── 4. Install kvboost editable + extras ─────────────────────────────────────
 log "Installing kvboost (editable) with dev + streaming + server extras"
