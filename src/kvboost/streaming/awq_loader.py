@@ -904,11 +904,12 @@ class AWQLoader:
         #
 
         if cache_path.exists():
-            return torch.load(
+            loaded = torch.load(
                 cache_path,
                 map_location="cpu",
                 weights_only=True,
             )
+            return self._ensure_pinned(loaded)
 
         logger.info(
             "Repacking AWQ tensor for Marlin: %s",
@@ -922,7 +923,22 @@ class AWQLoader:
             cache_path,
         )
 
-        return repacked
+        return self._ensure_pinned(repacked)
+
+    def _ensure_pinned(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Pin ``tensor`` if pinned memory is enabled and it isn't already.
+
+        ``torch.save`` / ``torch.load`` round-trips drop the pinned flag, and
+        ``tensor.contiguous()`` returns a non-pinned copy when the input is
+        already contiguous-but-pinned in some PyTorch builds. Without this,
+        the streaming H2D copy at ``staging.copy_from_host`` would silently
+        downgrade ``non_blocking=True`` to a synchronous transfer.
+        """
+        if not self.device_spec.use_pinned_memory:
+            return tensor
+        if tensor.is_pinned():
+            return tensor
+        return tensor.pin_memory()
 
     def _call_marlin_repack(
         self,
