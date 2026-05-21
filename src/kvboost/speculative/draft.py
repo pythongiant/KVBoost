@@ -57,8 +57,16 @@ class DraftModel:
         # engine.py, which itself imports streaming).
         from ..streaming import StreamingCausalLM, StreamingConfig
 
+        # Default to partial_resident with very high keep_first/last so all
+        # layers count as resident — this is functionally equivalent to
+        # full_resident but takes StreamingCausalLM's from_config load path,
+        # which bypasses transformers' AWQ quantizer (otherwise gptqmodel
+        # intercepts and replaces our StreamingQLinear with its slow
+        # TorchAtenAwqLinear; ~80x slowdown observed on Ada hardware).
         draft_streaming_cfg = cfg.draft_streaming_config or StreamingConfig(
-            residency_mode="full_resident"
+            residency_mode="partial_resident",
+            keep_first_k=1024,
+            keep_last_k=1024,
         )
         log.info(
             "DraftModel loading %s (%s) on %s",

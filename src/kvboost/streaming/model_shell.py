@@ -132,16 +132,50 @@ class StreamingCausalLM(nn.Module):
             )
 
         if not want_streaming:
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                model_name_or_path,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-                revision=revision,
-                cache_dir=cache_dir,
-                **hf_kwargs,
+            # transformers 5.x hard-requires gptqmodel for any AWQ model
+            # loaded via from_pretrained, and gptqmodel replaces every AWQ
+            # projection with its slow TorchAtenAwqLinear (~80x slowdown
+            # observed on Ada hardware). Detect the AWQ case and rewrite
+            # the residency config to partial_resident with all-layers
+            # resident — same end state as full_resident, but takes the
+            # from_config(cfg_no_quant) load path below which installs
+            # StreamingQLinear with our fast Marlin path.
+            quant_cfg = getattr(cfg, "quantization_config", None)
+            quant_method = ""
+            if quant_cfg is not None:
+                quant_method = (
+                    getattr(quant_cfg, "quant_method", "")
+                    or (isinstance(quant_cfg, dict) and quant_cfg.get("quant_method", ""))
+                    or ""
+                )
+            is_awq = str(quant_method).lower() == "awq"
+            if not is_awq:
+                hf_model = AutoModelForCausalLM.from_pretrained(
+                    model_name_or_path,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    **hf_kwargs,
+                )
+                hf_model.eval()
+                return cls(hf_model=hf_model, streaming_config=streaming_config)
+            # Rewrite the streaming config so the loader marks every layer
+            # as resident (no scheduler / no slot copies), then fall through
+            # to the streaming code path below. Forces from_config bypass.
+            from dataclasses import replace
+            logger.info(
+                "AWQ model with residency_mode=%s: rewriting to "
+                "partial_resident with all-layers-resident to bypass "
+                "gptqmodel quantizer.",
+                streaming_config.residency_mode,
             )
-            hf_model.eval()
-            return cls(hf_model=hf_model, streaming_config=streaming_config)
+            streaming_config = replace(
+                streaming_config,
+                residency_mode="partial_resident",
+                keep_first_k=max(num_layers, streaming_config.keep_first_k),
+                keep_last_k=max(num_layers, streaming_config.keep_last_k),
+            )
 
         # ── Streaming path ────────────────────────────────────────────────
         loader = AWQLoader(
