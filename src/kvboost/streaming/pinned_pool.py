@@ -75,7 +75,7 @@ class PinnedMemoryPool:
         dtype: torch.dtype,
     ) -> int:
         """Allocate a pinned host tensor and return its opaque handle."""
-        tensor = torch.empty(shape, dtype=dtype, pin_memory=True)
+        tensor = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
         return self.register(tensor)
 
     def register(self, tensor: torch.Tensor) -> int:

@@ -460,9 +460,14 @@ class AWQLoader:
 
         fused_shape = list(gate.shape)
         fused_shape[-1] = gate.shape[-1] + up.shape[-1]
+        # device="cpu" must be explicit. Without it, torch.empty(shape, ...,
+        # pin_memory=True) trips cudaErrorInvalidValue on some torch builds —
+        # the empty_like(..., pin_memory=True) pattern used elsewhere works
+        # because it inherits device='cpu' from the source tensor.
         fused = torch.empty(
             fused_shape,
             dtype=gate.dtype,
+            device="cpu",
             pin_memory=self.device_spec.use_pinned_memory,
         )
         fused.narrow(-1, 0, gate.shape[-1]).copy_(gate)
