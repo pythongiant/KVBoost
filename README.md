@@ -7,7 +7,7 @@
 <p align="center">
   <strong>A practical KV-cache toolkit for Hugging Face causal LMs.</strong><br>
   Cross-request prefix reuse, a custom FlashAttention-2 kernel, AWQ layer streaming,<br>
-  and speculative decoding — behind a drop-in <code>from_pretrained</code> API and an<br>
+  and speculative decoding  behind a drop-in <code>from_pretrained</code> API and an<br>
   OpenAI-compatible server. Works in your existing stack without model porting.
 </p>
 
@@ -37,7 +37,7 @@
 Multi-turn chat, agent loops, and RAG pipelines spend most of their prefill time
 re-encoding text they've already seen. KVBoost keeps a content-addressed KV
 cache across requests so any prompt that shares a chunk-aligned prefix with a
-prior one skips that work entirely — without changing your model, your
+prior one skips that work entirely  without changing your model, your
 tokenizer, or the calling code.
 
 On a 500-conversation ShareGPT replay (Qwen2.5-3B, RTX 4060 Laptop, 8 GB VRAM):
@@ -50,7 +50,7 @@ On a 500-conversation ShareGPT replay (Qwen2.5-3B, RTX 4060 Laptop, 8 GB VRAM):
   (99.2% WARM = 99.2% COLD at 73% average reuse).
 
 Everything sits behind a standard `from_pretrained` call that returns a
-generator with the same calling convention as Hugging Face — no graph
+generator with the same calling convention as Hugging Face  no graph
 rewrites, no custom training format, no engine to learn.
 
 ## Core features
@@ -60,12 +60,12 @@ rewrites, no custom training format, no engine to learn.
 | **Cache** | Chunk-level KV reuse | Content-addressed cache with boundary-aligned chunks. Hits across requests that share a chunk-aligned prefix, even when the prefix is not byte-identical. |
 | | CacheBlend seam repair | Selective recompute at chunk boundaries keeps output quality identical to no-cache (≤0.2 pp drift on standard evals) even at >80% reuse. |
 | | KV quantization | Optional 8-bit (KIVI-style asymmetric K/V) or 4-bit cache, for 2-4× cache-memory savings with minimal accuracy loss. |
-| **Compute** | FlashAttention-2 CUDA kernel | Custom tiled-softmax kernel for Volta → Hopper (sm_70 through sm_90). Optional — falls back gracefully if not built. |
+| **Compute** | FlashAttention-2 CUDA kernel | Custom tiled-softmax kernel for Volta → Hopper (sm_70 through sm_90). Optional  falls back gracefully if not built. |
 | | AWQ layer streaming | Run 32B-class models on 8 GB GPUs by streaming INT4 layer weights from pinned host RAM. PCIe transfer overlaps with compute via staging slots. |
 | | Speculative decoding | Small AWQ draft proposes K tokens; streamed target verifies in one forward. Provably preserves the output distribution (greedy & sampling). |
 | **Serving** | OpenAI-compatible HTTP server | `/v1/completions` and `/v1/chat/completions` with async prefix-grouped batching. Drop-in for the OpenAI SDK, LangChain, LlamaIndex, Instructor, and friends. |
 | | Multi-backend | CUDA (full feature set), MPS (Apple Silicon, unified memory), CPU paged attention. |
-| | Telemetry | `result.ttft_ms`, `result.kv_reuse_ratio`, scheduler hit rates, speculative acceptance histograms — surfaced through both the Python API and a `/v1/stats` endpoint. |
+| | Telemetry | `result.ttft_ms`, `result.kv_reuse_ratio`, scheduler hit rates, speculative acceptance histograms  surfaced through both the Python API and a `/v1/stats` endpoint. |
 
 ## Quick start
 
@@ -102,7 +102,7 @@ print(f"TTFT: {result.ttft_ms:.1f} ms | KV reuse: {result.kv_reuse_ratio:.0%}")
 ```
 
 That's the whole integration. Subsequent `generate()` calls that share any
-chunk-aligned prefix with a prior request hit cache automatically — no extra
+chunk-aligned prefix with a prior request hit cache automatically  no extra
 API to learn.
 
 ### Use it from an OpenAI SDK client
@@ -149,7 +149,7 @@ pip install -e .
 
 ## Flash Attention (CUDA)
 
-KVBoost ships a custom **FlashAttention-2 CUDA kernel** that replaces the default O(N²) attention during KV encoding. It is optional — the library falls back gracefully if the extension is not built.
+KVBoost ships a custom **FlashAttention-2 CUDA kernel** that replaces the default O(N²) attention during KV encoding. It is optional  the library falls back gracefully if the extension is not built.
 
 ### Installation
 
@@ -178,7 +178,7 @@ pip install ninja  # recommended
 
 ### What it does
 
-The kernel implements tiled FlashAttention-2 with online softmax, reducing HBM memory traffic from O(N²) to O(N) during KV encoding. It is applied automatically to every attention module inside the loaded model — no code changes needed.
+The kernel implements tiled FlashAttention-2 with online softmax, reducing HBM memory traffic from O(N²) to O(N) during KV encoding. It is applied automatically to every attention module inside the loaded model  no code changes needed.
 
 Supported:
 
@@ -198,9 +198,9 @@ Falls back to `torch.nn.functional.scaled_dot_product_attention` (which uses cuD
 from kvboost import flash_attention_available, get_flash_attn_tier
 
 print(get_flash_attn_tier())
-# "kvboost_cuda"  — custom kernel compiled and loaded
-# "torch_flash"   — torch SDPA flash path (cuDNN)
-# "vanilla"       — standard SDPA (CPU/MPS or no flash support)
+# "kvboost_cuda"   custom kernel compiled and loaded
+# "torch_flash"    torch SDPA flash path (cuDNN)
+# "vanilla"        standard SDPA (CPU/MPS or no flash support)
 
 print(flash_attention_available())  # True if either accelerated tier is active
 ```
@@ -210,7 +210,7 @@ print(flash_attention_available())  # True if either accelerated tier is active
 ```python
 from kvboost import install_flash_attention, uninstall_flash_attention
 
-# Already called automatically by KVBoost.__init__ —
+# Already called automatically by KVBoost.__init__ 
 # only needed if you want to patch a model you loaded yourself:
 n_patched = install_flash_attention(model)
 print(f"Patched {n_patched} attention modules")
@@ -221,7 +221,7 @@ uninstall_flash_attention(model)
 
 ### CPU paged attention
 
-For CPU-only deployments, KVBoost provides `CPUPagedEngine` — a drop-in replacement that manages KV tensors in a fixed block pool (PagedAttention-style) instead of growing contiguous tensors. Shared prefixes across requests share physical blocks via copy-on-write, eliminating redundant memory allocation.
+For CPU-only deployments, KVBoost provides `CPUPagedEngine`  a drop-in replacement that manages KV tensors in a fixed block pool (PagedAttention-style) instead of growing contiguous tensors. Shared prefixes across requests share physical blocks via copy-on-write, eliminating redundant memory allocation.
 
 ```python
 from kvboost import CPUPagedEngine
@@ -239,7 +239,7 @@ print(engine.paged_stats())
 # {'block_utilization': 0.12, 'free_blocks': 7168, 'used_blocks': 1024, ...}
 ```
 
-`CPUPagedEngine` inherits all of KVBoost's chunk hashing, recompute strategies, and KV quantization — only the decode loop changes.
+`CPUPagedEngine` inherits all of KVBoost's chunk hashing, recompute strategies, and KV quantization  only the decode loop changes.
 
 ---
 
@@ -309,7 +309,7 @@ The 32B model is **~2.4× larger than the GPU** and runs end-to-end without OOM.
 | **Turing laptop** (RTX 20-series, T4, RTX 5000) | sm_75, PCIe 3.0 | ✗ (falls back to `gemv_cuda`) | **~0.5 tok/s (≈30 tok/min)** | ~10 GB |
 | **Ampere+ desktop/data center** (RTX 30/40, A100, L4) | sm_80+, PCIe 4.0+ | ✓ | ~2-5 tok/s | ~10 GB |
 
-On laptop-class Turing hardware, **the floor is the INT4 GEMM, not PCIe**: Turing's 2nd-gen tensor cores can't run Marlin's tensor-core path, so each layer's quantized matmul runs on autoawq's `gemv_cuda` — correct but ~5-10× slower than Marlin on Ampere. The streaming pipeline successfully hides most of the PCIe transfer behind compute; the per-token cost is dominated by the GEMM kernel itself.
+On laptop-class Turing hardware, **the floor is the INT4 GEMM, not PCIe**: Turing's 2nd-gen tensor cores can't run Marlin's tensor-core path, so each layer's quantized matmul runs on autoawq's `gemv_cuda`  correct but ~5-10× slower than Marlin on Ampere. The streaming pipeline successfully hides most of the PCIe transfer behind compute; the per-token cost is dominated by the GEMM kernel itself.
 
 This is the point of the feature: **you trade tok/s for the ability to run a model that doesn't fit at all.** On the same Turing hardware, you can pick between "0.5 tok/s on Qwen-32B" or "no Qwen-32B." There's no software trick that turns a 2060/T4 into an A100.
 
@@ -352,7 +352,7 @@ result = engine.generate("...", max_new_tokens=64)
 | Indexing | safetensors on disk (memory-mapped) | `AWQLoader` builds a tensor-name → shard-offset map without loading anything |
 | Resident materialization | GPU VRAM | Embeddings, LM head, all layernorms, and the projection weights of the first `keep_first_k` + last `keep_last_k` decoder layers are loaded once into `StreamingQLinear` modules |
 | Streamed staging | Host pinned RAM | Remaining layers' AWQ-packed projections (`qweight`/`scales`/`qzeros`) are pinned for async DMA |
-| Per-forward DMA | CUDA staging slots (2 × max layer size) | A `forward_pre_hook` on each streamed decoder layer asks the scheduler to DMA the next layer's weights into a slot on a dedicated transfer stream, then rebinds that layer's `StreamingQLinear` children to the slot views — Marlin's launch-config cache stays valid because the slot pointer is constant across forwards |
+| Per-forward DMA | CUDA staging slots (2 × max layer size) | A `forward_pre_hook` on each streamed decoder layer asks the scheduler to DMA the next layer's weights into a slot on a dedicated transfer stream, then rebinds that layer's `StreamingQLinear` children to the slot views  Marlin's launch-config cache stays valid because the slot pointer is constant across forwards |
 | Per-projection compute | GPU | Chunked, fused dequant+matmul keeps peak per-call memory to ~20 MB instead of the ~280 MB a dense materialization would need |
 
 ### Configuration
@@ -370,14 +370,14 @@ StreamingConfig(
 | Knob | Effect |
 |---|---|
 | `keep_first_k` / `keep_last_k` | More resident = faster, more VRAM. With 32B on 8 GB the sweet spot is ~4 each; on a 4 GB GPU drop to 2 each |
-| `residency_mode="ffn_only_stream"` | Attention weights resident, FFN weights streamed (FFN domi`nates layer bytes 2:1) — less peak VRAM at the same throughput |
+| `residency_mode="ffn_only_stream"` | Attention weights resident, FFN weights streamed (FFN domi`nates layer bytes 2:1)  less peak VRAM at the same throughput |
 | `quant_kernel="auto"` | Probes for Marlin / ExLlamaV2 at import time, falls back to a pure-torch chunked dequant if neither is available |
 
 ### Honest expectations
 
-- **Throughput is hardware-bound, with the bottleneck depending on tier.** On Ampere+ with real Marlin tensor-core GEMM, the floor is PCIe (~13 GB DMA / token; ceiling ~2.5 tok/s on PCIe 4.0 x16). On Turing (RTX 20-series, T4, sm_75) the floor is the INT4 GEMM itself — Marlin's tensor-core path doesn't engage on 2nd-gen tensor cores, so `gemv_cuda` runs the matmul at ~5-10× the latency of Marlin on Ampere. Expect **~0.5 tok/s (30 tok/min)** on laptop-class Turing, **~2-5 tok/s** on Ampere+. The streaming pipeline correctly overlaps transfer with compute; the gap to fully resident is the cost of the hardware not being able to absorb 32B-class weights any faster.
+- **Throughput is hardware-bound, with the bottleneck depending on tier.** On Ampere+ with real Marlin tensor-core GEMM, the floor is PCIe (~13 GB DMA / token; ceiling ~2.5 tok/s on PCIe 4.0 x16). On Turing (RTX 20-series, T4, sm_75) the floor is the INT4 GEMM itself  Marlin's tensor-core path doesn't engage on 2nd-gen tensor cores, so `gemv_cuda` runs the matmul at ~5-10× the latency of Marlin on Ampere. Expect **~0.5 tok/s (30 tok/min)** on laptop-class Turing, **~2-5 tok/s** on Ampere+. The streaming pipeline correctly overlaps transfer with compute; the gap to fully resident is the cost of the hardware not being able to absorb 32B-class weights any faster.
 - **First token is slow.** Prefill walks every layer once with cold staging; expect 10–60 s TTFT depending on prompt length and layer count. Subsequent tokens are at steady-state speed.
-- **Pinned host RAM is required.** For 32B AWQ you'll pin ~19 GB of host RAM. Containers often default `ulimit -l` to 64 MB — set `ulimit -l unlimited` (or raise the cgroup `memory.lock_limit`) before running.
+- **Pinned host RAM is required.** For 32B AWQ you'll pin ~19 GB of host RAM. Containers often default `ulimit -l` to 64 MB  set `ulimit -l unlimited` (or raise the cgroup `memory.lock_limit`) before running.
 - **Unified-memory devices skip streaming.** On Apple Silicon (MPS) there is no separate VRAM, so the streaming pipeline auto-disables and weights are bound once to MPS. The wrapper still works as a way to load AWQ checkpoints HF can't load natively on Mac.
 
 ### Serve over HTTP (OpenAI-compatible) with streaming AWQ
@@ -409,7 +409,7 @@ curl http://localhost:8000/v1/completions \
     }'
 ```
 
-Each SSE chunk is a token; the per-token latency you see in the demo script (`demo_partial_8b`) is the same physical work each SSE chunk represents. Subsequent requests that share a prompt prefix get full chunk-reuse savings — the streaming backend doesn't change the KV-cache contract.
+Each SSE chunk is a token; the per-token latency you see in the demo script (`demo_partial_8b`) is the same physical work each SSE chunk represents. Subsequent requests that share a prompt prefix get full chunk-reuse savings  the streaming backend doesn't change the KV-cache contract.
 
 | Server flag | Purpose |
 |---|---|
@@ -422,18 +422,18 @@ Each SSE chunk is a token; the per-token latency you see in the demo script (`de
 
 ### Files
 
-- [src/kvboost/streaming/model_shell.py](src/kvboost/streaming/model_shell.py) — `StreamingCausalLM`, the wrapper + layer-replacement walker
-- [src/kvboost/streaming/scheduler.py](src/kvboost/streaming/scheduler.py) — `StreamingScheduler` with `begin_forward` / `before_layer` / `after_layer` primitives
-- [src/kvboost/streaming/staging.py](src/kvboost/streaming/staging.py) — staging-slot arena and layout
-- [src/kvboost/streaming/awq_loader.py](src/kvboost/streaming/awq_loader.py) — safetensors indexing, pinned-host loading, marlin repack cache
-- [src/kvboost/streaming/kernels/](src/kvboost/streaming/kernels/) — Marlin / ExLlamaV2 wrappers + chunked torch fallback
-- [src/kvboost/server/__main__.py](src/kvboost/server/__main__.py) — `--awq-streaming` CLI flag and dispatch to `InferenceEngine.from_pretrained(streaming_config=...)`
+- [src/kvboost/streaming/model_shell.py](src/kvboost/streaming/model_shell.py)  `StreamingCausalLM`, the wrapper + layer-replacement walker
+- [src/kvboost/streaming/scheduler.py](src/kvboost/streaming/scheduler.py)  `StreamingScheduler` with `begin_forward` / `before_layer` / `after_layer` primitives
+- [src/kvboost/streaming/staging.py](src/kvboost/streaming/staging.py)  staging-slot arena and layout
+- [src/kvboost/streaming/awq_loader.py](src/kvboost/streaming/awq_loader.py)  safetensors indexing, pinned-host loading, marlin repack cache
+- [src/kvboost/streaming/kernels/](src/kvboost/streaming/kernels/)  Marlin / ExLlamaV2 wrappers + chunked torch fallback
+- [src/kvboost/server/__main__.py](src/kvboost/server/__main__.py)  `--awq-streaming` CLI flag and dispatch to `InferenceEngine.from_pretrained(streaming_config=...)`
 
 ---
 
 ## Speculative decoding (stacked on AWQ streaming)
 
-When the target model is streamed, **every decode token costs one full host→GPU layer DMA**. A small resident draft can amortize that cost by proposing K tokens that the streamed target verifies in a single multi-token forward — the same physical streaming cycle, but yielding multiple tokens per cycle.
+When the target model is streamed, **every decode token costs one full host→GPU layer DMA**. A small resident draft can amortize that cost by proposing K tokens that the streamed target verifies in a single multi-token forward  the same physical streaming cycle, but yielding multiple tokens per cycle.
 
 ### Run
 
@@ -463,7 +463,7 @@ Same hardware, same prompt, same `keep_first_k = keep_last_k = 9`:
 | Streaming, no speculation (`demo_partial_8b`) | 0.91 | 0.91 | 1 token per target forward |
 | **Streaming + speculative (gamma=5)** | **2.79** | **2.30** | 3.0 tokens per target forward |
 
-The decode-only ratio (2.79 / 0.91 ≈ **3.07×**) matches `avg_committed_per_round = 3.00` exactly — speculative wins by collapsing N target forwards into one. Acceptance on this prompt: 40% with 4/20 bonus rounds (all K drafted tokens accepted, plus the target's bonus).
+The decode-only ratio (2.79 / 0.91 ≈ **3.07×**) matches `avg_committed_per_round = 3.00` exactly  speculative wins by collapsing N target forwards into one. Acceptance on this prompt: 40% with 4/20 bonus rounds (all K drafted tokens accepted, plus the target's bonus).
 
 ### vs llama.cpp speculative (same model family, same hardware)
 
@@ -486,12 +486,12 @@ llama.cpp with the same target+draft pair, partial GPU offload (`-ngl 20`, compa
 KVBoost's decode is **~1.47× faster** than llama.cpp on the same prompt and roughly matched residency budget. The win comes from two places:
 
 1. **Marlin INT4 tensor-core GEMM** on Ampere+, vs llama.cpp's mixed Q4_K_M kernels which don't engage tensor cores the same way.
-2. **Async layer streaming with overlap** — KVBoost prefetches the next streamed layer's weights on a transfer stream while the current layer computes. `target.hit_rate = 1.000` in the telemetry confirms the pipeline stays ahead. llama.cpp's `-ngl 20` keeps the first 20 layers resident and recomputes the remaining 44 on CPU each token — no overlap.
+2. **Async layer streaming with overlap**  KVBoost prefetches the next streamed layer's weights on a transfer stream while the current layer computes. `target.hit_rate = 1.000` in the telemetry confirms the pipeline stays ahead. llama.cpp's `-ngl 20` keeps the first 20 layers resident and recomputes the remaining 44 on CPU each token  no overlap.
 
 Caveats for a fair read:
 
 - Quant formats differ (AWQ vs Q4_K_M). They're both ~4-bit but the per-group scaling layouts aren't identical, so a tiny accuracy delta is expected on both sides.
-- Prompt tok/s for KVBoost above is approximate — the warm-up prefill in `demo_speculative` includes cold-cache disk I/O. Post-warm-up re-prefill ran at ~3 tok/s for 7 tokens (very short prompt, dominated by per-call overhead, not steady-state); for prompts >100 tokens both engines converge to per-layer streaming/compute throughput.
+- Prompt tok/s for KVBoost above is approximate  the warm-up prefill in `demo_speculative` includes cold-cache disk I/O. Post-warm-up re-prefill ran at ~3 tok/s for 7 tokens (very short prompt, dominated by per-call overhead, not steady-state); for prompts >100 tokens both engines converge to per-layer streaming/compute throughput.
 - Both runs used greedy decoding. Output text is semantically equivalent across the two engines for this prompt.
 
 ### Telemetry surface
@@ -517,11 +517,11 @@ Caveats for a fair read:
 
 What to look for:
 
-- `avg_verify_ms_per_forward` ≈ baseline `steady_state_ms_per_tok` — verify pays the same streaming cost as a single-token forward. The speedup comes from `avg_committed/round`.
+- `avg_verify_ms_per_forward` ≈ baseline `steady_state_ms_per_tok`  verify pays the same streaming cost as a single-token forward. The speedup comes from `avg_committed/round`.
 - `target.hit_rate` should be 1.000 with `--n-staging-slots ≥ 2`. Lower means prefetch is falling behind compute.
-- `target.prefetches_sync > 0` means a layer was DMA'd on the critical path — set more staging slots or raise `keep_*` until misses stop.
-- `draft` reports `None` (fully resident) — confirms the draft skipped scheduler installation.
-- `engine_overhead` should be small (<5s) on a warm cache. Large values mean disk I/O during the timed window — repeat the run to amortize.
+- `target.prefetches_sync > 0` means a layer was DMA'd on the critical path  set more staging slots or raise `keep_*` until misses stop.
+- `draft` reports `None` (fully resident)  confirms the draft skipped scheduler installation.
+- `engine_overhead` should be small (<5s) on a warm cache. Large values mean disk I/O during the timed window  repeat the run to amortize.
 
 Programmatic access: `engine.speculative_stats()` and `engine.streaming_stats()` return the same dicts for `/v1/stats` integration.
 
@@ -529,19 +529,19 @@ Programmatic access: `engine.speculative_stats()` and `engine.streaming_stats()`
 
 - **Speedup ceiling = `avg_committed_per_round`, capped at `gamma + 1`.** No speculative scheme can beat the rate at which the target accepts drafts. For chat-style prompts with a good draft we typically see 2.5–4×; for code or low-entropy text, often higher; for adversarial / high-entropy text, can collapse to ~1×.
 - **First token is dominated by prefill, not speculative.** Speculative only kicks in for the decode loop; prefill is one big multi-token forward on the target. Use `demo_partial_8b`-style warm-up if you want to measure decode alone.
-- **Pinned host RAM still applies.** When pinning fails (e.g. container `RLIMIT_MEMLOCK = 64 KB`), the loader falls back to pageable + synchronous H2D — streaming overlap is lost for both baseline and speculative, but the relative speedup from speculation is preserved. See [AWQ streaming honest expectations](#honest-expectations) for the underlying limit and how to raise it.
-- **Tokenizer parity is required.** The draft must share vocab with the target — a mismatch silently corrupts verification. Asserted strictly at construction.
+- **Pinned host RAM still applies.** When pinning fails (e.g. container `RLIMIT_MEMLOCK = 64 KB`), the loader falls back to pageable + synchronous H2D  streaming overlap is lost for both baseline and speculative, but the relative speedup from speculation is preserved. See [AWQ streaming honest expectations](#honest-expectations) for the underlying limit and how to raise it.
+- **Tokenizer parity is required.** The draft must share vocab with the target  a mismatch silently corrupts verification. Asserted strictly at construction.
 - **Greedy mode is bit-for-bit identical to non-speculative greedy.** Sampling mode is distributionally equivalent to non-speculative sampling (target-distribution rejection sampling). Speculative never changes the output distribution.
 
 ### Files
 
-- [src/kvboost/speculative/engine.py](src/kvboost/speculative/engine.py) — `SpeculativeEngine.decode_from` orchestrator
-- [src/kvboost/speculative/verifier.py](src/kvboost/speculative/verifier.py) — single multi-token forward over the streamed target
-- [src/kvboost/speculative/draft.py](src/kvboost/speculative/draft.py) — `DraftModel` (autoregressive K-step proposal)
-- [src/kvboost/speculative/sampler.py](src/kvboost/speculative/sampler.py) — `verify_greedy` / `verify_sampling`
-- [src/kvboost/speculative/rollback.py](src/kvboost/speculative/rollback.py) — KV truncation after partial acceptance
-- [src/kvboost/speculative/stats.py](src/kvboost/speculative/stats.py) — acceptance histogram + per-round timings
-- [src/kvboost/streaming/demo_speculative.py](src/kvboost/streaming/demo_speculative.py) — runnable demo with the telemetry block shown above
+- [src/kvboost/speculative/engine.py](src/kvboost/speculative/engine.py)  `SpeculativeEngine.decode_from` orchestrator
+- [src/kvboost/speculative/verifier.py](src/kvboost/speculative/verifier.py)  single multi-token forward over the streamed target
+- [src/kvboost/speculative/draft.py](src/kvboost/speculative/draft.py)  `DraftModel` (autoregressive K-step proposal)
+- [src/kvboost/speculative/sampler.py](src/kvboost/speculative/sampler.py)  `verify_greedy` / `verify_sampling`
+- [src/kvboost/speculative/rollback.py](src/kvboost/speculative/rollback.py)  KV truncation after partial acceptance
+- [src/kvboost/speculative/stats.py](src/kvboost/speculative/stats.py)  acceptance histogram + per-round timings
+- [src/kvboost/streaming/demo_speculative.py](src/kvboost/streaming/demo_speculative.py)  runnable demo with the telemetry block shown above
 
 ---
 
@@ -570,7 +570,7 @@ content_hash = SHA256(this_chunk.tokens)
 ```
 
 The prefix hash only matches when the tokens *and every preceding chunk*
-are identical — this is the case where stored K/V is directly usable.
+are identical  this is the case where stored K/V is directly usable.
 The content hash is a fallback: the tokens match but the history doesn't,
 so the stored K/V is approximately right but needs heavier correction.
 
@@ -605,7 +605,7 @@ KVBoost has two strategies (`recompute_strategy=`):
   misses. ([`cacheblend.py`](src/kvboost/cacheblend.py))
 
 Approximate (content-hash) matches force CacheBlend regardless of the
-chosen strategy — position encodings are wrong in that case and
+chosen strategy  position encodings are wrong in that case and
 boundary-only repair is not enough.
 
 Two optional continuity features stack on top of either strategy:
@@ -628,11 +628,11 @@ an explicit `warm()`.
 ### 6. Correctness guarantees
 
 Under **greedy decoding**, the cached-and-corrected path is designed to
-produce the argmax-equivalent token at every step — which matches what
+produce the argmax-equivalent token at every step  which matches what
 the benchmark's `cosine = 1.000` columns show on the KV-side logits.
 Despite this, *task* accuracy still drifts by a few points at high reuse.
 Why? Because "argmax matches at step 1" does not guarantee "full
-generation matches" — small K/V perturbations can tilt later tokens onto
+generation matches"  small K/V perturbations can tilt later tokens onto
 a different branch. The accuracy-by-reuse table is the ground truth;
 treat the logit-cosine metric as a necessary but not sufficient check.
 
@@ -643,7 +643,7 @@ distributions), not token-identity.
 ### Optional: KV quantization
 
 `kv_cache_bits=8` quantizes cached tensors (per-channel for K,
-per-token for V — the KIVI-paper asymmetry) for ~2× RAM savings with
+per-token for V  the KIVI-paper asymmetry) for ~2× RAM savings with
 minimal accuracy loss. `kv_cache_bits=4` is available for 4× but you
 should validate it with `verify_correctness()` on your workload before
 trusting it.
@@ -686,11 +686,11 @@ KVBoost config: `cacheblend` strategy, 1.5 GB cache, recency window 8, boundary 
 
 ---
 
-## ShareGPT Multi-Turn Replay — KVBoost vs vLLM Prefix Cache
+## ShareGPT Multi-Turn Replay  KVBoost vs vLLM Prefix Cache
 
 **Methodology**: 500 real ShareGPT conversations replayed turn-by-turn on
 `Qwen/Qwen2.5-3B` (RTX 4060 Laptop, 8 GB VRAM). History accumulates naturally
-across turns — exactly as a real user session would. Both backends generate up
+across turns  exactly as a real user session would. Both backends generate up
 to 128 new tokens per turn.
 
 - **KVBoost**: `cacheblend` recompute strategy, chunk=128, boundary_window=16, overlap_k=16, sink_tokens=32
@@ -716,7 +716,7 @@ to 128 new tokens per turn.
 
 † vLLM TTFT = total generation time (first_token_time unavailable in sync mode).
 
-### TTFT vs Turn Number (KVBoost only — true TTFT)
+### TTFT vs Turn Number (KVBoost only  true TTFT)
 
 | Turn | N | Avg ctx tokens | Baseline TTFT | KVBoost TTFT | Speedup | KV reuse |
 |---|---|---|---|---|---|---|
@@ -762,7 +762,7 @@ the matchable prefix length.
    matching misses tokens changed by generation.
 
 3. **Throughput parity**: Both backends achieve similar throughput (~0.28–0.32
-   rps) on this single-GPU setup — the difference is dominated by generation
+   rps) on this single-GPU setup  the difference is dominated by generation
    decode time, not TTFT.
 
 4. **vLLM TTFT caveat**: The vLLM numbers require async streaming to measure
@@ -783,7 +783,7 @@ python vllm_sharegpt_replay/plot_results.py
 
 ---
 
-### Latency — Time to First Token
+### Latency  Time to First Token
 
 ![COLD vs WARM TTFT](docs/figures/cold_warm_ttft.png)
 
@@ -802,7 +802,7 @@ Both caching backends reach nearly identical WARM latency (~62–63 ms); KVBoost
 
 ![TTFT CDF](docs/figures/ttft_cdf.png)
 
-The CDF shows that KVBoost's advantage is consistent across percentiles, not just at the mean — even the p95 warm latency (101 ms) is far below the baseline median (440 ms).
+The CDF shows that KVBoost's advantage is consistent across percentiles, not just at the mean  even the p95 warm latency (101 ms) is far below the baseline median (440 ms).
 
 ![TTFT by Context Length](docs/figures/ttft_by_bucket.png)
 
@@ -815,11 +815,11 @@ KVBoost's chunk-level partial cache hits let it outperform vLLM on COLD queries 
 | Backend | Overall | COLD | WARM | Avg KV reuse (warm) |
 |---|---|---|---|---|
 | **KVBoost** | **99.2%** | 99.2% | 99.2% | **72.9%** |
-| vLLM (prefix cache) | 99.1% | 99.4% | 98.8% | — |
-| Baseline (HF) | 99.1% | 99.2% | 99.0% | — |
+| vLLM (prefix cache) | 99.1% | 99.4% | 98.8% |  |
+| Baseline (HF) | 99.1% | 99.2% | 99.0% |  |
 
 Cold accuracy spread across backends is **0.2 pp**, confirming all three backends process identical inputs.
-KVBoost WARM accuracy matches COLD exactly (99.2%) despite 72.9% average KV reuse — the CacheBlend seam repair produces no measurable quality degradation. The accuracy-by-reuse chart confirms this holds even at the 80–100% reuse bucket.
+KVBoost WARM accuracy matches COLD exactly (99.2%) despite 72.9% average KV reuse  the CacheBlend seam repair produces no measurable quality degradation. The accuracy-by-reuse chart confirms this holds even at the 80–100% reuse bucket.
 
 ### KV Reuse Distribution (KVBoost, warm queries only)
 
@@ -944,7 +944,7 @@ Client D ──┘  prefix grouping   └── result C, D (shared prefix → s
 1. Requests arrive at the FastAPI handler and are enqueued immediately (non-blocking).
 2. The `BatchQueue` collects requests for `--batch-window-ms` (default 20 ms).
 3. At the end of the window, requests are grouped by the hash of their first 3 prefix chunks. Requests sharing a prefix are dispatched as a single batch.
-4. The `EngineWorker` calls `engine.generate_batch()` for each batch group — shared prefix KV is loaded once and broadcast (zero-copy) across the batch.
+4. The `EngineWorker` calls `engine.generate_batch()` for each batch group  shared prefix KV is loaded once and broadcast (zero-copy) across the batch.
 5. Results are resolved back to each caller's `asyncio.Future`.
 
 Back-pressure: if the queue exceeds `--max-queue-size`, new requests receive HTTP 503. Requests not completed within 120 s receive HTTP 504.
@@ -965,7 +965,7 @@ Back-pressure: if the queue exceeds `--max-queue-size`, new requests receive HTT
 | `--batch-window-ms` | `20` | Request collection window |
 | `--max-batch-size` | `8` | Max requests per batch |
 | `--max-queue-size` | `256` | Queue capacity before 503 |
-| `--warm` | — | Pre-warm text (loaded before accepting traffic) |
+| `--warm` |  | Pre-warm text (loaded before accepting traffic) |
 | `--workers` | `1` | Engine thread-pool size (keep 1 for GPU) |
 
 ---
