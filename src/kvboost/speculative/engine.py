@@ -159,7 +159,13 @@ class SpeculativeEngine:
                 # invariant holds (last_committed at boundary, not in KV).
                 self.draft.rollback(0)
 
-            draft_ids, draft_probs = self.draft.draft(last_committed, k=k)
+            # Skip the per-step fp32 softmax in greedy mode (verify_greedy
+            # ignores draft_probs). Saves ~3-6 ms per round on large vocabs.
+            draft_ids, draft_probs = self.draft.draft(
+                last_committed,
+                k=k,
+                return_probs=(self.cfg.mode == "sampling"),
+            )
             # After draft: draft.past_kv length = committed_length + k
 
             # ── 2. Target verifies in one multi-token forward ───────────

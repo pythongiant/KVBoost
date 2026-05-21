@@ -63,14 +63,21 @@ class MockDraftModel:
         self._past_kv = _fake_past_kv(seq_len)
         self._primed_length = seq_len
 
-    def draft(self, last_token: int, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def draft(
+        self,
+        last_token: int,
+        k: int,
+        *,
+        return_probs: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         ids: List[int] = []
-        probs = torch.zeros(k, self.vocab)
+        probs = torch.zeros(k, self.vocab) if return_probs else torch.empty(0)
         cur = last_token
         for i in range(k):
             cur = self.succ_table[cur]
             ids.append(cur)
-            probs[i, cur] = 1.0
+            if return_probs:
+                probs[i, cur] = 1.0
         # Grow fake past_kv by k positions.
         cur_len = self._past_kv[0][0].shape[2] if self._past_kv else 0
         self._past_kv = _fake_past_kv(cur_len + k)
