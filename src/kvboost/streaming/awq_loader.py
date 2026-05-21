@@ -39,56 +39,57 @@ class DeviceSpec:
     supports_async_transfer: bool
 
 
-_PIN_PROBE_BYTES = 16 * 1024 * 1024  # 16 MB — larger than any sane "tiny cap"
+# Process-wide latch: tripped the first time a pinned host alloc fails.
+# Pinning isn't binary "works or doesn't" on locked-down containers —
+# cudaHostAlloc can succeed for small sizes and fail under accumulated
+# pressure when RLIMIT_MEMLOCK is tight (it surfaces as cudaErrorInvalidValue
+# from the underlying mlock). A reactive latch + per-call fallback handles
+# both "totally disabled" and "works until it doesn't" cases.
+import threading as _threading
+
+_PINNING_AVAILABLE = True
+_PINNING_LATCH_LOCK = _threading.Lock()
 
 
-def _probe_pinned_memory() -> tuple[bool, str]:
-    """Try a real pinned allocation; return (ok, diagnostic_message).
-
-    cudaErrorInvalidValue from cudaHostAlloc/mlock is how restrictive
-    container limits surface (e.g. RLIMIT_MEMLOCK=64KB on locked-down
-    runpods). A small probe lets us decide once at startup whether
-    pinning is actually viable, instead of crashing mid-generation.
+def _alloc_host_like(stub: torch.Tensor) -> torch.Tensor:
+    """Allocate a tensor shaped/typed like ``stub``, pinned if possible,
+    pageable otherwise. Trips ``_PINNING_AVAILABLE`` False on first failure
+    so subsequent calls skip the pinned attempt entirely.
     """
-    memlock_note = ""
-    try:
-        import resource
+    global _PINNING_AVAILABLE
+    if _PINNING_AVAILABLE:
+        try:
+            return torch.empty_like(stub, pin_memory=True)
+        except Exception as exc:
+            memlock_note = ""
+            try:
+                import resource
 
-        soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
-        if soft == resource.RLIM_INFINITY:
-            memlock_note = " (RLIMIT_MEMLOCK=unlimited)"
-        else:
-            memlock_note = f" (RLIMIT_MEMLOCK soft={soft} bytes, hard={hard})"
-    except Exception:
-        pass
-
-    try:
-        nbytes = _PIN_PROBE_BYTES
-        stub = torch.empty(nbytes, dtype=torch.uint8, device="cpu")
-        pinned = torch.empty_like(stub, pin_memory=True)
-        del pinned, stub
-        return True, f"pinned host memory available{memlock_note}"
-    except Exception as exc:
-        return False, (
-            f"pinned host allocation of {_PIN_PROBE_BYTES} bytes failed: "
-            f"{type(exc).__name__}: {exc}{memlock_note}"
-        )
-
-
-def _cuda_pinning_ok() -> bool:
-    ok, msg = _probe_pinned_memory()
-    if ok:
-        logger.debug("pin-probe: %s", msg)
-    else:
-        logger.warning(
-            "Disabling pinned host memory for streaming weights: %s. "
-            "Falling back to pageable host buffers; H2D transfers will be "
-            "synchronous and streaming overlap is lost. To restore async "
-            "DMA, raise RLIMIT_MEMLOCK (e.g. `ulimit -l unlimited`, or "
-            "container flags --ulimit memlock=-1 / --cap-add IPC_LOCK).",
-            msg,
-        )
-    return ok
+                soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+                if soft == resource.RLIM_INFINITY:
+                    memlock_note = " (RLIMIT_MEMLOCK=unlimited)"
+                else:
+                    memlock_note = (
+                        f" (RLIMIT_MEMLOCK soft={soft} bytes, hard={hard})"
+                    )
+            except Exception:
+                pass
+            with _PINNING_LATCH_LOCK:
+                if _PINNING_AVAILABLE:
+                    _PINNING_AVAILABLE = False
+                    logger.warning(
+                        "Pinned host allocation failed (%s: %s)%s — disabling "
+                        "pinned memory for the remainder of this process. "
+                        "Streaming H2D copies will fall back to pageable + "
+                        "synchronous; streaming overlap is lost. To restore "
+                        "async DMA, raise RLIMIT_MEMLOCK (e.g. "
+                        "`ulimit -l unlimited`, or container flags "
+                        "--ulimit memlock=-1 / --cap-add IPC_LOCK).",
+                        type(exc).__name__,
+                        exc,
+                        memlock_note,
+                    )
+    return torch.empty_like(stub, pin_memory=False)
 
 
 def detect_device(prefer: str = "auto") -> DeviceSpec:
@@ -102,14 +103,13 @@ def detect_device(prefer: str = "auto") -> DeviceSpec:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but unavailable")
 
-        pin_ok = _cuda_pinning_ok()
         return DeviceSpec(
             device=torch.device("cuda"),
             kind="cuda",
-            use_pinned_memory=pin_ok,
-            non_blocking=pin_ok,
+            use_pinned_memory=True,
+            non_blocking=True,
             supports_marlin=True,
-            supports_async_transfer=pin_ok,
+            supports_async_transfer=True,
         )
 
     #
@@ -152,14 +152,13 @@ def detect_device(prefer: str = "auto") -> DeviceSpec:
     #
 
     if torch.cuda.is_available():
-        pin_ok = _cuda_pinning_ok()
         return DeviceSpec(
             device=torch.device("cuda"),
             kind="cuda",
-            use_pinned_memory=pin_ok,
-            non_blocking=pin_ok,
+            use_pinned_memory=True,
+            non_blocking=True,
             supports_marlin=True,
-            supports_async_transfer=pin_ok,
+            supports_async_transfer=True,
         )
 
     if (
@@ -514,14 +513,11 @@ class AWQLoader:
 
         fused_shape = list(gate.shape)
         fused_shape[-1] = gate.shape[-1] + up.shape[-1]
-        # The only pin path verified reliable on this build is
-        # empty_like(..., pin_memory=True). Anchor it with an unpinned stub
-        # of the right shape/dtype.
         stub = torch.empty(fused_shape, dtype=gate.dtype, device="cpu")
-        fused = torch.empty_like(
-            stub,
-            pin_memory=self.device_spec.use_pinned_memory,
-        )
+        if self.device_spec.use_pinned_memory:
+            fused = _alloc_host_like(stub)
+        else:
+            fused = stub
         fused.narrow(-1, 0, gate.shape[-1]).copy_(gate)
         fused.narrow(-1, gate.shape[-1], up.shape[-1]).copy_(up)
         return fused
@@ -920,10 +916,10 @@ class AWQLoader:
                 # pageable host tensor
                 #
 
-                host = torch.empty_like(
-                    tensor,
-                    pin_memory=self.device_spec.use_pinned_memory,
-                )
+                if self.device_spec.use_pinned_memory:
+                    host = _alloc_host_like(tensor)
+                else:
+                    host = torch.empty_like(tensor)
 
                 host.copy_(tensor)
 
@@ -995,13 +991,11 @@ class AWQLoader:
             return tensor
         if tensor.is_pinned():
             return tensor
-        # tensor.pin_memory() trips cudaErrorInvalidValue on tensors loaded
-        # via torch.load on this build. Allocate fresh pinned memory via the
-        # empty_like(..., pin_memory=True) form (the only pin path that's
-        # reliable here) and copy into it.
-        pinned = torch.empty_like(tensor, pin_memory=True)
-        pinned.copy_(tensor)
-        return pinned
+        # _alloc_host_like falls back to pageable if pinning has been
+        # latched off (e.g. RLIMIT_MEMLOCK exhausted mid-run).
+        host = _alloc_host_like(tensor)
+        host.copy_(tensor)
+        return host
 
     def _call_marlin_repack(
         self,
