@@ -5,8 +5,10 @@
 <h1 align="center">KVBoost</h1>
 
 <p align="center">
-  <strong>Chunk-level KV cache reuse for HuggingFace inference.</strong><br>
-  Reuse KV tensors across requests that share long prefixes. Drop-in on any HF causal LM.
+  <strong>A practical KV-cache toolkit for Hugging Face causal LMs.</strong><br>
+  Cross-request prefix reuse, a custom FlashAttention-2 kernel, AWQ layer streaming,<br>
+  and speculative decoding — behind a drop-in <code>from_pretrained</code> API and an<br>
+  OpenAI-compatible server. Works in your existing stack without model porting.
 </p>
 
 <p align="center">
@@ -18,32 +20,77 @@
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> &bull;
-  <a href="#awq-layer-streaming-run-models-bigger-than-vram">AWQ Streaming</a> &bull;
+  <a href="#quick-start">Quick start</a> &bull;
+  <a href="#core-features">Features</a> &bull;
+  <a href="#use-it-from-an-openai-sdk-client">OpenAI server</a> &bull;
+  <a href="#awq-layer-streaming-run-models-bigger-than-vram">AWQ streaming</a> &bull;
   <a href="#speculative-decoding-stacked-on-awq-streaming">Speculative</a> &bull;
   <a href="#benchmarks">Benchmarks</a> &bull;
   <a href="#how-it-works">How it works</a> &bull;
-  <a href="#when-kvboost-helps-and-when-it-doesnt">When it helps</a> &bull;
-  <a href="#api-reference">API</a> &bull;
-  <a href="https://kvboost.readthedocs.io/en/latest/">Docs</a>
+  <a href="#api-reference">API</a>
 </p>
 
+---
+
+## Why KVBoost
+
+Multi-turn chat, agent loops, and RAG pipelines spend most of their prefill time
+re-encoding text they've already seen. KVBoost keeps a content-addressed KV
+cache across requests so any prompt that shares a chunk-aligned prefix with a
+prior one skips that work entirely — without changing your model, your
+tokenizer, or the calling code.
+
+On a 500-conversation ShareGPT replay (Qwen2.5-3B, RTX 4060 Laptop, 8 GB VRAM):
+
+- **TTFT p50: 20 ms.** Flat from turn 1 through turn 8, while a no-cache
+  baseline grows linearly to 122 ms.
+- **4.59× faster than its own no-cache baseline** at turn 8 (~1 100 context
+  tokens), with **≥99% KV reuse from turn 2 onward**.
+- **No measurable accuracy loss** on a 500-sample bug-localization eval
+  (99.2% WARM = 99.2% COLD at 73% average reuse).
+
+Everything sits behind a standard `from_pretrained` call that returns a
+generator with the same calling convention as Hugging Face — no graph
+rewrites, no custom training format, no engine to learn.
+
+## Core features
+
+| | Feature | What it does |
+|---|---|---|
+| **Cache** | Chunk-level KV reuse | Content-addressed cache with boundary-aligned chunks. Hits across requests that share a chunk-aligned prefix, even when the prefix is not byte-identical. |
+| | CacheBlend seam repair | Selective recompute at chunk boundaries keeps output quality identical to no-cache (≤0.2 pp drift on standard evals) even at >80% reuse. |
+| | KV quantization | Optional 8-bit (KIVI-style asymmetric K/V) or 4-bit cache, for 2-4× cache-memory savings with minimal accuracy loss. |
+| **Compute** | FlashAttention-2 CUDA kernel | Custom tiled-softmax kernel for Volta → Hopper (sm_70 through sm_90). Optional — falls back gracefully if not built. |
+| | AWQ layer streaming | Run 32B-class models on 8 GB GPUs by streaming INT4 layer weights from pinned host RAM. PCIe transfer overlaps with compute via staging slots. |
+| | Speculative decoding | Small AWQ draft proposes K tokens; streamed target verifies in one forward. Provably preserves the output distribution (greedy & sampling). |
+| **Serving** | OpenAI-compatible HTTP server | `/v1/completions` and `/v1/chat/completions` with async prefix-grouped batching. Drop-in for the OpenAI SDK, LangChain, LlamaIndex, Instructor, and friends. |
+| | Multi-backend | CUDA (full feature set), MPS (Apple Silicon, unified memory), CPU paged attention. |
+| | Telemetry | `result.ttft_ms`, `result.kv_reuse_ratio`, scheduler hit rates, speculative acceptance histograms — surfaced through both the Python API and a `/v1/stats` endpoint. |
 
 ## Quick start
 
 ```bash
-pip install kvboost
+pip install kvboost                # CPU / MPS, pure-Python
+pip install 'kvboost[cuda]'        # + custom FlashAttention-2 CUDA kernel
+pip install 'kvboost[server]'      # + OpenAI-compatible HTTP server
 ```
+
+Requirements: Python ≥ 3.9, PyTorch ≥ 2.1, Transformers ≥ 4.38.
+
+### Use it as a library
+
+Drop it in front of any Hugging Face causal LM. The returned engine has a
+`generate()` method with the same shape as `transformers`, plus a
+`GenerationResult` with timing and cache-hit telemetry:
 
 ```python
 from kvboost import KVBoost
 
 engine = KVBoost.from_pretrained("Qwen/Qwen2.5-3B")
 
-# Warm the shared prefix once
+# Optional: pre-warm a shared prefix (system prompt, retrieved context, etc.)
 engine.warm("You are a helpful coding assistant. Always be concise...")
 
-# Subsequent generates reuse cached chunks automatically
 result = engine.generate(
     "You are a helpful coding assistant. Always be concise...\n\n"
     "User: How do I reverse a linked list?\nAssistant:",
@@ -51,18 +98,52 @@ result = engine.generate(
 )
 
 print(result.output_text)
-print(f"TTFT: {result.ttft_ms:.1f} ms | reuse: {result.kv_reuse_ratio:.0%}")
+print(f"TTFT: {result.ttft_ms:.1f} ms | KV reuse: {result.kv_reuse_ratio:.0%}")
 ```
 
-From source:
+That's the whole integration. Subsequent `generate()` calls that share any
+chunk-aligned prefix with a prior request hit cache automatically — no extra
+API to learn.
+
+### Use it from an OpenAI SDK client
+
+If your code already talks to the OpenAI API, run the bundled server and
+point `base_url` at it. Prefix caching, FlashAttention, AWQ streaming, and
+speculative decoding all kick in transparently:
+
+```bash
+kvboost-server --model Qwen/Qwen2.5-3B --port 8000
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="kvboost")
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen2.5-3B",
+    messages=[
+        {"role": "system", "content": "You are a helpful coding assistant."},
+        {"role": "user", "content": "How do I reverse a linked list?"},
+    ],
+    max_tokens=128,
+)
+print(response.choices[0].message.content)
+```
+
+The same endpoint works unmodified with LangChain (`ChatOpenAI`),
+LlamaIndex (`OpenAI` LLM), Instructor, the Vercel AI SDK, and any other
+client that targets an OpenAI-compatible base URL. See
+[Inference server](#inference-server) for batching, KV-quant, and warm-up
+flags.
+
+### Install from source
 
 ```bash
 git clone https://github.com/pythongiant/kvboost.git
 cd kvboost
 pip install -e .
 ```
-
-Requirements: Python ≥ 3.9, PyTorch ≥ 2.1, Transformers ≥ 4.38.
 
 ---
 
