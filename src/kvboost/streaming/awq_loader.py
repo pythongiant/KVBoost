@@ -460,27 +460,13 @@ class AWQLoader:
 
         fused_shape = list(gate.shape)
         fused_shape[-1] = gate.shape[-1] + up.shape[-1]
-        try:
-            fused = torch.empty(
-                fused_shape,
-                dtype=gate.dtype,
-                device="cpu",
-                pin_memory=self.device_spec.use_pinned_memory,
-            )
-        except Exception as exc:
-            logger.error(
-                "_build_fused_pinned failed: shape=%s dtype=%s "
-                "gate.device=%s gate.is_contig=%s gate.is_pinned=%s "
-                "up.device=%s up.is_contig=%s up.is_pinned=%s "
-                "use_pinned=%s err=%r",
-                fused_shape, gate.dtype,
-                gate.device, gate.is_contiguous(),
-                gate.is_pinned() if gate.device.type == "cpu" else "n/a",
-                up.device, up.is_contiguous(),
-                up.is_pinned() if up.device.type == "cpu" else "n/a",
-                self.device_spec.use_pinned_memory, exc,
-            )
-            raise
+        # torch.empty(shape, ..., pin_memory=True) hits cudaErrorInvalidValue
+        # on some builds even with device="cpu". Allocating unpinned and then
+        # calling .pin_memory() goes through a different allocator path that
+        # works reliably.
+        fused = torch.empty(fused_shape, dtype=gate.dtype, device="cpu")
+        if self.device_spec.use_pinned_memory:
+            fused = fused.pin_memory()
         fused.narrow(-1, 0, gate.shape[-1]).copy_(gate)
         fused.narrow(-1, gate.shape[-1], up.shape[-1]).copy_(up)
         return fused
