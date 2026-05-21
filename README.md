@@ -79,31 +79,132 @@ Requirements: Python ≥ 3.9, PyTorch ≥ 2.1, Transformers ≥ 4.38.
 
 ### Use it as a library
 
-Drop it in front of any Hugging Face causal LM. The returned engine has a
-`generate()` method with the same shape as `transformers`, plus a
-`GenerationResult` with timing and cache-hit telemetry:
+`KVBoost.from_pretrained` wraps any Hugging Face causal LM. The returned
+engine exposes a `generate()` method that takes a fully-formatted prompt
+string and returns a `GenerationResult` with output text plus timing and
+cache-hit telemetry — embed it directly in a chat session, agent loop,
+or RAG pipeline.
+
+#### Multi-turn chat session
+
+A typical chat helper using the model's chat template. KVs are reused
+across turns automatically, so TTFT stays flat as history grows:
 
 ```python
+# chat.py
 from kvboost import KVBoost
+from transformers import AutoTokenizer
 
-engine = KVBoost.from_pretrained("Qwen/Qwen2.5-3B")
+MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
+SYSTEM_PROMPT = "You are a senior Python engineer. Be concise and show working code."
 
-# Optional: pre-warm a shared prefix (system prompt, retrieved context, etc.)
-engine.warm("You are a helpful coding assistant. Always be concise...")
 
-result = engine.generate(
-    "You are a helpful coding assistant. Always be concise...\n\n"
-    "User: How do I reverse a linked list?\nAssistant:",
-    max_new_tokens=128,
-)
+class ChatSession:
+    def __init__(self, model_id: str = MODEL_ID):
+        self.engine = KVBoost.from_pretrained(model_id)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.engine.warm(SYSTEM_PROMPT)  # pin the system prefix in cache
+        self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.last_result = None
 
-print(result.output_text)
-print(f"TTFT: {result.ttft_ms:.1f} ms | KV reuse: {result.kv_reuse_ratio:.0%}")
+    def send(self, user_msg: str, max_new_tokens: int = 256) -> str:
+        self.history.append({"role": "user", "content": user_msg})
+        prompt = self.tokenizer.apply_chat_template(
+            self.history, tokenize=False, add_generation_prompt=True,
+        )
+        self.last_result = self.engine.generate(prompt, max_new_tokens=max_new_tokens)
+        reply = self.last_result.output_text
+        self.history.append({"role": "assistant", "content": reply})
+        return reply
+
+
+if __name__ == "__main__":
+    chat = ChatSession()
+    chat.send("How do I reverse a linked list in Python?")
+    chat.send("Now do it iteratively instead of recursively.")
+    print(chat.send("Add type hints to the iterative version."))
+
+    # Cache reuse climbs turn over turn — see ShareGPT replay numbers above.
+    r = chat.last_result
+    print(f"TTFT: {r.ttft_ms:.1f} ms | KV reuse: {r.kv_reuse_ratio:.0%}")
 ```
 
-That's the whole integration. Subsequent `generate()` calls that share any
-chunk-aligned prefix with a prior request hit cache automatically  no extra
-API to learn.
+#### FastAPI service with a shared engine
+
+A production pattern: load the engine once at startup with FastAPI's
+`lifespan`, expose an async endpoint, surface KVBoost's telemetry on the
+response so you can track cache health from your existing observability
+stack.
+
+```python
+# app.py
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from pydantic import BaseModel
+from transformers import AutoTokenizer
+
+from kvboost import KVBoost
+
+MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
+SYSTEM_PROMPT = "You are a helpful assistant for an internal developer tools team."
+
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: list[Message]
+    max_tokens: int = 256
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.engine = KVBoost.from_pretrained(MODEL_ID)
+    app.state.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    app.state.engine.warm(SYSTEM_PROMPT)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *(m.model_dump() for m in req.messages)]
+    prompt = app.state.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+    result = app.state.engine.generate(prompt, max_new_tokens=req.max_tokens)
+    return {
+        "text": result.output_text,
+        "ttft_ms": result.ttft_ms,
+        "kv_reuse_ratio": result.kv_reuse_ratio,
+    }
+```
+
+#### RAG: stable retrieved-context prefix
+
+When your retriever returns the same documents to many requests (e.g. a
+hot FAQ shard, a docs index), the formatted-context prefix is reused
+across queries — chunk-level matching means even a partial overlap with a
+previously-seen context still hits cache:
+
+```python
+def answer(question: str, docs: list[str]) -> str:
+    context = "\n\n".join(f"[doc {i}]\n{d}" for i, d in enumerate(docs))
+    messages = [
+        {"role": "system", "content": "Answer using only the provided context."},
+        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
+    ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return engine.generate(prompt, max_new_tokens=256).output_text
+```
+
+KV reuse happens at chunk granularity, so subsequent calls with overlapping
+docs skip the corresponding prefill work — no caching layer to maintain in
+your application code.
 
 ### Use it from an OpenAI SDK client
 
