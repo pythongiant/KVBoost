@@ -76,9 +76,10 @@ class PinnedMemoryPool:
     ) -> int:
         """Allocate a pinned host tensor and return its opaque handle."""
         # torch.empty(shape, ..., pin_memory=True) trips cudaErrorInvalidValue
-        # on some builds; allocating unpinned then calling .pin_memory() uses
-        # a different allocator path that works reliably.
-        tensor = torch.empty(shape, dtype=dtype, device="cpu").pin_memory()
+        # on some builds. The reliable path is empty_like(..., pin_memory=True),
+        # so anchor it with a throwaway unpinned stub of the right shape/dtype.
+        stub = torch.empty(shape, dtype=dtype, device="cpu")
+        tensor = torch.empty_like(stub, pin_memory=True)
         return self.register(tensor)
 
     def register(self, tensor: torch.Tensor) -> int:

@@ -460,13 +460,14 @@ class AWQLoader:
 
         fused_shape = list(gate.shape)
         fused_shape[-1] = gate.shape[-1] + up.shape[-1]
-        # torch.empty(shape, ..., pin_memory=True) hits cudaErrorInvalidValue
-        # on some builds even with device="cpu". Allocating unpinned and then
-        # calling .pin_memory() goes through a different allocator path that
-        # works reliably.
-        fused = torch.empty(fused_shape, dtype=gate.dtype, device="cpu")
-        if self.device_spec.use_pinned_memory:
-            fused = fused.pin_memory()
+        # The only pin path verified reliable on this build is
+        # empty_like(..., pin_memory=True). Anchor it with an unpinned stub
+        # of the right shape/dtype.
+        stub = torch.empty(fused_shape, dtype=gate.dtype, device="cpu")
+        fused = torch.empty_like(
+            stub,
+            pin_memory=self.device_spec.use_pinned_memory,
+        )
         fused.narrow(-1, 0, gate.shape[-1]).copy_(gate)
         fused.narrow(-1, gate.shape[-1], up.shape[-1]).copy_(up)
         return fused
@@ -940,7 +941,13 @@ class AWQLoader:
             return tensor
         if tensor.is_pinned():
             return tensor
-        return tensor.pin_memory()
+        # tensor.pin_memory() trips cudaErrorInvalidValue on tensors loaded
+        # via torch.load on this build. Allocate fresh pinned memory via the
+        # empty_like(..., pin_memory=True) form (the only pin path that's
+        # reliable here) and copy into it.
+        pinned = torch.empty_like(tensor, pin_memory=True)
+        pinned.copy_(tensor)
+        return pinned
 
     def _call_marlin_repack(
         self,
