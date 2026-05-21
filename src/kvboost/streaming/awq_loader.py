@@ -39,6 +39,58 @@ class DeviceSpec:
     supports_async_transfer: bool
 
 
+_PIN_PROBE_BYTES = 16 * 1024 * 1024  # 16 MB — larger than any sane "tiny cap"
+
+
+def _probe_pinned_memory() -> tuple[bool, str]:
+    """Try a real pinned allocation; return (ok, diagnostic_message).
+
+    cudaErrorInvalidValue from cudaHostAlloc/mlock is how restrictive
+    container limits surface (e.g. RLIMIT_MEMLOCK=64KB on locked-down
+    runpods). A small probe lets us decide once at startup whether
+    pinning is actually viable, instead of crashing mid-generation.
+    """
+    memlock_note = ""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        if soft == resource.RLIM_INFINITY:
+            memlock_note = " (RLIMIT_MEMLOCK=unlimited)"
+        else:
+            memlock_note = f" (RLIMIT_MEMLOCK soft={soft} bytes, hard={hard})"
+    except Exception:
+        pass
+
+    try:
+        nbytes = _PIN_PROBE_BYTES
+        stub = torch.empty(nbytes, dtype=torch.uint8, device="cpu")
+        pinned = torch.empty_like(stub, pin_memory=True)
+        del pinned, stub
+        return True, f"pinned host memory available{memlock_note}"
+    except Exception as exc:
+        return False, (
+            f"pinned host allocation of {_PIN_PROBE_BYTES} bytes failed: "
+            f"{type(exc).__name__}: {exc}{memlock_note}"
+        )
+
+
+def _cuda_pinning_ok() -> bool:
+    ok, msg = _probe_pinned_memory()
+    if ok:
+        logger.debug("pin-probe: %s", msg)
+    else:
+        logger.warning(
+            "Disabling pinned host memory for streaming weights: %s. "
+            "Falling back to pageable host buffers; H2D transfers will be "
+            "synchronous and streaming overlap is lost. To restore async "
+            "DMA, raise RLIMIT_MEMLOCK (e.g. `ulimit -l unlimited`, or "
+            "container flags --ulimit memlock=-1 / --cap-add IPC_LOCK).",
+            msg,
+        )
+    return ok
+
+
 def detect_device(prefer: str = "auto") -> DeviceSpec:
     prefer = prefer.lower()
 
@@ -50,13 +102,14 @@ def detect_device(prefer: str = "auto") -> DeviceSpec:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but unavailable")
 
+        pin_ok = _cuda_pinning_ok()
         return DeviceSpec(
             device=torch.device("cuda"),
             kind="cuda",
-            use_pinned_memory=True,
-            non_blocking=True,
+            use_pinned_memory=pin_ok,
+            non_blocking=pin_ok,
             supports_marlin=True,
-            supports_async_transfer=True,
+            supports_async_transfer=pin_ok,
         )
 
     #
@@ -99,13 +152,14 @@ def detect_device(prefer: str = "auto") -> DeviceSpec:
     #
 
     if torch.cuda.is_available():
+        pin_ok = _cuda_pinning_ok()
         return DeviceSpec(
             device=torch.device("cuda"),
             kind="cuda",
-            use_pinned_memory=True,
-            non_blocking=True,
+            use_pinned_memory=pin_ok,
+            non_blocking=pin_ok,
             supports_marlin=True,
-            supports_async_transfer=True,
+            supports_async_transfer=pin_ok,
         )
 
     if (
