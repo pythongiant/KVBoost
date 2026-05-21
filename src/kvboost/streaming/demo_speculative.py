@@ -118,6 +118,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"  load_time: {load_s:.1f}s", file=sys.stderr)
     print(f"  peak_vram_after_load: {peak_after_load / 1e9:.2f} GB", file=sys.stderr)
 
+    # ── Warm-up prefill ─────────────────────────────────────────────
+    # First call to the streamed target pays full disk I/O hydrating
+    # all non-resident layers into the loader's pin cache. Without an
+    # explicit warm-up this cost lands inside the timed generate()
+    # call and dominates the per-token average (~138s for 32B-AWQ with
+    # keep_first_k=keep_last_k=9). demo_partial_8b does the same to
+    # keep its decode_s clean; mirror it here so the two demos are
+    # directly comparable.
+    print("--- warm-up prefill (loads streamed layers into pin cache) ---", file=sys.stderr)
+    from transformers import AutoTokenizer
+    warm_tok = AutoTokenizer.from_pretrained(args.model)
+    warm_inputs = warm_tok(args.prompt, return_tensors="pt").to("cuda")
+    t_warm = time.perf_counter()
+    with torch.inference_mode():
+        _ = engine.model(**warm_inputs)
+    torch.cuda.synchronize()
+    warm_s = time.perf_counter() - t_warm
+    print(f"  warmup_prefill_time: {warm_s:.2f}s", file=sys.stderr)
+
+    torch.cuda.reset_peak_memory_stats()
+
     print("--- generation ---", file=sys.stderr)
     t1 = time.perf_counter()
     result = engine.generate(
@@ -140,7 +161,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print("--- summary ---", file=sys.stderr)
     print(f"  new_tokens:              {new_tokens}", file=sys.stderr)
-    print(f"  total_decode_time:       {decode_s:.2f}s", file=sys.stderr)
+    print(f"  warmup_prefill_time:     {warm_s:.2f}s "
+          f"(excluded from decode metrics)", file=sys.stderr)
+    print(f"  total_decode_time:       {decode_s:.2f}s "
+          f"(includes prompt re-prefill inside generate)", file=sys.stderr)
     print(f"  avg_tok_per_s:           {tps:.2f}", file=sys.stderr)
     print(f"  peak_vram_during_decode: {peak_decode / 1e9:.2f} GB", file=sys.stderr)
 
@@ -167,8 +191,23 @@ def main(argv: Optional[list[str]] = None) -> int:
             + spec_stats['verify_time_s']
             + spec_stats['rollback_time_s']
         )
+        # Decode-only tok/s: tokens produced per second of actual verify
+        # work. This is the right number to compare against baseline
+        # demo_partial_8b's steady_state_tok_per_s — both exclude prefill.
+        # Baseline forward is 1 token per verify; spec is
+        # ``avg_committed_per_round`` per verify, so the expected speedup
+        # vs baseline is exactly ``avg_committed_per_round``.
+        verify_tps = (
+            spec_stats['committed_total'] / spec_stats['verify_time_s']
+            if spec_stats['verify_time_s'] > 0 else 0.0
+        )
+        print(f"  decode_only_tok_per_s:   {verify_tps:.2f} "
+              f"(tokens per second of verify time — comparable to "
+              f"demo_partial_8b's steady_state_tok_per_s)", file=sys.stderr)
         print(f"  engine_overhead:         {overhead:.2f}s "
-              f"(sampler/list/python)", file=sys.stderr)
+              f"(prompt re-prefill + sampler/list/python; if >>0 the "
+              f"re-prefill is paying disk I/O — repeat run will be faster)",
+              file=sys.stderr)
         print(f"  histogram (K=0..{len(spec_stats['histogram'])-1}): "
               f"{spec_stats['histogram']}", file=sys.stderr)
 
