@@ -230,14 +230,17 @@ class StreamingCausalLM(nn.Module):
         )
         # 2. Replace resident-layer projections too — also StreamingQLinear,
         #    but bound once permanently. cache_dense=False keeps the weights
-        #    packed (~4× less VRAM than fp16 dense); forward pays torch
-        #    dequant per call, which on resident layers is the price of not
-        #    depending on autoawq's CUDA kernel.
+        #    packed (~4× less VRAM than fp16 dense). Resident layers use the
+        #    same kernel preference as streamed layers — historically this
+        #    was hardcoded to "torch" (pure-torch chunked dequant) which is
+        #    ~50× slower than Marlin / autoawq's gemm_forward_cuda. With
+        #    autoawq-kernels available, "auto" picks the fast path
+        #    (gemv_cuda on Turing, real Marlin on Ampere+).
         resident_qlinears = _replace_linears_for_quant_paths(
             hf_model,
             loader=loader,
             group_size=group_size,
-            prefer="torch",
+            prefer=streaming_config.quant_kernel,
             cache_dense=False,
             layer_indices=resident_indices,
         )
