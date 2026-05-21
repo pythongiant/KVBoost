@@ -106,6 +106,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_cache_bytes=int(2e9),
     )
 
+    # InferenceEngine skips its own .to(device) for quantized models because
+    # weight movers in bnb/accelerate can break. In streaming full_resident
+    # mode there are no per-layer hooks, so nothing else moves the model.
+    # Mirror demo_partial_8b.py and do it explicitly.
+    if args.mode == "full_resident":
+        engine.model.hf_model.to("cuda")
+
     load_s = time.perf_counter() - t0
     peak_after_load = torch.cuda.max_memory_allocated()
     print(f"  load_time: {load_s:.1f}s", file=sys.stderr)
