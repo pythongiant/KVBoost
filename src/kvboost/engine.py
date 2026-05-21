@@ -851,7 +851,15 @@ class InferenceEngine:
             # we assert this loudly to catch rollback bugs early.
             if __debug__:
                 expected_len = cached_len + len(live_ids) - 1 + len(generated)
-                actual_len = KVCacheManager.kv_seq_len(past_kv) if past_kv is not None else 0
+                # past_kv can be either DynamicCache (modern HF returns)
+                # or tuple-of-tuples (KVBoost's internal format). Handle
+                # both — same helper used inside SpeculativeEngine.
+                if past_kv is None:
+                    actual_len = 0
+                elif hasattr(past_kv, "get_seq_length"):
+                    actual_len = past_kv.get_seq_length()
+                else:
+                    actual_len = KVCacheManager.kv_seq_len(past_kv)
                 if actual_len != expected_len:
                     log.warning(
                         "speculative cache-commit invariant: past_kv len %d "
