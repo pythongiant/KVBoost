@@ -460,40 +460,12 @@ class AWQLoader:
 
         fused_shape = list(gate.shape)
         fused_shape[-1] = gate.shape[-1] + up.shape[-1]
-
-        logger.warning(
-            "_build_fused_pinned: shape=%s dtype=%s gate.device=%s "
-            "gate.is_pinned=%s use_pinned=%s",
-            fused_shape, gate.dtype, gate.device,
-            gate.is_pinned() if gate.device.type == "cpu" else "n/a",
-            self.device_spec.use_pinned_memory,
+        fused = torch.empty(
+            fused_shape,
+            dtype=gate.dtype,
+            device="cpu",
+            pin_memory=self.device_spec.use_pinned_memory,
         )
-
-        # Fallback chain: try torch.empty(..., pin_memory=True) first, then
-        # torch.empty_like(gate.new_empty(shape), pin_memory=True), then
-        # an unpinned alloc + .pin_memory(). Surface the first error so we
-        # can see which path actually fails.
-        try:
-            fused = torch.empty(
-                fused_shape,
-                dtype=gate.dtype,
-                device="cpu",
-                pin_memory=self.device_spec.use_pinned_memory,
-            )
-            logger.warning("  → torch.empty(pin_memory=True) succeeded")
-        except Exception as e1:
-            logger.warning("  → torch.empty(pin_memory=True) FAILED: %r", e1)
-            try:
-                stub = torch.empty(fused_shape, dtype=gate.dtype, device="cpu")
-                if self.device_spec.use_pinned_memory:
-                    fused = stub.pin_memory()
-                    logger.warning("  → empty + .pin_memory() succeeded")
-                else:
-                    fused = stub
-            except Exception as e2:
-                logger.warning("  → empty + .pin_memory() FAILED: %r", e2)
-                raise
-
         fused.narrow(-1, 0, gate.shape[-1]).copy_(gate)
         fused.narrow(-1, gate.shape[-1], up.shape[-1]).copy_(up)
         return fused
