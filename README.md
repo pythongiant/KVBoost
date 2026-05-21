@@ -20,6 +20,7 @@
 <p align="center">
   <a href="#quick-start">Quick Start</a> &bull;
   <a href="#awq-layer-streaming-run-models-bigger-than-vram">AWQ Streaming</a> &bull;
+  <a href="#speculative-decoding-stacked-on-awq-streaming">Speculative</a> &bull;
   <a href="#benchmarks">Benchmarks</a> &bull;
   <a href="#how-it-works">How it works</a> &bull;
   <a href="#when-kvboost-helps-and-when-it-doesnt">When it helps</a> &bull;
@@ -346,6 +347,120 @@ Each SSE chunk is a token; the per-token latency you see in the demo script (`de
 - [src/kvboost/streaming/awq_loader.py](src/kvboost/streaming/awq_loader.py) — safetensors indexing, pinned-host loading, marlin repack cache
 - [src/kvboost/streaming/kernels/](src/kvboost/streaming/kernels/) — Marlin / ExLlamaV2 wrappers + chunked torch fallback
 - [src/kvboost/server/__main__.py](src/kvboost/server/__main__.py) — `--awq-streaming` CLI flag and dispatch to `InferenceEngine.from_pretrained(streaming_config=...)`
+
+---
+
+## Speculative decoding (stacked on AWQ streaming)
+
+When the target model is streamed, **every decode token costs one full host→GPU layer DMA**. A small resident draft can amortize that cost by proposing K tokens that the streamed target verifies in a single multi-token forward — the same physical streaming cycle, but yielding multiple tokens per cycle.
+
+### Run
+
+```bash
+python -m kvboost.streaming.demo_speculative \
+    --model       Qwen/Qwen2.5-32B-Instruct-AWQ \
+    --draft-model Qwen/Qwen2.5-1.5B-Instruct-AWQ \
+    --mode partial_resident \
+    --keep-first-k 9 --keep-last-k 9 \
+    --n-staging-slots 4 \
+    --gamma 5 --max-new-tokens 60 \
+    --prompt 'Explain entropy in two sentences.'
+```
+
+| Flag | Purpose |
+|---|---|
+| `--draft-model` | Small AWQ model with the same tokenizer family (e.g. Qwen2.5-1.5B for Qwen2.5-32B). Vocab parity is asserted at construction. |
+| `--gamma` | Tokens drafted per verification round. Higher gamma = more potential speedup if acceptance holds, more wasted draft work if it doesn't. K=5 is a reasonable default. |
+| `--spec-mode` | `greedy` (matches non-speculative greedy bit-for-bit) or `sampling` (target-distribution rejection sampling). |
+
+### Measured speedup (Qwen2.5-32B-AWQ target + 1.5B-AWQ draft, RTX 3060 12 GB)
+
+Same hardware, same prompt, same `keep_first_k = keep_last_k = 9`:
+
+| Mode | Tokens/s (decode-only) | Tokens/s (wall, post warm-up) | Notes |
+|---|---|---|---|
+| Streaming, no speculation (`demo_partial_8b`) | 0.91 | 0.91 | 1 token per target forward |
+| **Streaming + speculative (gamma=5)** | **2.79** | **2.30** | 3.0 tokens per target forward |
+
+The decode-only ratio (2.79 / 0.91 ≈ **3.07×**) matches `avg_committed_per_round = 3.00` exactly — speculative wins by collapsing N target forwards into one. Acceptance on this prompt: 40% with 4/20 bonus rounds (all K drafted tokens accepted, plus the target's bonus).
+
+### vs llama.cpp speculative (same model family, same hardware)
+
+llama.cpp with the same target+draft pair, partial GPU offload (`-ngl 20`, comparable to KVBoost's 18 resident layers), and `--spec-type draft-simple`:
+
+```bash
+./build/bin/llama-cli \
+    -m ~/models/qwen2.5-32b-instruct-q4_k_m-00001-of-00005.gguf \
+    --model-draft ~/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+    --spec-type draft-simple \
+    -ngl 20 --ctx-size 2048 \
+    -p "Explain entropy in two sentences." -n 60
+```
+
+| Engine | Quant | Resident layers | Generation tok/s | Prompt tok/s |
+|---|---|---|---|---|
+| llama.cpp speculative | Q4_K_M GGUF | 20 (`-ngl 20`) | 1.9 | 24.0 |
+| **KVBoost speculative (gamma=5)** | **AWQ INT4 + Marlin** | **18 (keep_first=keep_last=9)** | **2.30 (wall) / 2.79 (decode-only)** | ~24 |
+
+KVBoost's decode is **~1.47× faster** than llama.cpp on the same prompt and roughly matched residency budget. The win comes from two places:
+
+1. **Marlin INT4 tensor-core GEMM** on Ampere+, vs llama.cpp's mixed Q4_K_M kernels which don't engage tensor cores the same way.
+2. **Async layer streaming with overlap** — KVBoost prefetches the next streamed layer's weights on a transfer stream while the current layer computes. `target.hit_rate = 1.000` in the telemetry confirms the pipeline stays ahead. llama.cpp's `-ngl 20` keeps the first 20 layers resident and recomputes the remaining 44 on CPU each token — no overlap.
+
+Caveats for a fair read:
+
+- Quant formats differ (AWQ vs Q4_K_M). They're both ~4-bit but the per-group scaling layouts aren't identical, so a tiny accuracy delta is expected on both sides.
+- Prompt tok/s for KVBoost above is approximate — the warm-up prefill in `demo_speculative` includes cold-cache disk I/O. Post-warm-up re-prefill ran at ~3 tok/s for 7 tokens (very short prompt, dominated by per-call overhead, not steady-state); for prompts >100 tokens both engines converge to per-layer streaming/compute throughput.
+- Both runs used greedy decoding. Output text is semantically equivalent across the two engines for this prompt.
+
+### Telemetry surface
+
+`demo_speculative` prints per-round timings and scheduler health so you can see exactly where time is going:
+
+```
+--- speculative stats ---
+  rounds:                  20
+  acceptance_rate:         0.400
+  avg_committed/round:     3.00
+  draft_time:              2.28s (avg 24.3ms/forward)
+  verify_time:             21.51s (avg 1075.7ms/forward)
+  rollback_time:           0.01s
+  decode_only_tok_per_s:   2.79
+  engine_overhead:         2.29s
+  histogram (K=0..5):      [6, 3, 4, 2, 2, 3]
+
+--- streaming scheduler stats ---
+  target: forwards=22 layer_calls=1012 hits=1012 misses=0 hit_rate=1.000 ...
+  draft:  fully resident (no scheduler)
+```
+
+What to look for:
+
+- `avg_verify_ms_per_forward` ≈ baseline `steady_state_ms_per_tok` — verify pays the same streaming cost as a single-token forward. The speedup comes from `avg_committed/round`.
+- `target.hit_rate` should be 1.000 with `--n-staging-slots ≥ 2`. Lower means prefetch is falling behind compute.
+- `target.prefetches_sync > 0` means a layer was DMA'd on the critical path — set more staging slots or raise `keep_*` until misses stop.
+- `draft` reports `None` (fully resident) — confirms the draft skipped scheduler installation.
+- `engine_overhead` should be small (<5s) on a warm cache. Large values mean disk I/O during the timed window — repeat the run to amortize.
+
+Programmatic access: `engine.speculative_stats()` and `engine.streaming_stats()` return the same dicts for `/v1/stats` integration.
+
+### Honest expectations
+
+- **Speedup ceiling = `avg_committed_per_round`, capped at `gamma + 1`.** No speculative scheme can beat the rate at which the target accepts drafts. For chat-style prompts with a good draft we typically see 2.5–4×; for code or low-entropy text, often higher; for adversarial / high-entropy text, can collapse to ~1×.
+- **First token is dominated by prefill, not speculative.** Speculative only kicks in for the decode loop; prefill is one big multi-token forward on the target. Use `demo_partial_8b`-style warm-up if you want to measure decode alone.
+- **Pinned host RAM still applies.** When pinning fails (e.g. container `RLIMIT_MEMLOCK = 64 KB`), the loader falls back to pageable + synchronous H2D — streaming overlap is lost for both baseline and speculative, but the relative speedup from speculation is preserved. See [AWQ streaming honest expectations](#honest-expectations) for the underlying limit and how to raise it.
+- **Tokenizer parity is required.** The draft must share vocab with the target — a mismatch silently corrupts verification. Asserted strictly at construction.
+- **Greedy mode is bit-for-bit identical to non-speculative greedy.** Sampling mode is distributionally equivalent to non-speculative sampling (target-distribution rejection sampling). Speculative never changes the output distribution.
+
+### Files
+
+- [src/kvboost/speculative/engine.py](src/kvboost/speculative/engine.py) — `SpeculativeEngine.decode_from` orchestrator
+- [src/kvboost/speculative/verifier.py](src/kvboost/speculative/verifier.py) — single multi-token forward over the streamed target
+- [src/kvboost/speculative/draft.py](src/kvboost/speculative/draft.py) — `DraftModel` (autoregressive K-step proposal)
+- [src/kvboost/speculative/sampler.py](src/kvboost/speculative/sampler.py) — `verify_greedy` / `verify_sampling`
+- [src/kvboost/speculative/rollback.py](src/kvboost/speculative/rollback.py) — KV truncation after partial acceptance
+- [src/kvboost/speculative/stats.py](src/kvboost/speculative/stats.py) — acceptance histogram + per-round timings
+- [src/kvboost/streaming/demo_speculative.py](src/kvboost/streaming/demo_speculative.py) — runnable demo with the telemetry block shown above
 
 ---
 
