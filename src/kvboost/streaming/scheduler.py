@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -11,6 +12,58 @@ from .profile import get_profiler
 from .staging import SlotLayout, StagingArena
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class StreamingCounters:
+    """Cumulative scheduler health counters. Cheap to maintain (one int+=
+    per event) and decisive for diagnosing slow streaming runs.
+
+    Read order of operations:
+    - ``forwards``: how many model forward passes we've seen.
+    - ``layer_before_calls``: total ``before_layer`` calls (resident layers
+      short-circuit and don't increment).
+    - ``prefetch_hits``: ``before_layer`` found the slot already populated
+      by an async prefetch — the desired path.
+    - ``prefetch_misses``: had to issue a synchronous prefetch from inside
+      ``before_layer`` (the pipeline was behind). Each miss adds a full
+      H2D wait to the critical path.
+    - ``prefetches_async`` / ``prefetches_sync``: count of prefetch issues
+      by mode. Sum is ``async + sync`` which should equal ``hits + misses``
+      modulo final-layer cleanup.
+    - ``prefetch_source_time_s``: cumulative wall time the CPU spent inside
+      ``prefetch_source_fn`` (typically ``loader.pin_layer``). High values
+      here mean disk / host-side work, not GPU-side DMA.
+    """
+    forwards: int = 0
+    layer_before_calls: int = 0
+    prefetch_hits: int = 0
+    prefetch_misses: int = 0
+    prefetches_async: int = 0
+    prefetches_sync: int = 0
+    prefetch_source_time_s: float = 0.0
+
+    def summary(self) -> dict[str, Any]:
+        denom = max(1, self.layer_before_calls)
+        return {
+            "forwards": self.forwards,
+            "layer_before_calls": self.layer_before_calls,
+            "prefetch_hits": self.prefetch_hits,
+            "prefetch_misses": self.prefetch_misses,
+            "hit_rate": round(self.prefetch_hits / denom, 4),
+            "prefetches_async": self.prefetches_async,
+            "prefetches_sync": self.prefetches_sync,
+            "prefetch_source_time_s": round(self.prefetch_source_time_s, 4),
+        }
+
+    def reset(self) -> None:
+        self.forwards = 0
+        self.layer_before_calls = 0
+        self.prefetch_hits = 0
+        self.prefetch_misses = 0
+        self.prefetches_async = 0
+        self.prefetches_sync = 0
+        self.prefetch_source_time_s = 0.0
 
 PrefetchSourceFn = Callable[[int], Mapping[str, torch.Tensor]]
 RunLayerFn = Callable[
@@ -109,6 +162,10 @@ class StreamingScheduler:
         # Maps streamed layer index -> slot id currently holding its weights.
         self._layer_to_slot: dict[int, int] = {}
 
+        # Cumulative health counters. Read via ``self.counters.summary()``.
+        # Always-on; each event is one int+= so overhead is negligible.
+        self.counters = StreamingCounters()
+
     # ── Hook-driven primitives ──────────────────────────────────────────────
 
     def begin_forward(self) -> None:
@@ -118,6 +175,7 @@ class StreamingScheduler:
         stream) before any layer pre-hook fires.
         """
         with get_profiler().region("scheduler.begin_forward"):
+            self.counters.forwards += 1
             self.compute_stream = torch.cuda.current_stream(device=self.device)
             self._layer_to_slot.clear()
             if self.streamed_indices:
@@ -132,11 +190,15 @@ class StreamingScheduler:
             return None
 
         with get_profiler().region("scheduler.before_layer", layer_idx=layer_idx):
+            self.counters.layer_before_calls += 1
             slot_id = self._layer_to_slot.get(layer_idx)
             if slot_id is None:
                 # Late prefetch (single-slot config, or layer was missed). Stage
                 # synchronously into slot 0 so forward can proceed.
+                self.counters.prefetch_misses += 1
                 slot_id = self._fallback_synchronous_prefetch(layer_idx)
+            else:
+                self.counters.prefetch_hits += 1
 
             assert self.compute_stream is not None, "begin_forward not called"
             self.compute_stream.wait_event(self.xfer_done[layer_idx])
@@ -248,15 +310,22 @@ class StreamingScheduler:
         layer_idx: int,
         slot_id: int,
         wait_event: Optional[torch.cuda.Event],
+        is_sync_fallback: bool = False,
     ) -> None:
         if layer_idx in self._layer_to_slot:
             return
 
         if wait_event is not None:
             self.transfer_stream.wait_event(wait_event)
+        if is_sync_fallback:
+            self.counters.prefetches_sync += 1
+        else:
+            self.counters.prefetches_async += 1
 
+        t0 = time.perf_counter()
         with get_profiler().region("scheduler.prefetch_source_fn", layer_idx=layer_idx):
             layer_tensors = self.prefetch_source_fn(layer_idx)
+        self.counters.prefetch_source_time_s += time.perf_counter() - t0
 
         with torch.cuda.stream(self.transfer_stream):
             self.arena.copy_layer_into_slot(slot_id, layer_tensors)
@@ -273,6 +342,7 @@ class StreamingScheduler:
             layer_idx=layer_idx,
             slot_id=slot_id,
             wait_event=None,
+            is_sync_fallback=True,
         )
         return slot_id
 

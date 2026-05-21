@@ -41,6 +41,7 @@ Per round
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
@@ -53,6 +54,18 @@ from .stats import SpeculativeStats
 from .verifier import TargetVerifier
 
 log = logging.getLogger(__name__)
+
+
+def _cuda_sync_if_needed(device: Optional[torch.device]) -> None:
+    """Ensure GPU work has completed before we read wall-clock time.
+
+    Without this, per-round timings would only measure CPU dispatch latency,
+    not the actual streaming/compute work. We sync only on CUDA devices and
+    only if a device is supplied (draft can be on CPU in pathological setups).
+    """
+    if device is None or device.type != "cuda":
+        return
+    torch.cuda.synchronize(device)
 
 
 def _kv_length(past_kv: Any) -> int:
@@ -140,6 +153,17 @@ class SpeculativeEngine:
 
         generated: List[int] = []
 
+        # Cache device handles once so we don't pay an attribute lookup per
+        # round; needed for sync-before-clock so timings reflect real GPU
+        # work instead of CPU dispatch latency.
+        draft_device = getattr(self.draft, "device", None)
+        if isinstance(draft_device, str):
+            draft_device = torch.device(draft_device)
+        target_device = getattr(self.verifier, "device", None)
+        if isinstance(target_device, str):
+            target_device = torch.device(target_device)
+
+        round_idx = 0
         while len(generated) < max_new_tokens:
             remaining = max_new_tokens - len(generated)
             k = min(self.cfg.draft_k, remaining)
@@ -161,20 +185,28 @@ class SpeculativeEngine:
 
             # Skip the per-step fp32 softmax in greedy mode (verify_greedy
             # ignores draft_probs). Saves ~3-6 ms per round on large vocabs.
+            _cuda_sync_if_needed(draft_device)
+            t_draft0 = time.perf_counter()
             draft_ids, draft_probs = self.draft.draft(
                 last_committed,
                 k=k,
                 return_probs=(self.cfg.mode == "sampling"),
             )
+            _cuda_sync_if_needed(draft_device)
+            draft_dt = time.perf_counter() - t_draft0
             # After draft: draft.past_kv length = committed_length + k
 
             # ── 2. Target verifies in one multi-token forward ───────────
+            _cuda_sync_if_needed(target_device)
+            t_verify0 = time.perf_counter()
             target_logits, target_past_kv = self.verifier.verify(
                 last_committed_token=last_committed,
                 draft_ids=draft_ids,
                 past_kv=target_past_kv,
                 committed_length=committed_length,
             )
+            _cuda_sync_if_needed(target_device)
+            verify_dt = time.perf_counter() - t_verify0
             # After verify: target_past_kv length = committed_length + k + 1
 
             # ── 3. Sampler decides ──────────────────────────────────────
@@ -223,6 +255,7 @@ class SpeculativeEngine:
             n_committed_draft_tokens = min(n_committed, accepted)
 
             # ── 5. Rollback both KV caches to match committed state ─────
+            t_rb0 = time.perf_counter()
             new_kv_length = committed_length + 1 + n_committed_draft_tokens
             target_past_kv = self.verifier.rollback(target_past_kv, new_kv_length)
 
@@ -245,9 +278,24 @@ class SpeculativeEngine:
             # else: leave draft KV as-is. The next round's draft.draft
             # will feed the new last_committed, which lands at the
             # current draft KV's tail — matching the new state.
+            rollback_dt = time.perf_counter() - t_rb0
 
             # ── 6. Stats + advance ──────────────────────────────────────
-            self.stats.record_round(accepted_count=accepted, draft_k=k)
+            self.stats.record_round(
+                accepted_count=accepted,
+                draft_k=k,
+                draft_time_s=draft_dt,
+                verify_time_s=verify_dt,
+                rollback_time_s=rollback_dt,
+            )
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug(
+                    "spec round=%d k=%d accepted=%d committed=%d "
+                    "draft=%.1fms verify=%.1fms rollback=%.2fms",
+                    round_idx, k, accepted, len(committed_this_round),
+                    draft_dt * 1000.0, verify_dt * 1000.0, rollback_dt * 1000.0,
+                )
+            round_idx += 1
 
             committed_length = new_kv_length
             if n_committed > 0:

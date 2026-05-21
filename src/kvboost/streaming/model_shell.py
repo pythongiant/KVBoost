@@ -571,6 +571,18 @@ class StreamingCausalLM(nn.Module):
                         )
                     )
 
+    def streaming_counters(self) -> Optional[dict[str, Any]]:
+        """Return scheduler health counters, or ``None`` if no scheduler.
+
+        ``None`` means this model is fully resident — no per-layer DMA was
+        scheduled, so there's nothing to report. A returned dict surfaces
+        prefetch hit/miss rate and sync-fallback counts; see
+        :class:`StreamingCounters` for the field meanings.
+        """
+        if self._scheduler is None:
+            return None
+        return self._scheduler.counters.summary()
+
     def __del__(self) -> None:  # pragma: no cover - cleanup
         for h in self._hook_handles:
             try:
@@ -1073,6 +1085,19 @@ def _build_scheduler(
     streamed_set = set(loader.streamed_layer_indices())
     for spec in layer_specs:
         spec.resident = spec.layer_idx not in streamed_set
+
+    # If every layer is resident (e.g. the speculative draft loaded with
+    # huge keep_first_k / keep_last_k), there is no streaming to schedule.
+    # Skip building the scheduler so we also skip installing the per-forward
+    # `cuda.synchronize` hook — that sync is dead weight on a fully resident
+    # model and noticeable when called K times per spec round on the draft.
+    if not streamed_set:
+        logger.info(
+            "All %d layers are resident; skipping StreamingScheduler "
+            "(no per-forward sync hook needed).",
+            len(layer_specs),
+        )
+        return None
 
     # Only stream the *projection* tensors. Layernorms and biases for
     # streamed layers are tiny and already resident; keep them out of the

@@ -245,6 +245,28 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  steady_state_tok_per_s:  {steady_tps:.2f}", file=sys.stderr)
     print(f"  peak_vram_during_decode: {peak_decode / 1e9:.2f} GB", file=sys.stderr)
 
+    # Streaming scheduler counters — same telemetry surface as
+    # demo_speculative so the two runs can be diffed directly to
+    # see whether the spec path is actually amortizing target forwards.
+    sched_summary = (
+        model.streaming_counters() if hasattr(model, "streaming_counters") else None
+    )
+    if sched_summary is None:
+        print("  streaming_scheduler:     <none> (fully resident)", file=sys.stderr)
+    else:
+        print(
+            f"  streaming_scheduler:     "
+            f"forwards={sched_summary['forwards']} "
+            f"layer_calls={sched_summary['layer_before_calls']} "
+            f"hits={sched_summary['prefetch_hits']} "
+            f"misses={sched_summary['prefetch_misses']} "
+            f"hit_rate={sched_summary['hit_rate']:.3f} "
+            f"async={sched_summary['prefetches_async']} "
+            f"sync_fallback={sched_summary['prefetches_sync']} "
+            f"prefetch_src_time={sched_summary['prefetch_source_time_s']:.2f}s",
+            file=sys.stderr,
+        )
+
     # In quiet mode the live-stream above only emits timing lines, not the
     # actual text. Print the decoded continuation so the user has a readable
     # answer to inspect.

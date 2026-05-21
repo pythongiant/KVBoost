@@ -152,10 +152,45 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"  accepted_total:          {spec_stats['accepted_total']}", file=sys.stderr)
         print(f"  committed_total:         {spec_stats['committed_total']}", file=sys.stderr)
         print(f"  bonus_rounds:            {spec_stats['bonus_rounds']}", file=sys.stderr)
+        print(f"  target_forwards:         {spec_stats['target_forwards']}", file=sys.stderr)
+        print(f"  draft_forwards:          {spec_stats['draft_forwards']}", file=sys.stderr)
         print(f"  acceptance_rate:         {spec_stats['acceptance_rate']:.3f}", file=sys.stderr)
         print(f"  avg_committed/round:     {spec_stats['avg_committed_per_round']:.2f}", file=sys.stderr)
+        print(f"  draft_time:              {spec_stats['draft_time_s']:.2f}s "
+              f"(avg {spec_stats['avg_draft_ms_per_forward']:.1f}ms/forward)", file=sys.stderr)
+        print(f"  verify_time:             {spec_stats['verify_time_s']:.2f}s "
+              f"(avg {spec_stats['avg_verify_ms_per_forward']:.1f}ms/forward)", file=sys.stderr)
+        print(f"  rollback_time:           {spec_stats['rollback_time_s']:.2f}s "
+              f"(avg {spec_stats['avg_rollback_ms_per_round']:.2f}ms/round)", file=sys.stderr)
+        overhead = decode_s - (
+            spec_stats['draft_time_s']
+            + spec_stats['verify_time_s']
+            + spec_stats['rollback_time_s']
+        )
+        print(f"  engine_overhead:         {overhead:.2f}s "
+              f"(sampler/list/python)", file=sys.stderr)
         print(f"  histogram (K=0..{len(spec_stats['histogram'])-1}): "
               f"{spec_stats['histogram']}", file=sys.stderr)
+
+    stream_stats = engine.streaming_stats()
+    if stream_stats:
+        print()
+        print("--- streaming scheduler stats ---", file=sys.stderr)
+        for who, counters in stream_stats.items():
+            if counters is None:
+                print(f"  {who}: fully resident (no scheduler)", file=sys.stderr)
+                continue
+            print(
+                f"  {who}: forwards={counters['forwards']} "
+                f"layer_calls={counters['layer_before_calls']} "
+                f"hits={counters['prefetch_hits']} "
+                f"misses={counters['prefetch_misses']} "
+                f"hit_rate={counters['hit_rate']:.3f} "
+                f"async={counters['prefetches_async']} "
+                f"sync_fallback={counters['prefetches_sync']} "
+                f"prefetch_src_time={counters['prefetch_source_time_s']:.2f}s",
+                file=sys.stderr,
+            )
     return 0
 
 

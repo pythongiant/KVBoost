@@ -1169,6 +1169,26 @@ class InferenceEngine:
             return {}
         return self._speculative_stats.summary()
 
+    def streaming_stats(self) -> Dict:
+        """Per-model streaming-scheduler counters (target + optional draft).
+
+        Each value is either a dict (the scheduler's counter summary) or
+        ``None`` (model is fully resident, no scheduler). Use this to
+        diagnose streaming pipeline health — low ``hit_rate`` or non-zero
+        ``prefetches_sync`` means the prefetch pipeline isn't staying ahead
+        of compute and every miss serializes the H2D copy onto the
+        critical path.
+        """
+        out: Dict = {}
+        target = getattr(self.model, "streaming_counters", None)
+        if callable(target):
+            out["target"] = target()
+        if self.speculative_engine is not None:
+            draft = getattr(self.speculative_engine.draft.model, "streaming_counters", None)
+            if callable(draft):
+                out["draft"] = draft()
+        return out
+
     def verify_correctness(self, max_new_tokens: int = 32) -> bool:
         """
         Quick self-test: runs greedy decode on a synthetic prompt with
