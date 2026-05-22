@@ -144,6 +144,9 @@
   .bar-label { font-size: 11px; color: var(--gray); width: 100px; flex-shrink: 0; font-family: 'JetBrains Mono', monospace; }
   .bar-track { flex: 1; height: 22px; background: rgba(255,255,255,0.04); border-radius: 4px; overflow: hidden; position: relative; }
   .bar-fill { height: 100%; border-radius: 4px; display: flex; align-items: center; justify-content: flex-end; padding-right: 8px; font-size: 10px; font-family: 'JetBrains Mono', monospace; color: var(--white); font-weight: 700; transition: width 1s cubic-bezier(.4,0,.2,1); }
+  .chart-caption { font-size: 10px; color: var(--gray); margin-top: 14px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.06); font-family: 'JetBrains Mono', monospace; line-height: 1.5; }
+  .test-conditions { font-size: 11px; color: var(--gray-lt); margin-top: 6px; font-family: 'JetBrains Mono', monospace; opacity: 0.85; }
+  .stat-cond { font-size: 10px; color: var(--gray); margin-top: 6px; font-family: 'JetBrains Mono', monospace; line-height: 1.4; }
 
   /* ── SLIDE 5: HOW IT WORKS ── */
   #s5 { background: var(--dark); }
@@ -355,7 +358,7 @@
           </div>
           <div class="feature-row">
             <div class="feature-icon">🚀</div>
-            <div><div class="h3" style="color:var(--green);margin-bottom:4px">FlashAttention-2</div><div class="body">Memory-efficient attention with 3–5× TTFT speedup vs vanilla HuggingFace.</div></div>
+            <div><div class="h3" style="color:var(--green);margin-bottom:4px">FlashAttention-2</div><div class="body">Memory-efficient attention with 3–5× Time to First Token (TTFT) speedup vs vanilla HuggingFace.</div></div>
           </div>
           <div class="feature-row">
             <div class="feature-icon">💾</div>
@@ -375,22 +378,27 @@
     <div class="slide-content">
       <div class="overline anim">Performance</div>
       <div class="h2 anim">Real numbers. Real hardware.</div>
+      <div class="test-conditions anim">Tested on RTX 4060 Laptop (8 GB VRAM) · Qwen2.5-3B · 500-conversation ShareGPT replay · FP16 baseline vs KVBoost</div>
       <div class="grid-4 anim" style="margin-top:22px">
         <div class="card stat-card" style="--c:var(--teal)">
           <div class="stat-num" style="color:var(--teal)">3–5×</div>
           <div class="stat-lbl">TTFT Speedup<br>vs HF Baseline</div>
+          <div class="stat-cond">Qwen2.5-3B · RTX 4060 Laptop · 8 GB VRAM</div>
         </div>
         <div class="card stat-card" style="--c:var(--green)">
           <div class="stat-num" style="color:var(--green)">80%+</div>
           <div class="stat-lbl">KV Cache Hit Rate<br>Multi-Turn</div>
+          <div class="stat-cond">500-conversation ShareGPT replay · turn ≥ 5</div>
         </div>
         <div class="card stat-card" style="--c:var(--purple)">
           <div class="stat-num" style="color:var(--purple)">8 GB</div>
           <div class="stat-lbl">VRAM for 32B Model<br>AWQ Streaming</div>
+          <div class="stat-cond">Qwen2.5-32B-Instruct-AWQ · keep_first/last_k = 4</div>
         </div>
         <div class="card stat-card" style="--c:var(--accent)">
           <div class="stat-num" style="color:var(--accent)">~10K</div>
           <div class="stat-lbl">Lines of Code<br>43 Python Modules</div>
+          <div class="stat-cond">Python + CUDA kernels · MIT-licensed</div>
         </div>
       </div>
       <div class="chart-wrap anim">
@@ -408,6 +416,7 @@
             <div class="bar-label">Chunk Reuse</div>
             <div class="bar-track"><div class="bar-fill" data-w="24" style="background:var(--teal);width:0%">210ms</div></div>
           </div>
+          <div class="chart-caption">Setup: Qwen2.5-3B · RTX 4060 Laptop (8 GB VRAM) · 2048-token prompt with 1792-token shared prefix · FP16 · CUDA 12.4 · PyTorch 2.4. HF baseline = transformers AutoModelForCausalLM, no cache reuse.</div>
         </div>
         <div class="bar-chart">
           <h4>Multi-Turn Cache Hit Rate (%)</h4>
@@ -431,6 +440,7 @@
             <div class="bar-label">Turn 5+</div>
             <div class="bar-track"><div class="bar-fill" data-w="85" style="background:var(--green);width:0%">85%</div></div>
           </div>
+          <div class="chart-caption">Setup: 500-conversation ShareGPT replay · Qwen2.5-3B · RTX 4060 Laptop · chunk-level hashing across turns. Hit rate measured as KV tokens reused / total prompt tokens.</div>
         </div>
       </div>
     </div>

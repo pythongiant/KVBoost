@@ -40,7 +40,7 @@ from .flash_attn_ext import (
 )
 from .cpu_paged import CPUPagedEngine, BlockAllocator, paged_attention_fwd, ChunkBlockMapper
 
-__version__ = "0.4.0"
+__version__ = "0.7.0"
 
 __all__ = [
     # Core engine
