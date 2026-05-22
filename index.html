@@ -206,9 +206,70 @@
   .slide.active .anim:nth-child(3) { animation-delay: 0.25s; opacity: 0; }
   .slide.active .anim:nth-child(4) { animation-delay: 0.35s; opacity: 0; }
   .slide.active .anim:nth-child(5) { animation-delay: 0.42s; opacity: 0; }
+
+  /* ── GITHUB STAR BUTTON (floating, always visible) ── */
+  .gh-star {
+    position: fixed;
+    top: 24px;
+    right: 24px;
+    z-index: 100;
+    display: inline-flex;
+    align-items: stretch;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.35), 0 0 0 1px rgba(255,255,255,0.08);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    text-decoration: none;
+    transition: transform 0.18s ease, box-shadow 0.18s ease;
+  }
+  .gh-star:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.45), 0 0 0 1px rgba(20,184,166,0.5);
+  }
+  .gh-star .gh-star-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #1f2937;
+    color: #f5f7fa;
+    padding: 7px 12px;
+    font-weight: 700;
+  }
+  .gh-star .gh-star-icon { width: 14px; height: 14px; fill: #f5f7fa; }
+  .gh-star .gh-star-count {
+    display: inline-flex;
+    align-items: center;
+    background: #0d1117;
+    color: var(--teal-lt);
+    padding: 7px 12px;
+    border-left: 1px solid rgba(255,255,255,0.08);
+    font-weight: 700;
+  }
+  .gh-star .gh-star-count::before {
+    content: '';
+    display: inline-block;
+    width: 0; height: 0;
+    border-top: 5px solid transparent;
+    border-bottom: 5px solid transparent;
+    border-right: 5px solid #1f2937;
+    margin-right: 8px;
+  }
 </style>
 </head>
 <body>
+<!-- Floating GitHub Star button (live count via buttons.github.io fetched async) -->
+<a class="gh-star" href="https://github.com/pythongiant/kvboost"
+   target="_blank" rel="noopener" aria-label="Star pythongiant/kvboost on GitHub">
+  <span class="gh-star-btn">
+    <svg class="gh-star-icon" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.75.75 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z"/>
+    </svg>
+    Star
+  </span>
+  <span class="gh-star-count" id="gh-star-count">★</span>
+</a>
+
 <div class="deck">
 
   <!-- ═══════════════════════════════ SLIDE 1: TITLE ═══════════════════════════════ -->
@@ -404,28 +465,29 @@
           </div>
           <div class="term-body">
             <span class="t-cmd">$ python -m kvboost.streaming.demo_partial_8b</span><br>
-            <span class="t-muted">&nbsp;&nbsp;--model Qwen/Qwen2.5-32B-Instruct-AWQ</span><br><br>
+            <span class="t-muted">&nbsp;&nbsp;--model Qwen/Qwen2.5-32B-Instruct-AWQ</span><br>
+            <span class="t-muted">&nbsp;&nbsp;--keep-first-k 9 --keep-last-k 9</span><br><br>
             <span class="t-muted">INFO: Replaced projections:</span><br>
-            <span class="t-ok">&nbsp;&nbsp;56 resident across 8 layers</span><br>
-            <span class="t-ok">&nbsp;&nbsp;392 streamed across 56 layers</span><br><br>
-            <span class="t-muted">&nbsp;&nbsp;load_time:               </span><span class="t-val">10.7s</span><br>
-            <span class="t-muted">&nbsp;&nbsp;peak_vram_after_load:    </span><span class="t-num-p">5.65 GB</span><br>
-            <span class="t-muted">&nbsp;&nbsp;avg_tok_per_s:           </span><span class="t-num-a">0.11</span><br>
-            <span class="t-muted">&nbsp;&nbsp;peak_vram_during_decode: </span><span class="t-num-p">6.13 GB</span>
+            <span class="t-ok">&nbsp;&nbsp;126 resident across 18 layers</span><br>
+            <span class="t-ok">&nbsp;&nbsp;322 streamed across 46 layers</span><br><br>
+            <span class="t-muted">&nbsp;&nbsp;load_time:               </span><span class="t-val">11.4s</span><br>
+            <span class="t-muted">&nbsp;&nbsp;peak_vram_after_load:    </span><span class="t-num-p">8.76 GB</span><br>
+            <span class="t-muted">&nbsp;&nbsp;avg_tok_per_s:           </span><span class="t-num-a">1.40</span><br>
+            <span class="t-muted">&nbsp;&nbsp;peak_vram_during_decode: </span><span class="t-num-p">9.58 GB</span>
           </div>
         </div>
         <div style="display:flex;flex-direction:column;gap:14px">
           <div class="card metric-card" style="--c:var(--purple)">
-            <div class="metric-val" style="color:var(--purple)">5.65 GB</div>
-            <div class="body">Peak VRAM after loading a 32B model — fits on a single 8 GB gaming GPU.</div>
+            <div class="metric-val" style="color:var(--purple)">8.76 GB</div>
+            <div class="body">Peak VRAM after loading a 32B model — fits comfortably on a 12 GB gaming GPU (RTX 3060).</div>
           </div>
           <div class="card metric-card" style="--c:var(--teal)">
-            <div class="metric-val" style="color:var(--teal)">6.13 GB</div>
-            <div class="body">Peak VRAM during decode — stays safely under the 8 GB limit.</div>
+            <div class="metric-val" style="color:var(--teal)">9.58 GB</div>
+            <div class="body">Peak VRAM during decode — well under the 12 GB limit with room for KV cache growth.</div>
           </div>
           <div class="card metric-card" style="--c:var(--accent)">
-            <div class="metric-val" style="color:var(--accent)">0.11 tok/s</div>
-            <div class="body">PCIe-bound throughput — built for VRAM savings, not raw speed.</div>
+            <div class="metric-val" style="color:var(--accent)">1.40 tok/s</div>
+            <div class="body">Steady-state throughput on a 32B model — async prefetch keeps prefetch_hit_rate at 1.000. Add the 1.5B AWQ draft for speculative decoding and this climbs to <b>2.79 tok/s</b> (~3× speedup).</div>
           </div>
         </div>
       </div>
@@ -559,18 +621,21 @@
         KVBoost is open source and production-ready.<br>Drop it into any HuggingFace project today.
       </div>
       <div class="grid-3 anim" style="margin-top:28px;max-width:700px">
-        <div class="card link-card" style="--c:var(--teal)">
-          <div class="h3" style="color:var(--teal)">GitHub</div>
+        <a class="card link-card" href="https://github.com/pythongiant/kvboost"
+           target="_blank" rel="noopener" style="--c:var(--teal);text-decoration:none;color:inherit">
+          <div class="h3" style="color:var(--teal)">⭐ Star on GitHub</div>
           <div class="link-url">github.com/pythongiant/kvboost</div>
-        </div>
-        <div class="card link-card" style="--c:var(--green)">
+        </a>
+        <a class="card link-card" href="https://pypi.org/project/kvboost/"
+           target="_blank" rel="noopener" style="--c:var(--green);text-decoration:none;color:inherit">
           <div class="h3" style="color:var(--green)">PyPI</div>
           <div class="link-url">pypi.org/project/kvboost/</div>
-        </div>
-        <div class="card link-card" style="--c:var(--purple)">
+        </a>
+        <a class="card link-card" href="https://kvboost.readthedocs.io"
+           target="_blank" rel="noopener" style="--c:var(--purple);text-decoration:none;color:inherit">
           <div class="h3" style="color:var(--purple)">Docs</div>
           <div class="link-url">kvboost.readthedocs.io</div>
-        </div>
+        </a>
       </div>
       <div class="install-box anim">
         <span style="color:var(--gray)">$</span> pip install kvboost
@@ -589,6 +654,37 @@
 </div>
 
 <script>
+  // ── GitHub Star count (live, cached in sessionStorage to avoid rate limits) ──
+  (function loadGhStars() {
+    const target = document.getElementById('gh-star-count');
+    if (!target) return;
+    const REPO = 'pythongiant/kvboost';
+    const CACHE_KEY = 'gh-stars:' + REPO;
+    const CACHE_TTL_MS = 10 * 60 * 1000;  // 10 min
+    const fmt = (n) => n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+
+    try {
+      const cached = JSON.parse(sessionStorage.getItem(CACHE_KEY) || 'null');
+      if (cached && Date.now() - cached.t < CACHE_TTL_MS) {
+        target.textContent = fmt(cached.n);
+        return;
+      }
+    } catch (e) { /* ignore */ }
+
+    fetch('https://api.github.com/repos/' + REPO)
+      .then((r) => r.ok ? r.json() : null)
+      .then((j) => {
+        if (!j || typeof j.stargazers_count !== 'number') return;
+        target.textContent = fmt(j.stargazers_count);
+        try {
+          sessionStorage.setItem(CACHE_KEY, JSON.stringify({
+            n: j.stargazers_count, t: Date.now(),
+          }));
+        } catch (e) { /* ignore */ }
+      })
+      .catch(() => { /* leave the placeholder */ });
+  })();
+
   const slides = document.querySelectorAll('.slide');
   const total = slides.length;
   let current = 0;
