@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>KVBoost — Pitch Deck</title>
+<title>KVBoost</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -25,25 +25,32 @@
     --red:     #F87171;
   }
 
-  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: 'Syne', sans-serif; }
+  html, body {
+    width: 100%; min-height: 100%; background: #000;
+    font-family: 'Syne', sans-serif;
+    /* Native vertical scroll with optional snap to each section for the
+       deck feel. Use `proximity` (not `mandatory`) so users with reduced
+       motion / mid-section reading can stop wherever they want. */
+    scroll-snap-type: y proximity;
+    scroll-behavior: smooth;
+  }
 
-  .deck { width: 100vw; height: 100vh; position: relative; }
+  .deck { width: 100%; position: relative; }
 
   .slide {
-    position: absolute; inset: 0;
+    position: relative;
+    min-height: 100vh;
     display: flex; flex-direction: column; justify-content: center;
     padding: 5vh 7vw;
-    opacity: 0; pointer-events: none;
-    transition: opacity 0.45s ease, transform 0.45s ease;
-    transform: translateY(30px);
+    scroll-snap-align: start;
+    /* Sections are always rendered; the .anim children stay hidden until
+       the section enters the viewport (see IntersectionObserver below). */
   }
-  .slide.active {
-    opacity: 1; pointer-events: all;
-    transform: translateY(0);
-  }
-  .slide.out {
-    opacity: 0; transform: translateY(-30px);
-  }
+  /* Two state classes both maintained by the IntersectionObserver:
+     - `.active`: flips on whichever section is currently most visible
+       (drives the nav-dot highlight; nothing visual on the section itself).
+     - `.in-view`: added once the first time a section crosses into view
+       and never removed — gates the one-shot `.anim` reveal below. */
 
   /* ── NAV ── */
   .nav {
@@ -198,14 +205,23 @@
   .slide-bg { position: absolute; inset: 0; z-index: 0; }
   .slide-content { position: relative; z-index: 1; width: 100%; }
 
-  /* ── ANIMATIONS ── */
+  /* ── ANIMATIONS ──
+     `.in-view` is added once (and not removed) the first time a section
+     enters the viewport — content reveals on encounter, then stays put on
+     scroll-back. `.active` (separate class) tracks the currently-most-
+     visible section for the nav dots and is allowed to flip on/off. */
   @keyframes fadeUp { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
-  .slide.active .anim { animation: fadeUp 0.5s ease forwards; }
-  .slide.active .anim:nth-child(1) { animation-delay: 0.05s; opacity: 0; }
-  .slide.active .anim:nth-child(2) { animation-delay: 0.15s; opacity: 0; }
-  .slide.active .anim:nth-child(3) { animation-delay: 0.25s; opacity: 0; }
-  .slide.active .anim:nth-child(4) { animation-delay: 0.35s; opacity: 0; }
-  .slide.active .anim:nth-child(5) { animation-delay: 0.42s; opacity: 0; }
+  .slide .anim { opacity: 0; }
+  .slide.in-view .anim { animation: fadeUp 0.5s ease forwards; }
+  .slide.in-view .anim:nth-child(1) { animation-delay: 0.05s; }
+  .slide.in-view .anim:nth-child(2) { animation-delay: 0.15s; }
+  .slide.in-view .anim:nth-child(3) { animation-delay: 0.25s; }
+  .slide.in-view .anim:nth-child(4) { animation-delay: 0.35s; }
+  .slide.in-view .anim:nth-child(5) { animation-delay: 0.42s; }
+  @media (prefers-reduced-motion: reduce) {
+    .slide .anim { opacity: 1; }
+    .slide.in-view .anim { animation: none; }
+  }
 
   /* ── GITHUB STAR BUTTON (floating, always visible) ── */
   .gh-star {
@@ -689,7 +705,7 @@
   const total = slides.length;
   let current = 0;
 
-  // Build dots
+  // Build dots (each jumps the page to its section via native scroll).
   const dotsEl = document.getElementById('dots');
   for (let i = 0; i < total; i++) {
     const d = document.createElement('div');
@@ -698,45 +714,80 @@
     dotsEl.appendChild(d);
   }
 
-  function goTo(n) {
+  function setActive(n) {
     if (n < 0 || n >= total || n === current) return;
     slides[current].classList.remove('active');
-    slides[current].classList.add('out');
-    setTimeout(() => slides[current].classList.remove('out'), 500);
     current = n;
     slides[current].classList.add('active');
-    // Update dots
-    document.querySelectorAll('.nav-dot').forEach((d, i) => d.classList.toggle('active', i === current));
+    document.querySelectorAll('.nav-dot').forEach((d, i) =>
+      d.classList.toggle('active', i === current),
+    );
     document.getElementById('count').textContent = (current + 1) + ' / ' + total;
-    // Animate bars on slide 4
-    if (current === 3) animateBars();
+    // The "bars" reveal on slide 4 (#s4) is JS-driven; (re-)fire it
+    // whenever that slide becomes the active one — including when the
+    // user scrolls back to it.
+    if (slides[current].id === 's4') animateBars();
   }
+
+  function goTo(n) {
+    if (n < 0 || n >= total) return;
+    slides[n].scrollIntoView({ behavior: 'smooth', block: 'start' });
+    // setActive will fire from the IntersectionObserver once the scroll
+    // settles, so we don't need to duplicate it here.
+  }
+
+  // First slide: mark active (for nav-dot highlight) AND mark in-view so
+  // its children animate in on first paint, not on first scroll.
+  slides[0].classList.add('active');
+  slides[0].classList.add('in-view');
+
+  // Track which section is most-in-view and reflect that in `current`
+  // (drives nav dot highlight + the slide-4 bars re-fire).
+  const io = new IntersectionObserver((entries) => {
+    // Reveal animation: add `.in-view` the first time each section
+    // crosses the threshold; never remove it, so re-scrolls don't flash.
+    for (const e of entries) {
+      if (e.isIntersecting && !e.target.classList.contains('in-view')) {
+        e.target.classList.add('in-view');
+      }
+    }
+    // Nav highlight: pick the entry with the largest intersection ratio.
+    let best = null;
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      if (!best || e.intersectionRatio > best.intersectionRatio) best = e;
+    }
+    if (!best) return;
+    const idx = Array.prototype.indexOf.call(slides, best.target);
+    if (idx !== -1) setActive(idx);
+  }, { threshold: [0.2, 0.5, 0.8] });
+  slides.forEach((s) => io.observe(s));
 
   document.getElementById('prevBtn').onclick = () => goTo(current - 1);
   document.getElementById('nextBtn').onclick = () => goTo(current + 1);
 
-  document.addEventListener('keydown', e => {
-    if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ') { e.preventDefault(); goTo(current + 1); }
-    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); goTo(current - 1); }
-  });
-
-  // Swipe support
-  let tx = 0;
-  document.addEventListener('touchstart', e => tx = e.touches[0].clientX);
-  document.addEventListener('touchend', e => {
-    const dx = tx - e.changedTouches[0].clientX;
-    if (Math.abs(dx) > 40) goTo(current + (dx > 0 ? 1 : -1));
+  document.addEventListener('keydown', (e) => {
+    // Don't hijack typing in inputs / textareas / contenteditable.
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    if (e.key === 'PageDown' || e.key === ' ' || (e.key === 'ArrowRight' && !e.shiftKey)) {
+      e.preventDefault();
+      goTo(current + 1);
+    } else if (e.key === 'PageUp' || (e.key === 'ArrowLeft' && !e.shiftKey)) {
+      e.preventDefault();
+      goTo(current - 1);
+    }
+    // ArrowUp / ArrowDown are intentionally left to native scroll so
+    // users can scroll inside a section without snapping to the next.
   });
 
   function animateBars() {
     setTimeout(() => {
-      document.querySelectorAll('.bar-fill').forEach(b => {
+      document.querySelectorAll('.bar-fill').forEach((b) => {
         b.style.width = b.dataset.w + '%';
       });
     }, 300);
   }
-  // Reset bars when leaving slide 4
-  const origGoTo = goTo;
 </script>
 </body>
 </html>
