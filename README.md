@@ -61,7 +61,7 @@ rewrites, no custom training format, no engine to learn.
 | | CacheBlend seam repair | Selective recompute at chunk boundaries keeps output quality identical to no-cache (≤0.2 pp drift on standard evals) even at >80% reuse. |
 | | KV quantization | Optional 8-bit (KIVI-style asymmetric K/V) or 4-bit cache, for 2-4× cache-memory savings with minimal accuracy loss. |
 | **Compute** | FlashAttention-2 CUDA kernel | Custom tiled-softmax kernel for Volta → Hopper (sm_70 through sm_90). Optional  falls back gracefully if not built. |
-| | AWQ layer streaming | Run 32B-class models on 8 GB GPUs by streaming INT4 layer weights from pinned host RAM. PCIe transfer overlaps with compute via staging slots. |
+| | AWQ layer streaming | Run 32B-class models on 12 GB (and smaller) GPUs by streaming INT4 layer weights from pinned host RAM. PCIe transfer overlaps with compute via staging slots. |
 | | Speculative decoding | Small AWQ draft proposes K tokens; streamed target verifies in one forward. Provably preserves the output distribution (greedy & sampling). |
 | **Serving** | OpenAI-compatible HTTP server | `/v1/completions` and `/v1/chat/completions` with async prefix-grouped batching. Drop-in for the OpenAI SDK, LangChain, LlamaIndex, Instructor, and friends. |
 | | Multi-backend | CUDA (full feature set), MPS (Apple Silicon, unified memory), CPU paged attention. |
@@ -357,51 +357,51 @@ pip install "kvboost[streaming]"
 # adds: safetensors, huggingface_hub, accelerate; on Linux x86, autoawq-kernels
 ```
 
-### Run a 32B model on an 8 GB GPU
+### Run a 32B model on a 12 GB GPU
 
 ```bash
 PYTHONPATH=src python -m kvboost.streaming.demo_partial_8b \
     --model Qwen/Qwen2.5-32B-Instruct-AWQ \
-    --keep-first-k 4 --keep-last-k 4 \
+    --keep-first-k 9 --keep-last-k 9 \
     --prompt "Explain entropy in two sentences." \
     --max-new-tokens 32 --verbose
 ```
 
-Real output on an 8 GB GPU (Qwen2.5-32B-Instruct-AWQ, ~19 GB packed):
+Real output on a 12 GB GPU (RTX 3060, Qwen2.5-32B-Instruct-AWQ, ~19 GB packed):
 
 ```
 INFO:kvboost.streaming.model_shell:Replaced projections:
-    56 resident across 8 layers, 392 streamed across 56 layers
-  load_time: 10.7s
-  peak_vram_after_load: 5.65 GB
+    126 resident across 18 layers, 322 streamed across 46 layers
+  load_time: 11.4s
+  peak_vram_after_load: 8.76 GB
   prompt_tokens: 7
 
 --- warm-up prefill ---
-  prefill_time: 67.71s
+  prefill_time: 66.07s
 
 --- generation ---
  Ent
-  [  1/32] Δ_last=  1690ms  running= 0.59 tok/s
+  [  1/32] Δ_last=   720ms  running= 1.39 tok/s
 ropy is a measure of the disorder
-  [  8/32] Δ_last=  1712ms  running= 0.58 tok/s
+  [  8/32] Δ_last=   714ms  running= 1.40 tok/s
  or randomness in a system. It can
-  [ 16/32] Δ_last=  1718ms  running= 0.58 tok/s
+  [ 16/32] Δ_last=   712ms  running= 1.40 tok/s
  also be thought of as the amount of
-  [ 24/32] Δ_last=  1701ms  running= 0.58 tok/s
+  [ 24/32] Δ_last=   717ms  running= 1.40 tok/s
  energy in a system that is unavailable for
-  [ 32/32] Δ_last=  1715ms  running= 0.58 tok/s
+  [ 32/32] Δ_last=   715ms  running= 1.40 tok/s
 
 --- summary ---
   new_tokens:              32
-  total_decode_time:       54.75s
-  avg_tok_per_s:           0.61
-  first_token_latency:     1690ms
-  steady_state_ms_per_tok: 1712ms
-  steady_state_tok_per_s:  0.61
-  peak_vram_during_decode: 6.83 GB
+  total_decode_time:       22.86s
+  avg_tok_per_s:           1.40
+  first_token_latency:     720ms
+  steady_state_ms_per_tok: 715ms
+  steady_state_tok_per_s:  1.40
+  peak_vram_during_decode: 9.58 GB
 ```
 
-The 32B model is **~2.4× larger than the GPU** and runs end-to-end without OOM. Output is fully coherent.
+The 32B model is **~1.6× larger than the GPU** and runs end-to-end without OOM. Output is fully coherent. Layer streaming also runs on smaller GPUs — drop `--keep-first-k` / `--keep-last-k` (e.g. `4 4` on an 8 GB card); steady-state tok/s scales down accordingly as more layers stream per token.
 
 **Honest throughput by hardware tier** (Qwen2.5-32B-Instruct-AWQ, 22/64 layers resident):
 
@@ -424,8 +424,8 @@ model = StreamingCausalLM.from_pretrained(
     "Qwen/Qwen2.5-32B-Instruct-AWQ",
     streaming_config=StreamingConfig(
         residency_mode="partial_resident",
-        keep_first_k=4,
-        keep_last_k=4,
+        keep_first_k=9,
+        keep_last_k=9,
     ),
     dtype=torch.float16,
 )
@@ -440,7 +440,7 @@ from kvboost.streaming import StreamingConfig
 
 engine = KVBoost.from_pretrained(
     "Qwen/Qwen2.5-32B-Instruct-AWQ",
-    streaming_config=StreamingConfig(keep_first_k=4, keep_last_k=4),
+    streaming_config=StreamingConfig(keep_first_k=9, keep_last_k=9),
     max_cache_bytes=1 * 1024**3,
 )
 result = engine.generate("...", max_new_tokens=64)
@@ -461,8 +461,8 @@ result = engine.generate("...", max_new_tokens=64)
 ```python
 StreamingConfig(
     residency_mode="partial_resident",   # full_resident | partial_resident | ffn_only_stream | full_stream
-    keep_first_k=4,                      # decoder layers that stay in VRAM (head of network)
-    keep_last_k=4,                       # decoder layers that stay in VRAM (tail)
+    keep_first_k=9,                      # decoder layers that stay in VRAM (head of network)
+    keep_last_k=9,                       # decoder layers that stay in VRAM (tail)
     n_staging_slots=2,                   # 2 = full pipelining; 1 = serial fallback
     quant_kernel="auto",                 # auto | marlin | exllama_v2 | torch
 )
@@ -470,7 +470,7 @@ StreamingConfig(
 
 | Knob | Effect |
 |---|---|
-| `keep_first_k` / `keep_last_k` | More resident = faster, more VRAM. With 32B on 8 GB the sweet spot is ~4 each; on a 4 GB GPU drop to 2 each |
+| `keep_first_k` / `keep_last_k` | More resident = faster, more VRAM. With 32B on 12 GB the sweet spot is ~9 each (~1.4 tok/s steady state); on 8 GB drop to ~4 each; on 4 GB to 2 each |
 | `residency_mode="ffn_only_stream"` | Attention weights resident, FFN weights streamed (FFN domi`nates layer bytes 2:1)  less peak VRAM at the same throughput |
 | `quant_kernel="auto"` | Probes for Marlin / ExLlamaV2 at import time, falls back to a pure-torch chunked dequant if neither is available |
 
@@ -491,7 +491,7 @@ pip install "kvboost[server,streaming]"
 python -m kvboost.server \
     --model Qwen/Qwen2.5-32B-Instruct-AWQ \
     --awq-streaming \
-    --keep-first-k 4 --keep-last-k 4 \
+    --keep-first-k 9 --keep-last-k 9 \
     --streaming-mode partial_resident \
     --max-cache-bytes 1e9 \
     --port 8000

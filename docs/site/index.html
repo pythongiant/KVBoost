@@ -44,7 +44,7 @@
             <p class="lede">
                 <strong>KVBoost</strong> is a chunk-level KV-cache reuse engine for HuggingFace causal LMs.
                 It hashes prompt chunks so repeated prefixes skip prefill, and now ships a streaming AWQ
-                runtime that fits 32B-class models onto 8&nbsp;GB GPUs.
+                runtime that fits 32B-class models onto 12&nbsp;GB (and smaller) GPUs.
             </p>
 
             <div class="install">
@@ -84,9 +84,9 @@
                         regardless of layer size.
                     </p>
                     <ul class="checklist">
-                        <li>Qwen2.5-32B-AWQ end-to-end on an 8&nbsp;GB GPU</li>
-                        <li>~5.65 GB peak VRAM after load, ~6.13 GB during decode</li>
-                        <li>Honest tradeoff: PCIe-bound, ~0.1–3 tok/s — built for VRAM savings, not throughput</li>
+                        <li>Qwen2.5-32B-AWQ end-to-end on a 12&nbsp;GB GPU (RTX 3060)</li>
+                        <li>~8.76 GB peak VRAM after load, ~9.58 GB during decode</li>
+                        <li>~1.4 tok/s steady state at <code>keep_first_k = keep_last_k = 9</code> — PCIe-bound, built for VRAM savings</li>
                     </ul>
                     <a href="#explore?group=streaming" class="cta" data-jump-group="streaming">
                         Explore the streaming code →
@@ -97,36 +97,36 @@
                         <span class="dot red"></span>
                         <span class="dot yellow"></span>
                         <span class="dot green"></span>
-                        <span class="terminal-title">demo_partial_8b.py — Qwen2.5-32B on 8GB</span>
+                        <span class="terminal-title">demo_partial_8b.py — Qwen2.5-32B on 12GB</span>
                     </div>
                     <pre><code class="language-bash">$ python -m kvboost.streaming.demo_partial_8b \
     --model Qwen/Qwen2.5-32B-Instruct-AWQ \
-    --keep-first-k 4 --keep-last-k 4 \
+    --keep-first-k 9 --keep-last-k 9 \
     --max-new-tokens 32
 
 INFO: Replaced projections:
-  56 resident across 8 layers,
-  392 streamed across 56 layers
-  load_time: 10.7s
-  peak_vram_after_load: 5.65 GB
-  prefill_time: 67.71s
+  126 resident across 18 layers,
+  322 streamed across 46 layers
+  load_time: 11.4s
+  peak_vram_after_load: 8.76 GB
+  prefill_time: 66.07s
 
 --- generation ---
  Ent
-  [  1/32] Δ_last= 12059ms  running= 0.08 tok/s
+  [  1/32] Δ_last=   720ms  running= 1.39 tok/s
 ropy is a measure of the disorder
-  [  8/32] Δ_last= 10551ms  running= 0.11 tok/s
+  [  8/32] Δ_last=   714ms  running= 1.40 tok/s
  or randomness in a system. It can
-  [ 16/32] Δ_last=  9729ms  running= 0.11 tok/s
+  [ 16/32] Δ_last=   712ms  running= 1.40 tok/s
  also be thought of as the amount of
-  [ 24/32] Δ_last=  7595ms  running= 0.11 tok/s
+  [ 24/32] Δ_last=   717ms  running= 1.40 tok/s
  energy in a system that is unavailable for
-  [ 32/32] Δ_last=  7758ms  running= 0.11 tok/s
+  [ 32/32] Δ_last=   715ms  running= 1.40 tok/s
 
 --- summary ---
   new_tokens:              32
-  avg_tok_per_s:           0.11
-  peak_vram_during_decode: 6.13 GB</code></pre>
+  avg_tok_per_s:           1.40
+  peak_vram_during_decode: 9.58 GB</code></pre>
                 </div>
             </div>
         </section>
@@ -222,7 +222,7 @@ from kvboost.streaming import StreamingConfig
 # Adds the streaming runtime — same engine API.
 engine = KVBoost.from_pretrained(
     "Qwen/Qwen2.5-32B-Instruct-AWQ",
-    streaming_config=StreamingConfig(keep_first_k=4, keep_last_k=4),
+    streaming_config=StreamingConfig(keep_first_k=9, keep_last_k=9),
     max_cache_bytes=1 * 1024**3,
 )
 print(engine.generate("Explain entropy.", max_new_tokens=64).output_text)</code></pre>
