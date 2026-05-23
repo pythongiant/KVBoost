@@ -155,7 +155,20 @@ class ForwardTimer:
         end-to-end wall numbers; only per-call mean/median exclude warm-up.
         """
         if not self.records:
-            return {"name": self.name, "n_forwards": 0}
+            return {
+                "name": self.name,
+                "device": str(self.device),
+                "n_forwards": 0,
+                "wall_ms_total": 0.0,
+                "gpu_ms_total": 0.0,
+                "overhead_ms_total": 0.0,
+                "wall_ms_mean": 0.0,
+                "wall_ms_median": 0.0,
+                "wall_ms_p95": 0.0,
+                "gpu_ms_mean": 0.0,
+                "gpu_ms_median": 0.0,
+                "gpu_ms_p95": 0.0,
+            }
 
         wall = [r.wall_ms for r in self.records]
         gpu = [r.gpu_ms or 0.0 for r in self.records]
@@ -315,11 +328,16 @@ def measure_speculative(
 
     prompt_tokens = len(engine.tokenizer.encode(prompt))
 
+    # Must use CHUNK_KV_REUSE (or PREFIX_CACHE) — the speculative handoff lives
+    # in engine._decode_with_kv, which BASELINE bypasses. With CHUNK_KV_REUSE
+    # on a fresh cold prompt there's no actual reuse, just the chunk-walk
+    # bookkeeping (a few ms), so the measurement is still dominated by the
+    # spec loop itself.
     with timer_target, timer_draft, time_generation(timers, device) as wall:
         result = engine.generate(
             prompt,
             max_new_tokens=max_new_tokens,
-            mode=GenerationMode.BASELINE,  # decode path; spec engine handles loop
+            mode=GenerationMode.CHUNK_KV_REUSE,
             do_sample=False,
         )
 
@@ -330,6 +348,13 @@ def measure_speculative(
     n_gen = max(result.generated_tokens, 1)
 
     spec_stats = engine.speculative_stats() if engine._speculative_stats else None
+    if spec_stats and spec_stats.get("rounds", 0) == 0:
+        raise RuntimeError(
+            f"Speculative decoding produced 0 rounds for {label}. The spec engine "
+            "did not run — check that engine.speculative_engine is not None and "
+            "that the generation mode reaches engine._decode_with_kv (BASELINE "
+            "skips it)."
+        )
 
     return RunResult(
         label=label,
@@ -438,11 +463,21 @@ def build_speculative_engine(
         draft_k=draft_k,
         mode="greedy",
     )
-    return KVBoost.from_pretrained(
-        model_name=target_id,
-        max_cache_bytes=max_cache_bytes,
-        speculative_config=spec_cfg,
-    )
+    try:
+        return KVBoost.from_pretrained(
+            model_name=target_id,
+            max_cache_bytes=max_cache_bytes,
+            speculative_config=spec_cfg,
+        )
+    except FileNotFoundError as e:
+        if "AWQ quantization config" in str(e):
+            raise SystemExit(
+                f"Draft model {draft_id!r} is not an AWQ checkpoint. "
+                "kvboost's DraftModel always loads via StreamingCausalLM, which "
+                "requires AWQ. Pass --draft-model with an AWQ variant, e.g. "
+                "Qwen/Qwen2.5-1.5B-Instruct-AWQ or Qwen/Qwen2.5-0.5B-Instruct-AWQ."
+            ) from e
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -540,9 +575,13 @@ def print_comparison(results: List[RunResult]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--target-model", default="Qwen/Qwen2.5-3B",
-                        help="HF model id for normal generation and the speculative target.")
-    parser.add_argument("--draft-model", default="Qwen/Qwen2.5-0.5B",
-                        help="HF model id for the speculative draft model.")
+                        help="HF model id for normal generation and the speculative target. "
+                             "Any fp16/bf16 HF causal LM works (loaded via AutoModelForCausalLM).")
+    parser.add_argument("--draft-model", default="Qwen/Qwen2.5-1.5B-Instruct-AWQ",
+                        help="HF model id for the speculative draft model. MUST be an AWQ "
+                             "checkpoint — kvboost's DraftModel always routes through "
+                             "StreamingCausalLM (see src/kvboost/speculative/draft.py:77). "
+                             "Tokenizer family must match the target (vocab parity is asserted).")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--draft-k", type=int, default=5,
                         help="Number of speculative draft tokens per round.")
