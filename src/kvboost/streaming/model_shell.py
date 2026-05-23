@@ -318,6 +318,19 @@ class StreamingCausalLM(nn.Module):
         #    for things we didn't enumerate).
         _materialize_meta_buffers(hf_model, device=loader.device_spec.device, dtype=dtype)
 
+        # 4b. Unify resident dtypes. Some checkpoints (e.g. DeepSeek-R1-Distill)
+        #     ship lm_head / final norm in bf16 while the AWQ-quantized body
+        #     dequantizes to fp16. The mismatch reaches Qwen2RMSNorm, which
+        #     computes in fp32 and then does `self.weight * x.to(input_dtype)`;
+        #     bf16 weight × fp16 hidden states broadcasts to fp32, and the
+        #     subsequent `lm_head` matmul errors out with "float != BFloat16".
+        #     `.to(dtype)` only touches floating/complex tensors, leaving
+        #     long/bool buffers (position ids, masks) intact; AWQ packed
+        #     tensors live as plain attributes on StreamingQLinear (see
+        #     qkv_proj.StreamingQLinear) and are not parameters/buffers, so
+        #     they're also skipped.
+        hf_model.to(dtype)
+
         # 5. One-shot bind for the resident-layer StreamingQLinears: load
         #    their packed AWQ tensors from disk and call .rebind() once.
         if resident_qlinears:
