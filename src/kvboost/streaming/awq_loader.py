@@ -316,7 +316,7 @@ class AWQLoader:
 
         return self.index
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def materialize_resident_tensors(self) -> None:
         """
         Load resident tensors directly onto device.
@@ -360,7 +360,7 @@ class AWQLoader:
 
         self._alias_tied_embeddings()
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def pin_layer(
         self,
         layer_idx: int,
@@ -541,7 +541,7 @@ class AWQLoader:
                 streamed.append(layer_idx)
         return streamed
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def materialize_into_module(
         self,
         hf_model: "torch.nn.Module",
@@ -608,7 +608,7 @@ class AWQLoader:
             except AttributeError:
                 pass
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def bind_streaming_qlinears(
         self,
         layer_replacements: dict[int, dict[str, Any]],
@@ -851,7 +851,7 @@ class AWQLoader:
     # Shard loading
     # =========================================================================
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def _load_shard_resident(
         self,
         shard_path: Path,
@@ -879,7 +879,7 @@ class AWQLoader:
 
         return out
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def _load_shard_pinned(
         self,
         shard_path: Path,
