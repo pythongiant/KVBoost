@@ -114,7 +114,7 @@ class DraftModel:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def prime(self, input_ids: torch.Tensor) -> None:
         """Prefill on the full prompt; populate ``_past_kv``.
 
@@ -136,7 +136,7 @@ class DraftModel:
         self._past_kv = out.past_key_values
         self._primed_length = int(input_ids.size(1))
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def draft(
         self,
         last_token: int,

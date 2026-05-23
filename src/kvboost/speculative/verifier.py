@@ -48,7 +48,7 @@ class TargetVerifier:
             except StopIteration:
                 self.device = torch.device("cpu")
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def verify(
         self,
         last_committed_token: int,

@@ -100,7 +100,7 @@ class SpeculativeEngine:
 
     # ── Public entry point ───────────────────────────────────────────────────
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def decode_from(
         self,
         prompt_ids: List[int],
