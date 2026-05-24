@@ -37,6 +37,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 
 from ..engine import InferenceEngine, GenerationResult
 from ..batch import group_by_prefix
+from ..oom_recovery import OOMRecovery
 from .batch_queue import Batch, BatchQueue, QueuedRequest
 from .schema import PendingRequest
 
@@ -70,6 +71,7 @@ class EngineWorker:
         max_queue_size: int = 256,
         release_cache_after_request: bool = False,
         rewarm_text: Optional[str] = None,
+        oom_recovery: Optional[OOMRecovery] = None,
     ) -> None:
         self.engine = engine
         self.loop = loop  # may be overridden in start() with the running loop
@@ -79,6 +81,7 @@ class EngineWorker:
         )
         self._release_cache = release_cache_after_request
         self._rewarm_text = rewarm_text
+        self.oom_recovery = oom_recovery
 
         self.queue = BatchQueue(
             tokenize_fn=self._tokenize,
@@ -153,20 +156,37 @@ class EngineWorker:
         """
         token_q: asyncio.Queue = asyncio.Queue()
         loop = self.loop
+        # Threading note: _on_token runs on the worker thread; emitted_count
+        # is read by OOMRecovery's can_retry() in the SAME thread (also worker),
+        # so no lock needed. The asyncio queue handoff is thread-safe.
+        emitted_count = [0]
 
         def _on_token(tok: int) -> None:
-            # Called from the worker thread — hand off to the loop.
+            emitted_count[0] += 1
             loop.call_soon_threadsafe(token_q.put_nowait, ("token", tok))
+
+        def _do_generate():
+            # Reset the per-call counter so retries on a fresh attempt start at 0.
+            # The recovery class only retries if can_retry() is True (i.e.,
+            # no tokens have been emitted on this attempt).
+            emitted_count[0] = 0
+            return self.engine.generate(
+                prompt=prompt,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                do_sample=do_sample,
+                on_token=_on_token,
+            )
 
         def _run() -> None:
             try:
-                result = self.engine.generate(
-                    prompt=prompt,
-                    max_new_tokens=max_tokens,
-                    temperature=temperature,
-                    do_sample=do_sample,
-                    on_token=_on_token,
-                )
+                if self.oom_recovery is not None:
+                    result = self.oom_recovery.attempt(
+                        _do_generate,
+                        can_retry=lambda: emitted_count[0] == 0,
+                    )
+                else:
+                    result = _do_generate()
                 loop.call_soon_threadsafe(token_q.put_nowait, ("done", result))
             except Exception as exc:
                 log.exception("Streaming generation failed for %s", request_id)
@@ -249,37 +269,46 @@ class EngineWorker:
                 self._reject(req.future, exc)
 
     def _run_batch(self, batch: Batch) -> List[GenerationResult]:
-        """Runs in the worker thread (blocking)."""
+        """Runs in the worker thread (blocking).
+
+        Non-streaming, so OOM is fully retriable — callers haven't seen any
+        bytes from this request yet.
+        """
         t0 = time.perf_counter()
         reqs = batch.requests
 
-        try:
-            if len(reqs) == 1:
-                r = reqs[0]
-                result = self.engine.generate(
-                    prompt=r.prompt,
-                    max_new_tokens=r.max_tokens,
-                    temperature=r.temperature,
-                    do_sample=r.do_sample,
-                )
-                log.debug(
-                    "Singleton generate: req=%s ttft=%.0fms",
-                    r.request_id, result.ttft_ms,
-                )
-                return [result]
+        def _singleton():
+            r = reqs[0]
+            result = self.engine.generate(
+                prompt=r.prompt,
+                max_new_tokens=r.max_tokens,
+                temperature=r.temperature,
+                do_sample=r.do_sample,
+            )
+            log.debug(
+                "Singleton generate: req=%s ttft=%.0fms",
+                r.request_id, result.ttft_ms,
+            )
+            return [result]
 
-            # Batched path — prompts share a prefix (grouped by BatchQueue)
+        def _batched():
             prompts = [r.prompt for r in reqs]
             max_tokens = max(r.max_tokens for r in reqs)
-            temperature = reqs[0].temperature   # use first req's params for batch
+            temperature = reqs[0].temperature
             do_sample = reqs[0].do_sample
-
-            results = self.engine.generate_batch(
+            return self.engine.generate_batch(
                 prompts=prompts,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
                 do_sample=do_sample,
             )
+
+        try:
+            target = _singleton if len(reqs) == 1 else _batched
+            if self.oom_recovery is not None:
+                results = self.oom_recovery.attempt(target)
+            else:
+                results = target()
         finally:
             self._release_gpu_memory()
 
@@ -312,4 +341,6 @@ class EngineWorker:
         spec_stats = self.engine.speculative_stats()
         if spec_stats:
             out["speculative"] = spec_stats
+        if self.oom_recovery is not None:
+            out["oom_recovery"] = self.oom_recovery.snapshot()
         return out

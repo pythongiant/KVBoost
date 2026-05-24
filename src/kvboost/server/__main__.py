@@ -174,6 +174,21 @@ def parse_args():
                         "allocator cache from request N can prevent prefill "
                         "from fitting in request N+1. Costs ~5-20 ms per request.")
 
+    # OOM recovery — catch CUDA OOM mid-request, lower the right knob, retry.
+    # Default on: the server should survive single-request OOMs by trimming
+    # the KV-cache budget (if cache is "high") or shrinking AWQ-streaming
+    # residency (if cache is "low"). See kvboost.oom_recovery for the policy.
+    p.add_argument("--oom-recovery", action="store_true", default=True,
+                   help="Catch CUDA OOM mid-request, lower KV cache or streaming "
+                        "residency, retry (default: on). Use --no-oom-recovery to disable.")
+    p.add_argument("--no-oom-recovery", action="store_false", dest="oom_recovery",
+                   help="Disable OOM recovery (originally-emitted CUDA OOM errors "
+                        "will propagate to the client unchanged).")
+    p.add_argument("--oom-max-retries", type=int, default=2,
+                   help="Max OOM recovery attempts per request before giving up "
+                        "(default: 2). Mid-stream requests never retry; the knob "
+                        "still gets adjusted so the NEXT request benefits.")
+
     # Tool / function calling
     p.add_argument("--enable-auto-tool-choice", action="store_true",
                    help="Enable OpenAI-compatible tool/function calling. When set, "
@@ -425,6 +440,22 @@ def main():
     warm_text = args.always_warm or args.warm
     rewarm_text = args.always_warm
 
+    oom_recovery = None
+    if args.oom_recovery:
+        from ..oom_recovery import OOMRecovery
+        oom_recovery = OOMRecovery(
+            engine,
+            initial_max_cache_bytes=int(args.max_cache_bytes),
+            initial_keep_first_k=args.keep_first_k if args.awq_streaming else None,
+            initial_keep_last_k=args.keep_last_k if args.awq_streaming else None,
+            streaming_enabled=args.awq_streaming,
+            max_retries=args.oom_max_retries,
+        )
+        log.info(
+            "OOM recovery enabled: max_retries=%d, streaming=%s",
+            args.oom_max_retries, args.awq_streaming,
+        )
+
     worker = EngineWorker(
         engine=engine,
         max_workers=args.workers,
@@ -433,6 +464,7 @@ def main():
         max_queue_size=args.max_queue_size,
         release_cache_after_request=args.release_cache_after_request,
         rewarm_text=rewarm_text,
+        oom_recovery=oom_recovery,
     )
 
     app = build_app(
