@@ -108,7 +108,8 @@ class OOMRecovery:
 
     # ── Knob adjusters (return whatever we managed to change) ──
     def _lower_cache(self) -> Dict[str, Any] | None:
-        new_bytes = int(self.max_cache_bytes * self.CACHE_SHRINK)
+        old_bytes = self.max_cache_bytes
+        new_bytes = int(old_bytes * self.CACHE_SHRINK)
         if new_bytes < self.MIN_CACHE_BYTES:
             return None
         cm = self.engine.cache_manager
@@ -124,14 +125,19 @@ class OOMRecovery:
             cm.clear()
         except Exception:
             pass
-        return {"action": "lower_cache", "new_max_cache_bytes": new_bytes}
+        return {
+            "action": "lower_cache",
+            "old_max_cache_bytes": old_bytes,
+            "new_max_cache_bytes": new_bytes,
+        }
 
     def _lower_streaming(self) -> Dict[str, Any] | None:
         if not self.streaming_enabled or self.keep_first_k is None:
             return None
-        new_first = max(self.MIN_KEEP, int(self.keep_first_k * self.STREAM_SHRINK))
-        new_last = max(self.MIN_KEEP, int((self.keep_last_k or 0) * self.STREAM_SHRINK))
-        if new_first == self.keep_first_k and new_last == self.keep_last_k:
+        old_first, old_last = self.keep_first_k, self.keep_last_k
+        new_first = max(self.MIN_KEEP, int(old_first * self.STREAM_SHRINK))
+        new_last = max(self.MIN_KEEP, int((old_last or 0) * self.STREAM_SHRINK))
+        if new_first == old_first and new_last == old_last:
             return None
 
         # Push into whatever exposes the streaming config. Hierarchy varies
@@ -166,7 +172,13 @@ class OOMRecovery:
 
         self.keep_first_k = new_first
         self.keep_last_k = new_last
-        return {"action": "lower_streaming", "keep_first_k": new_first, "keep_last_k": new_last}
+        return {
+            "action": "lower_streaming",
+            "old_keep_first_k": old_first,
+            "old_keep_last_k": old_last,
+            "keep_first_k": new_first,
+            "keep_last_k": new_last,
+        }
 
     # ── Driver ──
     def attempt(self, run_turn_fn, prompt: str) -> dict:
@@ -191,10 +203,21 @@ class OOMRecovery:
 
             cache_high = self._cache_high()
             cache_used = self._cache_bytes_used()
+            cache_frac = cache_used / max(self.max_cache_bytes, 1)
+            reason = (
+                f"cache HIGH ({cache_used / 1e9:.2f}/{self.max_cache_bytes / 1e9:.2f} GB, "
+                f"{cache_frac:.0%} of budget ≥ {self.HIGH_FRAC:.0%} → cache is the suspect)"
+                if cache_high else
+                f"cache LOW  ({cache_used / 1e9:.2f}/{self.max_cache_bytes / 1e9:.2f} GB, "
+                f"{cache_frac:.0%} of budget < {self.HIGH_FRAC:.0%} → resident layers are the suspect)"
+            )
+            last_action_str = (
+                f"previous action was '{self._last_action}'"
+                if self._last_action else "first OOM this turn"
+            )
             log.warning(
-                "CUDA OOM on attempt %d (cache_used=%.2f GB / budget=%.2f GB, "
-                "high=%s) — adjusting knobs.",
-                attempt_idx, cache_used / 1e9, self.max_cache_bytes / 1e9, cache_high,
+                "OOM #%d on attempt %d: %s — %s.",
+                len(self.events) + 1, attempt_idx, reason, last_action_str,
             )
 
             # Free everything we can before trying again.
@@ -210,30 +233,67 @@ class OOMRecovery:
 
             # Pick the knob. If the preferred knob was already adjusted last
             # round (and didn't help), flip to the other knob.
+            primary_name, secondary_name = (
+                ("lower_cache", "lower_streaming") if cache_high
+                else ("lower_streaming", "lower_cache")
+            )
             primary, secondary = (
                 (self._lower_cache, self._lower_streaming)
                 if cache_high
                 else (self._lower_streaming, self._lower_cache)
             )
             change = primary()
-            if change is None or change.get("action") == self._last_action:
+            flipped_reason: str | None = None
+            if change is None:
+                flipped_reason = f"{primary_name} unavailable (floor reached or disabled)"
+            elif change.get("action") == self._last_action:
+                flipped_reason = f"{primary_name} was already tried last attempt without recovering"
+            if flipped_reason is not None:
+                log.warning(
+                    "OOM recovery: skipping primary knob '%s' — %s; trying secondary '%s'.",
+                    primary_name, flipped_reason, secondary_name,
+                )
                 alt = secondary()
                 if alt is not None:
                     change = alt
+
             if change is None:
                 log.error(
-                    "OOM recovery exhausted: cache=%.2f GB (floor=%.2f GB), "
-                    "keep=%s/%s (floor=%d). Giving up on this turn.",
+                    "OOM recovery EXHAUSTED at attempt %d: "
+                    "cache=%.2f GB (floor=%.2f GB), keep=%s/%s (floor=%d). "
+                    "Re-raising — replay loop will record this turn as errored.",
+                    attempt_idx,
                     self.max_cache_bytes / 1e9, self.MIN_CACHE_BYTES / 1e9,
                     self.keep_first_k, self.keep_last_k, self.MIN_KEEP,
                 )
                 break
+
+            # Annotate + log the recovery action.
             change["attempt"] = attempt_idx
+            change["reason"] = "cache_high" if cache_high else "cache_low"
             change["cache_used_gb"] = round(cache_used / 1e9, 3)
             change["cache_budget_gb"] = round(self.max_cache_bytes / 1e9, 3)
+            change["flipped_to_secondary"] = flipped_reason is not None
             self.events.append(change)
             oom_events.append(change)
             self._last_action = change["action"]
+
+            if change["action"] == "lower_cache":
+                log.warning(
+                    "OOM recovery → lower_cache: max_cache_bytes %.2f GB → %.2f GB "
+                    "(×%.2f, reason=%s, attempt=%d). Will retry turn.",
+                    change["old_max_cache_bytes"] / 1e9,
+                    change["new_max_cache_bytes"] / 1e9,
+                    self.CACHE_SHRINK, change["reason"], attempt_idx,
+                )
+            else:
+                log.warning(
+                    "OOM recovery → lower_streaming: keep_first_k %d→%d, "
+                    "keep_last_k %d→%d (×%.2f, reason=%s, attempt=%d). Will retry turn.",
+                    change["old_keep_first_k"], change["keep_first_k"],
+                    change["old_keep_last_k"] or 0, change["keep_last_k"],
+                    self.STREAM_SHRINK, change["reason"], attempt_idx,
+                )
 
         # All retries failed: re-raise so the replay loop records an error.
         assert last_err is not None
