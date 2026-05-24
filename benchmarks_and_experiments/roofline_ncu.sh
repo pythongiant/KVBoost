@@ -55,13 +55,16 @@ KEEP_LAST_K="${KEEP_LAST_K:-1800}"
 N_STAGING_SLOTS="${N_STAGING_SLOTS:-4}"
 GAMMA="${GAMMA:-5}"
 SPEC_MODE="${SPEC_MODE:-greedy}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-6}"
+# Max-new-tokens 6 generates so few decode kernels that the
+# launch-skip / launch-count window can land on nothing (-> "No kernels were
+# profiled"). 24 gives a comfortable steady-state decode window for AWQ+spec.
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-24}"
 PROMPT="${PROMPT:-Explain entropy in two sentences.}"
 
-# Kernel-window controls. Prefill on a 32B model launches a few hundred
-# kernels; skip past them so the captured window is pure decode.
-LAUNCH_SKIP="${LAUNCH_SKIP:-400}"
-LAUNCH_COUNT="${LAUNCH_COUNT:-150}"
+# Kernel-window controls. Prefill on a 7B model launches ~80-120 kernels.
+# Skip a small constant so we land in steady-state decode without missing it.
+LAUNCH_SKIP="${LAUNCH_SKIP:-120}"
+LAUNCH_COUNT="${LAUNCH_COUNT:-200}"
 
 # Restrict capture to kernels that actually move FLOPs around. Without this
 # you'll spend hours replaying tokenizer/sampler/elementwise kernels that
