@@ -43,11 +43,15 @@ set -euo pipefail
 TAG="${TAG:-spec_default}"
 OUT_DIR="${OUT_DIR:-$(cd "$(dirname "$0")" && pwd)/results/roofline}"
 
-MODEL="${MODEL:-Qwen/Qwen2.5-32B-Instruct-AWQ}"
+# Defaults tuned for a 12 GB GPU (RTX 3060 / similar). Override MODEL+keep_k
+# from the env for bigger cards. KEEP_FIRST/LAST_K=1800 forces every Qwen2.5-7B
+# layer (28 total) resident; in `partial_resident` mode the streaming hooks
+# still fire (overhead!), in `full_resident` they're bypassed entirely.
+MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct-AWQ}"
 DRAFT_MODEL="${DRAFT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct-AWQ}"
 MODE="${MODE:-partial_resident}"
-KEEP_FIRST_K="${KEEP_FIRST_K:-9}"
-KEEP_LAST_K="${KEEP_LAST_K:-9}"
+KEEP_FIRST_K="${KEEP_FIRST_K:-1800}"
+KEEP_LAST_K="${KEEP_LAST_K:-1800}"
 N_STAGING_SLOTS="${N_STAGING_SLOTS:-4}"
 GAMMA="${GAMMA:-5}"
 SPEC_MODE="${SPEC_MODE:-greedy}"
@@ -64,9 +68,11 @@ LAUNCH_COUNT="${LAUNCH_COUNT:-150}"
 # don't matter for the roofline.
 KERNEL_REGEX="${KERNEL_REGEX:-regex:gemm|matmul|attention|wmma|mma|flash|attn|awq|dequant}"
 
-# ncu section set. `full` = everything (slow, comprehensive). `roofline` =
-# just the SpeedOfLight + roofline charts (faster).
-NCU_SET="${NCU_SET:-roofline}"
+# ncu section set. Valid choices vary by version:
+#   ncu 2023.x: basic | default | detailed | full | source | roofline
+#   ncu 2024.x: basic | default | detailed | full | source   (no `roofline`)
+# `full` always works and includes the SpeedOfLight + roofline chart sections.
+NCU_SET="${NCU_SET:-full}"
 
 # ----------------------------------------------------------------------------
 
@@ -84,11 +90,19 @@ echo "[roofline] tag=${TAG} mode=${MODE} gamma=${GAMMA} tokens=${MAX_NEW_TOKENS}
 echo "[roofline] writing -> ${REP}"
 
 # Profile run ----------------------------------------------------------------
-# --target-processes all  : Hugging Face spawns workers; catch them too.
-# --replay-mode kernel    : default; replays each kernel to gather all counters.
-# --cache-control all     : flush caches between replays so counters are stable.
-# --clock-control base    : lock clocks to base for reproducible FLOPs/s.
-# --import-source on      : embed Python source refs (helpful in ncu-ui).
+# --target-processes all      : Hugging Face spawns workers; catch them too.
+# --replay-mode kernel        : default; replays each kernel for all counters.
+# --cache-control all         : flush caches between replays for stable counters.
+# --clock-control base        : lock clocks to base for reproducible FLOPs/s.
+# --import-source on          : embed Python source refs (helpful in ncu-ui).
+# --launch-skip / -count       : -count was renamed --launch-count-per-target
+#                                in newer ncu; the unambiguous spellings below
+#                                work on both.
+#
+# NOTE: do NOT include a bare `--` separator before the python command.
+# Older ncu treated `--` as end-of-options; ncu >= 2024.x parses it as an
+# empty long-option name and errors with "option is ambiguous". Just put
+# the application command directly after the ncu flags.
 ncu \
   --set "${NCU_SET}" \
   --target-processes all \
@@ -101,7 +115,6 @@ ncu \
   --launch-count "${LAUNCH_COUNT}" \
   --export "${REP}" \
   --force-overwrite \
-  -- \
   python -m kvboost.streaming.demo_speculative \
     --model "${MODEL}" \
     --draft-model "${DRAFT_MODEL}" \
