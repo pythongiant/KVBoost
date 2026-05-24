@@ -344,6 +344,16 @@ def load_sharegpt(
     max_context_tokens: Optional[int] = None,
     seed: int = 42,
 ) -> List[dict]:
+    """Random-walk + per-conversation filter; stop once ``n_conversations`` accepted.
+
+    Old behavior filtered the entire corpus first (770K+ tokenize calls for the
+    full 94K Vicuna dump) and then sampled. Since accept-rates are ~50% on
+    typical filter settings, we only need to scan ~2× n_conversations on
+    average. We shuffle indices with ``seed`` for reproducibility, then walk
+    one row at a time, tokenizing all turns of a candidate in a single batched
+    tokenizer call — so for n_conversations=500 we hit ~1000 conversations and
+    ~5000 tokenize calls instead of hundreds of thousands.
+    """
     from datasets import load_dataset
 
     log.info("Loading anon8231489123/ShareGPT_Vicuna_unfiltered ...")
@@ -352,21 +362,48 @@ def load_sharegpt(
         data_files="ShareGPT_V3_unfiltered_cleaned_split.json",
         split="train",
     )
-    log.info(f"  Raw conversations: {len(ds)}")
+    n_raw = len(ds)
+    log.info(f"  Raw conversations: {n_raw}")
 
     rng = np.random.RandomState(seed)
+    order = rng.permutation(n_raw)
 
-    # ── Pass 1: structural filter (no tokenization). Cheap. ─────────────
-    log.info("  Pass 1/3: structural filter (min/max turns) ...")
-    structurally_ok: List[dict] = []
-    for raw in _maybe_tqdm(ds, desc="filter:turns", total=len(ds)):
+    log.info(
+        "  Walking shuffled corpus, filtering on the fly "
+        "(target=%d  filters: min_turns=%d max_turns=%d max_tokens_per_turn=%d max_context_tokens=%s)",
+        n_conversations, min_turns, max_turns, max_tokens_per_turn,
+        max_context_tokens,
+    )
+
+    conversations: List[dict] = []
+    rej_struct = rej_turn = rej_ctx = 0
+    scanned = 0
+    last_log = time.perf_counter()
+
+    pbar = _maybe_tqdm(
+        range(n_raw),
+        desc="sample+filter",
+        total=n_conversations,
+    )
+    pbar_iter = iter(pbar) if hasattr(pbar, "__iter__") else None
+
+    for idx in order:
+        if len(conversations) >= n_conversations:
+            break
+        scanned += 1
+
+        raw = ds[int(idx)]
         turns = raw.get("conversations", [])
         if not turns:
+            rej_struct += 1
             continue
+
         human_count = sum(1 for t in turns if t.get("from") == "human")
         if human_count < min_turns:
+            rej_struct += 1
             continue
-        capped = []
+
+        capped: List[dict] = []
         n_human = 0
         for t in turns:
             capped.append(t)
@@ -374,65 +411,68 @@ def load_sharegpt(
                 n_human += 1
                 if n_human >= max_turns:
                     break
-        structurally_ok.append({
-            "id": raw.get("id", f"conv_{len(structurally_ok)}"),
+
+        # Single batched tokenize call per candidate conversation.
+        all_texts = [t["value"] for t in capped]
+        try:
+            enc = tokenizer(all_texts, add_special_tokens=True)
+            all_lens = [len(ids) for ids in enc["input_ids"]]
+        except Exception:
+            all_lens = [len(tokenizer.encode(t)) for t in all_texts]
+
+        human_lens = [
+            all_lens[i] for i, t in enumerate(capped) if t.get("from") == "human"
+        ]
+        if any(l > max_tokens_per_turn for l in human_lens):
+            rej_turn += 1
+            continue
+
+        if max_context_tokens is not None and sum(all_lens) > max_context_tokens:
+            rej_ctx += 1
+            continue
+
+        conversations.append({
+            "id": raw.get("id", f"conv_{len(conversations)}"),
             "turns": capped,
         })
-    log.info(f"  Pass 1 → {len(structurally_ok)} conversations survive structure check")
 
-    # ── Pass 2: per-turn token-length filter (BATCHED tokenization). ────
-    log.info("  Pass 2/3: per-turn length filter (max_tokens_per_turn=%d) ...",
-             max_tokens_per_turn)
-    flat_human_texts: List[str] = []
-    spans: List[Tuple[int, int]] = []  # (start, count) of human turns per conv
-    for c in structurally_ok:
-        human = [t["value"] for t in c["turns"] if t.get("from") == "human"]
-        spans.append((len(flat_human_texts), len(human)))
-        flat_human_texts.extend(human)
-    log.info("  Pass 2: tokenizing %d human-turn strings (batched) ...",
-             len(flat_human_texts))
-    human_lengths = _batch_token_lengths(tokenizer, flat_human_texts)
+        if pbar_iter is not None:
+            try:
+                next(pbar_iter)
+            except StopIteration:
+                pbar_iter = None
 
-    conversations: List[dict] = []
-    for c, (start, count) in zip(structurally_ok, spans):
-        if any(human_lengths[start + i] > max_tokens_per_turn for i in range(count)):
-            continue
-        conversations.append(c)
-    log.info(f"  Pass 2 → {len(conversations)} conversations survive per-turn check")
+        now = time.perf_counter()
+        if now - last_log > 5.0:
+            log.info(
+                "    accepted %d/%d  (scanned %d, rejected struct=%d turn=%d ctx=%d)",
+                len(conversations), n_conversations, scanned,
+                rej_struct, rej_turn, rej_ctx,
+            )
+            last_log = now
 
-    # ── Pass 3: total context length filter (also batched). ─────────────
-    if max_context_tokens is not None:
-        log.info("  Pass 3/3: total-context filter (max_context_tokens=%d) ...",
-                 max_context_tokens)
-        flat_all_texts: List[str] = []
-        all_spans: List[Tuple[int, int]] = []
-        for c in conversations:
-            spans_start = len(flat_all_texts)
-            for t in c["turns"]:
-                flat_all_texts.append(t["value"])
-            all_spans.append((spans_start, len(c["turns"])))
-        log.info("  Pass 3: tokenizing %d turn strings (batched) ...",
-                 len(flat_all_texts))
-        all_lengths = _batch_token_lengths(tokenizer, flat_all_texts)
-        before = len(conversations)
-        kept = []
-        for c, (start, count) in zip(conversations, all_spans):
-            total = sum(all_lengths[start + i] for i in range(count))
-            if total <= max_context_tokens:
-                kept.append(c)
-        conversations = kept
-        log.info(f"  Pass 3 → {before} → {len(conversations)} after total-context filter")
-
-    if len(conversations) > n_conversations:
-        idx = rng.choice(len(conversations), n_conversations, replace=False)
-        conversations = [conversations[i] for i in sorted(idx)]
-
-    log.info(f"  Sampled: {len(conversations)} conversations")
-    turn_counts = [sum(1 for t in c["turns"] if t.get("from") == "human") for c in conversations]
     log.info(
-        f"  Turn distribution: min={min(turn_counts)} max={max(turn_counts)} "
-        f"mean={np.mean(turn_counts):.1f} median={np.median(turn_counts):.1f}"
+        "  Sampled: %d/%d conversations  (scanned %d/%d  rejected struct=%d turn=%d ctx=%d)",
+        len(conversations), n_conversations, scanned, n_raw,
+        rej_struct, rej_turn, rej_ctx,
     )
+
+    if len(conversations) < n_conversations:
+        log.warning(
+            "Only %d/%d conversations met all filters; raise max_tokens_per_turn "
+            "or max_context_tokens, or lower n_samples.",
+            len(conversations), n_conversations,
+        )
+
+    if conversations:
+        turn_counts = [
+            sum(1 for t in c["turns"] if t.get("from") == "human")
+            for c in conversations
+        ]
+        log.info(
+            f"  Turn distribution: min={min(turn_counts)} max={max(turn_counts)} "
+            f"mean={np.mean(turn_counts):.1f} median={np.median(turn_counts):.1f}"
+        )
     return conversations
 
 
@@ -440,6 +480,24 @@ def load_sharegpt(
 
 def checkpoint_key(backend: str, model: str, n_conversations: int, max_turns: int) -> str:
     return hashlib.md5(f"{backend}_{model}_{n_conversations}_{max_turns}".encode()).hexdigest()[:8]
+
+
+def is_run_complete(out_path: Path, n_samples: int) -> bool:
+    """True iff the final results JSON at ``out_path`` already covers
+    ``n_samples`` conversations. Used by runners to skip engine load when
+    the previous run already finished."""
+    if not out_path.exists():
+        return False
+    try:
+        with open(out_path) as f:
+            data = json.load(f)
+        if data.get("config", {}).get("n_samples", 0) < n_samples:
+            return False
+        if len(data.get("results", [])) < n_samples:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:

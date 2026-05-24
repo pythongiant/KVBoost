@@ -23,8 +23,8 @@ from pathlib import Path
 import _common as common
 from _common import (
     ConvResult, TurnResult, add_common_args, capture_run_metadata,
-    checkpoint_key, compute_metrics, load_sharegpt, print_summary,
-    replay_conversations, setup_logging,
+    checkpoint_key, compute_metrics, is_run_complete, load_sharegpt,
+    print_summary, replay_conversations, setup_logging,
 )
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -203,6 +203,12 @@ def main():
     print(f"  n_samples={args.n_samples}  turns={args.min_turns}-{args.max_turns}")
     print(f"{'=' * 72}\n")
 
+    out_path = Path(args.output) if args.output else RESULTS_DIR / "kvboost.json"
+    if not args.no_checkpoint and is_run_complete(out_path, args.n_samples):
+        print(f"[skip] {out_path} already covers {args.n_samples} conversations; "
+              "delete it or pass --no-checkpoint to force re-run.")
+        return
+
     engine = build_engine(args)
     conversations = load_sharegpt(
         n_conversations=args.n_samples,
@@ -261,7 +267,6 @@ def main():
     print_summary("kvboost", metrics)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = Path(args.output) if args.output else RESULTS_DIR / "kvboost.json"
     payload = {
         "backend": "kvboost",
         "model": args.model,

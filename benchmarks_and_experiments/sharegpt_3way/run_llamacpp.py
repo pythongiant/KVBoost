@@ -38,7 +38,8 @@ from typing import Optional
 import _common as common
 from _common import (
     add_common_args, capture_run_metadata, checkpoint_key, compute_metrics,
-    load_sharegpt, print_summary, replay_conversations, setup_logging,
+    is_run_complete, load_sharegpt, print_summary, replay_conversations,
+    setup_logging,
 )
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -256,6 +257,12 @@ def main():
     print(f"  n_samples={args.n_samples}  turns={args.min_turns}-{args.max_turns}")
     print(f"{'=' * 72}\n")
 
+    out_path = Path(args.output) if args.output else RESULTS_DIR / "llamacpp.json"
+    if not args.no_checkpoint and is_run_complete(out_path, args.n_samples):
+        print(f"[skip] {out_path} already covers {args.n_samples} conversations; "
+              "delete it or pass --no-checkpoint to force re-run.")
+        return
+
     runner = LlamaCppRunner(args)
     conversations = load_sharegpt(
         n_conversations=args.n_samples,
@@ -308,7 +315,6 @@ def main():
     print_summary("llamacpp", metrics)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = Path(args.output) if args.output else RESULTS_DIR / "llamacpp.json"
     payload = {
         "backend": "llamacpp",
         "model": args.model_path,
