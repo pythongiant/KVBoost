@@ -37,9 +37,11 @@ from typing import Optional
 
 import _common as common
 from _common import (
-    add_common_args, checkpoint_key, compute_metrics, load_sharegpt,
-    print_summary, replay_conversations, setup_logging,
+    add_common_args, capture_run_metadata, checkpoint_key, compute_metrics,
+    load_sharegpt, print_summary, replay_conversations, setup_logging,
 )
+from dataclasses import asdict
+from datetime import datetime, timezone
 
 RESULTS_DIR    = Path(__file__).resolve().parent / "results"
 CHECKPOINT_DIR = Path(__file__).resolve().parent / ".checkpoints"
@@ -126,15 +128,45 @@ class LlamaCppRunner:
             i += 1
         return i
 
+    def _capture_perf(self) -> dict:
+        """Pull llama.cpp's internal perf counters when available. Returns
+        a plain dict so it's JSON-serializable regardless of API shape."""
+        snap: dict = {}
+        # llama-cpp-python ≥ 0.2.50: llm.context_perf() / llm._ctx fields
+        try:
+            ctx = getattr(self.llm, "_ctx", None)
+            if ctx is not None:
+                # Many builds expose llama_perf_context_data via a helper.
+                perf_fn = getattr(ctx, "get_perf", None) or getattr(ctx, "perf", None)
+                if callable(perf_fn):
+                    perf = perf_fn()
+                    for attr in (
+                        "t_start_ms", "t_load_ms", "t_p_eval_ms",
+                        "t_eval_ms", "n_p_eval", "n_eval", "n_sample_ms",
+                    ):
+                        v = getattr(perf, attr, None)
+                        if v is not None:
+                            snap[attr] = v
+        except Exception:
+            pass
+        # llm.n_tokens — current KV occupancy (= retained prefix tokens)
+        try:
+            snap["n_tokens"] = int(getattr(self.llm, "n_tokens", 0))
+        except Exception:
+            pass
+        return snap
+
     def run_turn(self, prompt: str) -> dict:
         new_ids = self._gguf_tokenize(prompt)
         cached_before = self._prefix_match_len(new_ids)
+        perf_before = self._capture_perf()
 
         t0 = time.perf_counter()
         first_token_seen = False
         ttft_ms: Optional[float] = None
         output_text_chunks: list[str] = []
         output_token_count = 0
+        finish_reason: Optional[str] = None
 
         # stream=True yields one delta per token, so we can stamp TTFT cleanly.
         stream = self.llm.create_completion(
@@ -152,15 +184,34 @@ class LlamaCppRunner:
                     first_token_seen = True
                 output_text_chunks.append(piece)
                 output_token_count += 1
-            if choice.get("finish_reason") is not None:
+            fr = choice.get("finish_reason")
+            if fr is not None:
+                finish_reason = fr
                 break
 
         total_ms = (time.perf_counter() - t0) * 1000.0
         if ttft_ms is None:
             ttft_ms = total_ms
 
+        perf_after = self._capture_perf()
         # Remember the served prompt for next-turn prefix accounting.
         self._last_prompt_tokens = new_ids
+
+        stop_reason = None
+        if finish_reason == "stop":
+            stop_reason = "eos"
+        elif finish_reason == "length":
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = finish_reason
+
+        backend_telemetry = {
+            "finish_reason": finish_reason,
+            "perf_before": perf_before,
+            "perf_after": perf_after,
+            "spec_enabled": self._spec_enabled,
+            "prefix_match_len_tokens": cached_before,
+        }
 
         return {
             "ttft_ms":       ttft_ms,
@@ -169,6 +220,8 @@ class LlamaCppRunner:
             "output_tokens": output_token_count,
             "prompt_tokens": len(new_ids),
             "cached_tokens": cached_before,
+            "stop_reason":   stop_reason,
+            "backend_telemetry": backend_telemetry,
         }
 
     def reset_between_convs(self):
@@ -218,6 +271,21 @@ def main():
     ck_path = CHECKPOINT_DIR / f"llamacpp_{checkpoint_key('llamacpp', args.model_path, args.n_samples, args.max_turns)}.json"
     meta = {"backend": "llamacpp", "model": args.model_path, "draft": args.draft_model_path, "gamma": args.gamma}
 
+    config = {
+        "gamma": args.gamma,
+        "n_ctx": args.n_ctx,
+        "n_gpu_layers": args.n_gpu_layers,
+        "max_new_tokens": args.max_new_tokens,
+        "n_samples": args.n_samples,
+        "min_turns": args.min_turns,
+        "max_turns": args.max_turns,
+        "max_context_tokens": args.max_context_tokens,
+        "max_tokens_per_turn": args.max_tokens_per_turn,
+        "speculative_enabled": runner._spec_enabled,
+        "save_output_text": args.save_output_text,
+    }
+    run_metadata = capture_run_metadata("llamacpp", config)
+
     t0 = time.perf_counter()
     results = replay_conversations(
         run_turn=runner.run_turn,
@@ -226,9 +294,15 @@ def main():
         conversations=conversations,
         ck_path=ck_path,
         meta=meta,
+        run_metadata=run_metadata,
         no_checkpoint=args.no_checkpoint,
+        save_output_text=args.save_output_text,
+        on_error=args.error_mode,
+        progress_every=args.progress_every,
+        max_new_tokens=args.max_new_tokens,
     )
     wall_s = time.perf_counter() - t0
+    run_metadata.end_iso = datetime.now(timezone.utc).isoformat()
 
     metrics = compute_metrics(results, total_wall_s=wall_s)
     print_summary("llamacpp", metrics)
@@ -239,26 +313,21 @@ def main():
         "backend": "llamacpp",
         "model": args.model_path,
         "draft_model": args.draft_model_path,
-        "config": {
-            "gamma": args.gamma,
-            "n_ctx": args.n_ctx,
-            "n_gpu_layers": args.n_gpu_layers,
-            "max_new_tokens": args.max_new_tokens,
-            "n_samples": args.n_samples,
-            "min_turns": args.min_turns,
-            "max_turns": args.max_turns,
-            "max_context_tokens": args.max_context_tokens,
-            "speculative_enabled": runner._spec_enabled,
-        },
+        "config": config,
+        "run_metadata": asdict(run_metadata),
         "wall_s": wall_s,
         "metrics": metrics,
+        "results": [asdict(r) for r in results],
     }
     with open(out_path, "w") as f:
         json.dump(payload, f, indent=2, default=str)
     print(f"Results written: {out_path}")
 
-    if ck_path.exists():
+    if ck_path.exists() and not args.no_checkpoint:
         ck_path.unlink()
+    live = ck_path.with_name(ck_path.stem + ".live.json")
+    if live.exists():
+        live.unlink()
 
 
 if __name__ == "__main__":

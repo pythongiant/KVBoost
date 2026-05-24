@@ -34,9 +34,11 @@ from typing import Optional
 
 import _common as common
 from _common import (
-    add_common_args, checkpoint_key, compute_metrics, load_sharegpt,
-    print_summary, replay_conversations, setup_logging,
+    add_common_args, capture_run_metadata, checkpoint_key, compute_metrics,
+    load_sharegpt, print_summary, replay_conversations, setup_logging,
 )
+from dataclasses import asdict
+from datetime import datetime, timezone
 
 RESULTS_DIR    = Path(__file__).resolve().parent / "results"
 CHECKPOINT_DIR = Path(__file__).resolve().parent / ".checkpoints"
@@ -183,9 +185,55 @@ class VLLMRunner:
         )
         cached_tokens = self._get_cached_tokens(final_output)
 
+        # Stop reason from vLLM's finish_reason ("stop" → eos, "length" → max_tokens).
+        stop_reason = None
+        cumulative_logprob = None
+        finish_reason = None
+        if final_output and getattr(final_output, "outputs", None):
+            out0 = final_output.outputs[0]
+            finish_reason = getattr(out0, "finish_reason", None)
+            cumulative_logprob = getattr(out0, "cumulative_logprob", None)
+            if finish_reason == "stop":
+                stop_reason = "eos"
+            elif finish_reason == "length":
+                stop_reason = "max_tokens"
+            else:
+                stop_reason = finish_reason
+
+        # Surface the full RequestMetrics dict as backend telemetry. Field names
+        # vary across vLLM versions, so we dump everything we can introspect.
+        backend_telemetry: dict = {}
+        if final_output is not None:
+            m = getattr(final_output, "metrics", None)
+            if m is not None:
+                metrics_dict = {}
+                try:
+                    import dataclasses
+                    for f in dataclasses.fields(m):
+                        v = getattr(m, f.name, None)
+                        if isinstance(v, (int, float, str, bool)) or v is None:
+                            metrics_dict[f.name] = v
+                except Exception:
+                    pass
+                # Catch-all for non-dataclass metrics shapes.
+                if not metrics_dict:
+                    for attr in dir(m):
+                        if attr.startswith("_"):
+                            continue
+                        try:
+                            v = getattr(m, attr)
+                            if isinstance(v, (int, float, str, bool)):
+                                metrics_dict[attr] = v
+                        except Exception:
+                            pass
+                backend_telemetry["request_metrics"] = metrics_dict
+            backend_telemetry["finish_reason"] = finish_reason
+            backend_telemetry["cumulative_logprob"] = cumulative_logprob
+            backend_telemetry["request_id"] = request_id
+            backend_telemetry["num_cached_tokens"] = cached_tokens
+
         # vLLM does not expose per-request speculative acceptance counters in
-        # its public API. We leave the spec_* fields None — speedup shows up
-        # in ITL/decode-tps rather than as an explicit acceptance number.
+        # its public API. spec_* stays None — the speedup shows up in ITL/tps.
         return {
             "ttft_ms":       ttft_ms,
             "total_ms":      total_ms,
@@ -193,6 +241,8 @@ class VLLMRunner:
             "output_tokens": output_tokens,
             "prompt_tokens": prompt_tokens,
             "cached_tokens": cached_tokens,
+            "stop_reason":   stop_reason,
+            "backend_telemetry": backend_telemetry,
         }
 
     def close(self):
@@ -232,6 +282,22 @@ def main():
     ck_path = CHECKPOINT_DIR / f"vllm_{checkpoint_key('vllm', args.model, args.n_samples, args.max_turns)}.json"
     meta = {"backend": "vllm", "model": args.model, "draft": args.draft_model, "gamma": args.gamma}
 
+    config = {
+        "gamma": args.gamma,
+        "prefix_caching": True,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_model_len": args.max_model_len,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "max_new_tokens": args.max_new_tokens,
+        "n_samples": args.n_samples,
+        "min_turns": args.min_turns,
+        "max_turns": args.max_turns,
+        "max_context_tokens": args.max_context_tokens,
+        "max_tokens_per_turn": args.max_tokens_per_turn,
+        "save_output_text": args.save_output_text,
+    }
+    run_metadata = capture_run_metadata("vllm", config)
+
     t0 = time.perf_counter()
     # NB: do NOT reset between conversations — vLLM's prefix cache benefits
     # from shared system/preamble tokens across conversations too.
@@ -242,9 +308,15 @@ def main():
         conversations=conversations,
         ck_path=ck_path,
         meta=meta,
+        run_metadata=run_metadata,
         no_checkpoint=args.no_checkpoint,
+        save_output_text=args.save_output_text,
+        on_error=args.error_mode,
+        progress_every=args.progress_every,
+        max_new_tokens=args.max_new_tokens,
     )
     wall_s = time.perf_counter() - t0
+    run_metadata.end_iso = datetime.now(timezone.utc).isoformat()
 
     metrics = compute_metrics(results, total_wall_s=wall_s)
     print_summary("vllm", metrics)
@@ -255,27 +327,22 @@ def main():
         "backend": "vllm",
         "model": args.model,
         "draft_model": args.draft_model,
-        "config": {
-            "gamma": args.gamma,
-            "prefix_caching": True,
-            "gpu_memory_utilization": args.gpu_memory_utilization,
-            "max_model_len": args.max_model_len,
-            "max_new_tokens": args.max_new_tokens,
-            "n_samples": args.n_samples,
-            "min_turns": args.min_turns,
-            "max_turns": args.max_turns,
-            "max_context_tokens": args.max_context_tokens,
-        },
+        "config": config,
+        "run_metadata": asdict(run_metadata),
         "wall_s": wall_s,
         "metrics": metrics,
+        "results": [asdict(r) for r in results],
     }
     with open(out_path, "w") as f:
         json.dump(payload, f, indent=2, default=str)
     print(f"Results written: {out_path}")
 
     runner.close()
-    if ck_path.exists():
+    if ck_path.exists() and not args.no_checkpoint:
         ck_path.unlink()
+    live = ck_path.with_name(ck_path.stem + ".live.json")
+    if live.exists():
+        live.unlink()
 
 
 if __name__ == "__main__":
