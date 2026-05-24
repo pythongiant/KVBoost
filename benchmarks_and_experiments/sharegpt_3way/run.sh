@@ -17,6 +17,22 @@
 #   N_SAMPLES=500 ./run.sh                  # full 500-conversation run
 #   LLAMACPP_MODEL=/path/target.gguf LLAMACPP_DRAFT=/path/draft.gguf ./run.sh
 #
+# Parallel server-mode run (overlaps multiple conversations against a running
+# kvboost-server, with 503-aware back-pressure as queue saturates):
+#
+#   # shell 1: start the server with whatever flags you want
+#   kvboost-server --model Qwen/Qwen2.5-7B-Instruct-AWQ \
+#       --awq-streaming --keep-first-k 1024 --keep-last-k 1024 \
+#       --recompute-strategy cacheblend --max-batch-size 8 --max-queue-size 64
+#
+#   # shell 2: fire N convs in parallel
+#   python run_kvboost_server.py \
+#       --server-url http://localhost:8000 --concurrency 8 --n-samples 500
+#
+# Note: server mode shares the KV cache across conversations (multi-tenant
+# warm), so its numbers describe a different measurement than this script's
+# in-process per-conv-reset numbers.
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -30,12 +46,18 @@ case "${PROFILE}" in
   awq-12gb)
     KVBOOST_MODEL="${KVBOOST_MODEL:-Qwen/Qwen2.5-7B-Instruct-AWQ}"
     KVBOOST_DRAFT="${KVBOOST_DRAFT:-Qwen/Qwen2.5-1.5B-Instruct-AWQ}"
+    # AWQ loader path is required so transformers doesn't route 7B-AWQ to
+    # gptqmodel — but at 12 GB the whole model is fully resident, so we use
+    # `full_resident` to skip the streaming hooks (StreamingQLinear bookkeeping
+    # adds ~hundreds of ms/token even when nothing actually streams). KV is
+    # kept at fp16: the cache for 4 k context is well under 1 GB at 7 B and
+    # the per-token dequant cost of kv-cache-bits=8 outweighs the VRAM saving.
     KVBOOST_EXTRA=(
         --awq-streaming
-        --streaming-mode partial_resident
+        --streaming-mode full_resident
         --keep-first-k 1024 --keep-last-k 1024
-        --kv-cache-bits 8
-        --max-cache-bytes 1.5e9
+        --kv-cache-bits 16
+        --max-cache-bytes 2.0e9
     )
     VLLM_MODEL="${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct-AWQ}"
     VLLM_DRAFT="${VLLM_DRAFT:-Qwen/Qwen2.5-1.5B-Instruct-AWQ}"

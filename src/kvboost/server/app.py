@@ -33,7 +33,7 @@ import time
 import uuid
 from typing import AsyncGenerator, Optional
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -64,6 +64,32 @@ def _truncate(text: str, limit: int = 500) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}…<+{len(text) - limit} chars>"
+
+
+def _attach_kvboost_headers(response: Response, result, request_id: str) -> None:
+    """Expose per-request KVBoost telemetry via X-KVBoost-* response headers.
+
+    OpenAI's response shape has no slot for ttft/cached_tokens/kv_reuse, so we
+    return them as headers — OpenAI clients ignore them, and our benchmark
+    client (run_kvboost_server.py) reads them to populate TurnResult fields
+    without needing in-process access to the engine.
+    """
+    def _set(name: str, value):
+        if value is None:
+            return
+        response.headers[name] = str(value)
+
+    _set("X-KVBoost-Request-Id", request_id)
+    _set("X-KVBoost-Ttft-Ms", f"{getattr(result, 'ttft_ms', 0.0):.3f}")
+    total_ms = getattr(result, "total_ms", None)
+    if total_ms is not None:
+        _set("X-KVBoost-Total-Ms", f"{total_ms:.3f}")
+    _set("X-KVBoost-Prompt-Tokens", getattr(result, "prompt_tokens", None))
+    _set("X-KVBoost-Cached-Tokens", getattr(result, "cached_tokens", None))
+    _set("X-KVBoost-Generated-Tokens", getattr(result, "generated_tokens", None))
+    reuse = getattr(result, "kv_reuse_ratio", None)
+    if reuse is not None:
+        _set("X-KVBoost-Kv-Reuse-Ratio", f"{float(reuse):.6f}")
 
 
 def build_app(
@@ -170,7 +196,7 @@ def build_app(
     # ── /v1/completions ───────────────────────────────────────────────────────
 
     @app.post("/v1/completions", tags=["completions"])
-    async def completions(req: CompletionRequest):
+    async def completions(req: CompletionRequest, response: Response):
         _validate_model(req.model, _model_name)
 
         io_log.info(
@@ -198,6 +224,11 @@ def build_app(
             prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
         )
 
+        # Telemetry headers — for a multi-prompt batch we expose the first
+        # result's stats. Single-prompt is the dominant case (chat & bench).
+        if results:
+            _attach_kvboost_headers(response, results[0], request_id=f"cmpl-{uuid.uuid4().hex[:12]}")
+
         choices = [
             CompletionChoice(text=r.output_text, index=i)
             for i, r in enumerate(results)
@@ -215,7 +246,7 @@ def build_app(
     # ── /v1/chat/completions ──────────────────────────────────────────────────
 
     @app.post("/v1/chat/completions", tags=["chat"])
-    async def chat_completions(req: ChatCompletionRequest):
+    async def chat_completions(req: ChatCompletionRequest, response: Response):
         _validate_model(req.model, _model_name)
 
         prompt = req.to_prompt(worker.engine.tokenizer)
@@ -243,6 +274,8 @@ def build_app(
 
         prompt_tokens = len(worker._tokenize(prompt))
         completion_tokens = len(worker._tokenize(result.output_text))
+
+        _attach_kvboost_headers(response, result, request_id=f"chat-{uuid.uuid4().hex[:12]}")
 
         io_log.info("CHAT out=%r", _truncate(result.output_text))
         io_log.info(
