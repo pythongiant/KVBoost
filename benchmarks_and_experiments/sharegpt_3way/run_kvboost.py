@@ -15,10 +15,13 @@ run_llamacpp.py so compare.py can plot all three side-by-side.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import logging
 import sys
 import time
 from pathlib import Path
+from typing import Any, Dict, List
 
 import _common as common
 from _common import (
@@ -31,6 +34,210 @@ from datetime import datetime, timezone
 
 RESULTS_DIR    = Path(__file__).resolve().parent / "results"
 CHECKPOINT_DIR = Path(__file__).resolve().parent / ".checkpoints"
+
+log = logging.getLogger("sharegpt_3way.kvboost")
+
+
+# ── OOM recovery ────────────────────────────────────────────────────────
+#
+# On CUDA OOM we inspect *which* knob is most likely the cause and adjust
+# the one that frees the most VRAM with the least quality hit:
+#
+#   * KV cache "high" (used > HIGH_FRAC × budget) → lower max_cache_bytes
+#     (and evict). This is the cheap fix: trims residency without touching
+#     the model.
+#   * KV cache "low"  → lower streaming residency (keep_first_k /
+#     keep_last_k). Layers fall out of VRAM, paying a streaming-overhead
+#     tax but unblocking the run.
+#
+# A second OOM on the same knob flips to the other knob; further OOMs
+# halve again until we hit floors (MIN_CACHE_BYTES / MIN_KEEP), at which
+# point the turn is recorded as an error and we move on.
+class OOMRecovery:
+    HIGH_FRAC = 0.5
+    CACHE_SHRINK = 0.7
+    STREAM_SHRINK = 0.5
+    MIN_CACHE_BYTES = int(2.5e8)   # 250 MB floor
+    MIN_KEEP = 16                  # at least 16 fully-resident layers each side
+
+    def __init__(
+        self,
+        engine,
+        *,
+        initial_max_cache_bytes: int,
+        initial_keep_first_k: int | None,
+        initial_keep_last_k: int | None,
+        streaming_enabled: bool,
+        max_retries: int = 2,
+    ):
+        self.engine = engine
+        self.max_cache_bytes = int(initial_max_cache_bytes)
+        self.keep_first_k = initial_keep_first_k
+        self.keep_last_k = initial_keep_last_k
+        self.streaming_enabled = streaming_enabled
+        self.max_retries = max_retries
+        self.events: List[Dict[str, Any]] = []
+        self._last_action: str | None = None  # to alternate when one knob is exhausted
+
+    # ── Introspection ──
+    def _cache_bytes_used(self) -> int:
+        try:
+            cm = self.engine.cache_manager
+            fn = getattr(cm, "current_bytes", None)
+            if callable(fn):
+                return int(fn())
+            if isinstance(fn, (int, float)):
+                return int(fn)
+            # Fallback: sum of per-chunk sizes if exposed
+            chunks = getattr(cm, "_chunks", None)
+            if chunks:
+                total = 0
+                for c in (chunks.values() if isinstance(chunks, dict) else chunks):
+                    nb = getattr(c, "nbytes", None)
+                    if nb is not None:
+                        total += int(nb)
+                return total
+        except Exception:
+            pass
+        return 0
+
+    def _cache_high(self) -> bool:
+        used = self._cache_bytes_used()
+        budget = max(self.max_cache_bytes, 1)
+        return used > self.HIGH_FRAC * budget
+
+    # ── Knob adjusters (return whatever we managed to change) ──
+    def _lower_cache(self) -> Dict[str, Any] | None:
+        new_bytes = int(self.max_cache_bytes * self.CACHE_SHRINK)
+        if new_bytes < self.MIN_CACHE_BYTES:
+            return None
+        cm = self.engine.cache_manager
+        # Apply to whichever attribute the cache manager exposes.
+        for attr in ("max_cache_bytes", "_max_cache_bytes", "max_bytes"):
+            if hasattr(cm, attr):
+                try:
+                    setattr(cm, attr, new_bytes)
+                except Exception:
+                    pass
+        self.max_cache_bytes = new_bytes
+        try:
+            cm.clear()
+        except Exception:
+            pass
+        return {"action": "lower_cache", "new_max_cache_bytes": new_bytes}
+
+    def _lower_streaming(self) -> Dict[str, Any] | None:
+        if not self.streaming_enabled or self.keep_first_k is None:
+            return None
+        new_first = max(self.MIN_KEEP, int(self.keep_first_k * self.STREAM_SHRINK))
+        new_last = max(self.MIN_KEEP, int((self.keep_last_k or 0) * self.STREAM_SHRINK))
+        if new_first == self.keep_first_k and new_last == self.keep_last_k:
+            return None
+
+        # Push into whatever exposes the streaming config. Hierarchy varies
+        # across kvboost versions — try the documented spots, swallow errors.
+        applied = False
+        model = self.engine.model
+        for owner in (
+            getattr(model, "streaming_model", None),
+            model,
+            getattr(model, "config", None),
+        ):
+            if owner is None:
+                continue
+            cfg = getattr(owner, "streaming_config", None) or owner
+            if hasattr(cfg, "keep_first_k") and hasattr(cfg, "keep_last_k"):
+                try:
+                    cfg.keep_first_k = new_first
+                    cfg.keep_last_k = new_last
+                    applied = True
+                except Exception:
+                    pass
+            # If the streaming engine has a rebalance hook, fire it.
+            for hook_name in ("rebalance_residency", "refresh_residency", "_recompute_residency"):
+                hook = getattr(owner, hook_name, None)
+                if callable(hook):
+                    try:
+                        hook()
+                    except Exception:
+                        pass
+        if not applied:
+            return None
+
+        self.keep_first_k = new_first
+        self.keep_last_k = new_last
+        return {"action": "lower_streaming", "keep_first_k": new_first, "keep_last_k": new_last}
+
+    # ── Driver ──
+    def attempt(self, run_turn_fn, prompt: str) -> dict:
+        import torch
+        last_err: Exception | None = None
+        oom_events: List[Dict[str, Any]] = []
+
+        for attempt_idx in range(self.max_retries + 1):
+            try:
+                result = run_turn_fn(prompt)
+                if oom_events:
+                    bt = result.setdefault("backend_telemetry", {})
+                    bt["oom_events"] = oom_events
+                return result
+            except torch.cuda.OutOfMemoryError as e:
+                last_err = e
+            except RuntimeError as e:
+                msg = str(e).lower()
+                if "out of memory" not in msg and "cuda oom" not in msg:
+                    raise
+                last_err = e
+
+            cache_high = self._cache_high()
+            cache_used = self._cache_bytes_used()
+            log.warning(
+                "CUDA OOM on attempt %d (cache_used=%.2f GB / budget=%.2f GB, "
+                "high=%s) — adjusting knobs.",
+                attempt_idx, cache_used / 1e9, self.max_cache_bytes / 1e9, cache_high,
+            )
+
+            # Free everything we can before trying again.
+            try:
+                self.engine.reset_cache()
+            except Exception:
+                pass
+            gc.collect()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+            # Pick the knob. If the preferred knob was already adjusted last
+            # round (and didn't help), flip to the other knob.
+            primary, secondary = (
+                (self._lower_cache, self._lower_streaming)
+                if cache_high
+                else (self._lower_streaming, self._lower_cache)
+            )
+            change = primary()
+            if change is None or change.get("action") == self._last_action:
+                alt = secondary()
+                if alt is not None:
+                    change = alt
+            if change is None:
+                log.error(
+                    "OOM recovery exhausted: cache=%.2f GB (floor=%.2f GB), "
+                    "keep=%s/%s (floor=%d). Giving up on this turn.",
+                    self.max_cache_bytes / 1e9, self.MIN_CACHE_BYTES / 1e9,
+                    self.keep_first_k, self.keep_last_k, self.MIN_KEEP,
+                )
+                break
+            change["attempt"] = attempt_idx
+            change["cache_used_gb"] = round(cache_used / 1e9, 3)
+            change["cache_budget_gb"] = round(self.max_cache_bytes / 1e9, 3)
+            self.events.append(change)
+            oom_events.append(change)
+            self._last_action = change["action"]
+
+        # All retries failed: re-raise so the replay loop records an error.
+        assert last_err is not None
+        raise last_err
 
 
 def build_engine(args):
@@ -73,7 +280,7 @@ def build_engine(args):
     )
 
 
-def make_run_turn(engine, max_new_tokens: int):
+def make_run_turn(engine, max_new_tokens: int, oom_recovery: "OOMRecovery | None" = None):
     from kvboost import GenerationMode
 
     def _full_spec_snapshot() -> dict:
@@ -104,7 +311,7 @@ def make_run_turn(engine, max_new_tokens: int):
             pass
         return snap
 
-    def run_turn(prompt: str) -> dict:
+    def _do_run_turn(prompt: str) -> dict:
         engine.warm_chunks(prompt, position_offset=0)
         pre = _full_spec_snapshot()
         cache_pre = _cache_snapshot()
@@ -168,7 +375,13 @@ def make_run_turn(engine, max_new_tokens: int):
             "backend_telemetry": backend_telemetry,
         }
 
-    return run_turn
+    if oom_recovery is None:
+        return _do_run_turn
+
+    def run_turn_with_oom(prompt: str) -> dict:
+        return oom_recovery.attempt(_do_run_turn, prompt)
+
+    return run_turn_with_oom
 
 
 def main():
@@ -194,6 +407,12 @@ def main():
                                  "ffn_only_stream", "full_stream"])
     parser.add_argument("--keep-first-k", type=int, default=1024)
     parser.add_argument("--keep-last-k", type=int, default=1024)
+    parser.add_argument("--oom-recovery", action="store_true", default=True,
+                        help="Catch CUDA OOM, lower KV cache or streaming residency, retry. "
+                             "Default on; pass --no-oom-recovery to disable.")
+    parser.add_argument("--no-oom-recovery", action="store_false", dest="oom_recovery")
+    parser.add_argument("--oom-max-retries", type=int, default=2,
+                        help="Max OOM retries per turn before giving up (default: 2).")
     args = parser.parse_args()
 
     setup_logging(args.verbose, args.debug)
@@ -242,12 +461,25 @@ def main():
         "max_context_tokens": args.max_context_tokens,
         "max_tokens_per_turn": args.max_tokens_per_turn,
         "save_output_text": args.save_output_text,
+        "oom_recovery": args.oom_recovery,
+        "oom_max_retries": args.oom_max_retries,
     }
     run_metadata = capture_run_metadata("kvboost", config)
 
+    oom_recovery = None
+    if args.oom_recovery:
+        oom_recovery = OOMRecovery(
+            engine,
+            initial_max_cache_bytes=int(args.max_cache_bytes),
+            initial_keep_first_k=args.keep_first_k if args.awq_streaming else None,
+            initial_keep_last_k=args.keep_last_k if args.awq_streaming else None,
+            streaming_enabled=args.awq_streaming,
+            max_retries=args.oom_max_retries,
+        )
+
     t0 = time.perf_counter()
     results = replay_conversations(
-        run_turn=make_run_turn(engine, args.max_new_tokens),
+        run_turn=make_run_turn(engine, args.max_new_tokens, oom_recovery=oom_recovery),
         count_tokens=lambda s: len(engine.tokenizer.encode(s, add_special_tokens=True)),
         reset_between_convs=engine.reset_cache,
         conversations=conversations,
@@ -275,6 +507,14 @@ def main():
         "run_metadata": asdict(run_metadata),
         "wall_s": wall_s,
         "metrics": metrics,
+        "oom_recovery": {
+            "enabled": args.oom_recovery,
+            "n_events": len(oom_recovery.events) if oom_recovery else 0,
+            "final_max_cache_bytes": oom_recovery.max_cache_bytes if oom_recovery else int(args.max_cache_bytes),
+            "final_keep_first_k": oom_recovery.keep_first_k if oom_recovery else (args.keep_first_k if args.awq_streaming else None),
+            "final_keep_last_k": oom_recovery.keep_last_k if oom_recovery else (args.keep_last_k if args.awq_streaming else None),
+            "events": oom_recovery.events if oom_recovery else [],
+        },
         "results": [asdict(r) for r in results],
     }
     with open(out_path, "w") as f:
