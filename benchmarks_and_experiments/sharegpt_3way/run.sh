@@ -41,11 +41,13 @@ case "${PROFILE}" in
     VLLM_DRAFT="${VLLM_DRAFT:-Qwen/Qwen2.5-1.5B-Instruct-AWQ}"
     VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.85}"
     VLLM_MAX_LEN="${VLLM_MAX_LEN:-4096}"
-    LLAMACPP_MODEL="${LLAMACPP_MODEL:-${HOME}/models/qwen2.5-7b-instruct-q4_k_m.gguf}"
-    LLAMACPP_DRAFT="${LLAMACPP_DRAFT:-${HOME}/models/qwen2.5-1.5b-instruct-q4_k_m.gguf}"
+    LLAMACPP_REPO="${LLAMACPP_REPO:-Qwen/Qwen2.5-7B-Instruct-GGUF}"
+    LLAMACPP_FILE="${LLAMACPP_FILE:-qwen2.5-7b-instruct-q4_k_m.gguf}"
+    LLAMACPP_DRAFT_REPO="${LLAMACPP_DRAFT_REPO:-Qwen/Qwen2.5-1.5B-Instruct-GGUF}"
+    LLAMACPP_DRAFT_FILE="${LLAMACPP_DRAFT_FILE:-qwen2.5-1.5b-instruct-q4_k_m.gguf}"
     LLAMACPP_CTX="${LLAMACPP_CTX:-4096}"
     MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS:-4096}"
-    N_SAMPLES="${N_SAMPLES:-100}"
+    N_SAMPLES="${N_SAMPLES:-500}"
     GAMMA="${GAMMA:-4}"
     ;;
   fp16-big)
@@ -56,8 +58,10 @@ case "${PROFILE}" in
     VLLM_DRAFT="${VLLM_DRAFT:-Qwen/Qwen2.5-1.5B-Instruct}"
     VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.90}"
     VLLM_MAX_LEN="${VLLM_MAX_LEN:-8192}"
-    LLAMACPP_MODEL="${LLAMACPP_MODEL:-${HOME}/models/qwen2.5-7b-instruct-q4_k_m.gguf}"
-    LLAMACPP_DRAFT="${LLAMACPP_DRAFT:-${HOME}/models/qwen2.5-1.5b-instruct-q4_k_m.gguf}"
+    LLAMACPP_REPO="${LLAMACPP_REPO:-Qwen/Qwen2.5-7B-Instruct-GGUF}"
+    LLAMACPP_FILE="${LLAMACPP_FILE:-qwen2.5-7b-instruct-q4_k_m.gguf}"
+    LLAMACPP_DRAFT_REPO="${LLAMACPP_DRAFT_REPO:-Qwen/Qwen2.5-1.5B-Instruct-GGUF}"
+    LLAMACPP_DRAFT_FILE="${LLAMACPP_DRAFT_FILE:-qwen2.5-1.5b-instruct-q4_k_m.gguf}"
     LLAMACPP_CTX="${LLAMACPP_CTX:-8192}"
     MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS:-6000}"
     N_SAMPLES="${N_SAMPLES:-500}"
@@ -68,6 +72,46 @@ case "${PROFILE}" in
     exit 1
     ;;
 esac
+
+# Resolved GGUF paths: respect explicit LLAMACPP_MODEL/LLAMACPP_DRAFT overrides
+# (back-compat with the older interface), else derive from REPO/FILE pair.
+GGUF_DIR="${GGUF_DIR:-${HOME}/models}"
+LLAMACPP_MODEL="${LLAMACPP_MODEL:-${GGUF_DIR}/${LLAMACPP_FILE}}"
+LLAMACPP_DRAFT="${LLAMACPP_DRAFT:-${GGUF_DIR}/${LLAMACPP_DRAFT_FILE}}"
+
+# ── GGUF auto-download (vLLM-style: point at HF repo, fetch on demand) ─
+# vLLM resolves HF repos transparently when you pass --model. llama.cpp
+# expects on-disk paths, so we mirror that ergonomics here: if the GGUF
+# isn't present, download it before launching the runner.
+ensure_gguf() {
+    local repo="$1" filename="$2" dest="$3"
+    if [[ -f "${dest}" ]]; then
+        return 0
+    fi
+    mkdir -p "$(dirname "${dest}")"
+    echo ">>> GGUF missing: ${dest}"
+    echo "    Fetching ${filename} from ${repo} ..."
+    if command -v huggingface-cli >/dev/null 2>&1; then
+        huggingface-cli download "${repo}" "${filename}" \
+            --local-dir "$(dirname "${dest}")" \
+            --local-dir-use-symlinks False
+    else
+        "${PYTHON}" - <<PY
+from huggingface_hub import hf_hub_download
+import os, shutil
+p = hf_hub_download(repo_id="${repo}", filename="${filename}")
+dest = "${dest}"
+os.makedirs(os.path.dirname(dest), exist_ok=True)
+if os.path.realpath(p) != os.path.realpath(dest):
+    shutil.copy(p, dest)
+print("ok:", dest)
+PY
+    fi
+    if [[ ! -f "${dest}" ]]; then
+        echo "ERROR: failed to fetch ${filename}; expected at ${dest}" >&2
+        return 1
+    fi
+}
 
 # ── Shared workload shape — identical across all three backends ────────
 MIN_TURNS="${MIN_TURNS:-3}"
@@ -123,6 +167,11 @@ run_backend vllm run_vllm.py \
     --max-model-len "${VLLM_MAX_LEN}" \
     --progress-every "${PROGRESS_EVERY}" \
     --save-output-text
+
+if [[ ",${ONLY}," == *",llamacpp,"* ]]; then
+    ensure_gguf "${LLAMACPP_REPO}"       "${LLAMACPP_FILE}"       "${LLAMACPP_MODEL}"
+    ensure_gguf "${LLAMACPP_DRAFT_REPO}" "${LLAMACPP_DRAFT_FILE}" "${LLAMACPP_DRAFT}"
+fi
 
 run_backend llamacpp run_llamacpp.py \
     --n-samples "${N_SAMPLES}" \
