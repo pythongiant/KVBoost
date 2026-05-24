@@ -17,21 +17,41 @@
 #   N_SAMPLES=500 ./run.sh                  # full 500-conversation run
 #   LLAMACPP_MODEL=/path/target.gguf LLAMACPP_DRAFT=/path/draft.gguf ./run.sh
 #
-# Parallel server-mode run (overlaps multiple conversations against a running
-# kvboost-server, with 503-aware back-pressure as queue saturates):
+# Parallel server-mode runs — three matching clients, one per backend.
+# Each fires N conversations against an already-running server with
+# 503-aware back-pressure (concurrency falls back to sequential when the
+# server's queue saturates). Results land in results/{kvboost,vllm,llamacpp}_server.json
+# in the same schema as the in-process runs.
 #
-#   # shell 1: start the server with whatever flags you want
+# ─ kvboost ─
 #   kvboost-server --model Qwen/Qwen2.5-7B-Instruct-AWQ \
-#       --awq-streaming --keep-first-k 1024 --keep-last-k 1024 \
-#       --recompute-strategy cacheblend --max-batch-size 8 --max-queue-size 64
+#       --awq-streaming --streaming-mode full_resident \
+#       --keep-first-k 1024 --keep-last-k 1024 \
+#       --kv-cache-bits 16 --max-cache-bytes 2e9 \
+#       --recompute-strategy cacheblend \
+#       --max-batch-size 8 --max-queue-size 64 --port 8000
+#   python run_kvboost_server.py --server-url http://localhost:8000 \
+#       --concurrency 8 --n-samples 500
 #
-#   # shell 2: fire N convs in parallel
-#   python run_kvboost_server.py \
-#       --server-url http://localhost:8000 --concurrency 8 --n-samples 500
+# ─ vLLM ─
+#   vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ \
+#       --enable-prefix-caching \
+#       --gpu-memory-utilization 0.85 --max-model-len 4096 --port 8001
+#   python run_vllm_server.py --server-url http://localhost:8001 \
+#       --concurrency 8 --n-samples 500
 #
-# Note: server mode shares the KV cache across conversations (multi-tenant
-# warm), so its numbers describe a different measurement than this script's
-# in-process per-conv-reset numbers.
+# ─ llama.cpp ─
+#   ./llama-server -m /path/qwen2.5-7b-q4_k_m.gguf \
+#       --model-draft /path/qwen2.5-1.5b-q4_k_m.gguf \
+#       -ngl 99 --ctx-size 4096 --parallel 8 --port 8002
+#   python run_llamacpp_server.py --server-url http://localhost:8002 \
+#       --tokenizer Qwen/Qwen2.5-7B-Instruct \
+#       --concurrency 8 --n-samples 500
+#
+# Methodology note: server mode shares the KV cache across concurrent
+# conversations (multi-tenant warm). The per-conv cold→warm climb the
+# in-process variants measure is NOT recoverable here — analysis should
+# treat the two as different measurements.
 #
 set -euo pipefail
 

@@ -1,33 +1,38 @@
 #!/usr/bin/env python3
 """
-3-way ShareGPT benchmark — KVBoost **server-mode** runner (parallel).
+3-way ShareGPT benchmark — llama.cpp **server-mode** runner (parallel).
 
-Talks to a running ``kvboost-server`` over HTTP and fires N conversations
-concurrently. The server's BatchQueue handles batching and back-pressure:
-when ``--max-queue-size`` is exceeded the server returns 503, and this
-client backs off and retries — concurrency gracefully drops to whatever
-the GPU can actually absorb.
+Talks to a running ``llama-server`` (the llama.cpp HTTP daemon) over its
+OpenAI-compatible ``/v1/completions`` endpoint and fires N conversations
+concurrently. ``llama-server`` uses internal "slots" for parallelism; if the
+slots are full it returns 503 (when configured) or just queues — this client
+handles either with backoff and retry.
 
-Telemetry source: ``X-KVBoost-*`` response headers attached by
-``src/kvboost/server/app.py`` (engine ttft_ms, cached_tokens, kv_reuse_ratio).
+Telemetry
+---------
+TTFT comes from streaming SSE (time to first content chunk). llama-server
+does not expose per-request KV-reuse counters in its OpenAI-compat usage
+field, so ``cached_tokens`` will typically be 0. The ITL and decode-tok/s
+numbers are the meaningful comparison signal here.
 
 Quick start
 -----------
-    # shell 1: start the server
-    kvboost-server --model Qwen/Qwen2.5-7B-Instruct-AWQ \\
-        --awq-streaming --streaming-mode full_resident \\
-        --max-batch-size 8 --max-queue-size 64
+    # shell 1: start the server (assumes you've built llama.cpp with CUDA)
+    ./llama-server \\
+        -m ~/models/qwen2.5-7b-instruct-q4_k_m.gguf \\
+        --model-draft ~/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \\
+        -ngl 99 \\
+        --ctx-size 4096 \\
+        --parallel 8 \\
+        --port 8002
 
     # shell 2: parallel replay
-    python run_kvboost_server.py --concurrency 8 --n-samples 500
+    python run_llamacpp_server.py --server-url http://localhost:8002 \\
+        --concurrency 8 --n-samples 500
 
-Methodology caveat
-------------------
-The in-process variant resets the KV cache between conversations to measure
-the cold→warm climb. Server mode CANNOT reset (cache is shared across
-concurrent clients) — the numbers describe multi-tenant warm steady-state,
-not single-conversation cold-start. Recorded as
-``reset_between_conversations=false`` in metadata.
+The ``--parallel N`` flag on llama-server creates N slots; matching
+``--concurrency`` to ``--parallel`` is the right starting point. Beyond that,
+the server queues / rejects, and the client backs off.
 """
 
 from __future__ import annotations
@@ -44,7 +49,6 @@ from typing import Dict, Optional
 
 import httpx
 
-import _common as common
 import _server_common as srv
 from _common import (
     ConvResult, TurnResult, add_common_args, capture_run_metadata,
@@ -56,34 +60,9 @@ RESULTS_DIR    = Path(__file__).resolve().parent / "results"
 CHECKPOINT_DIR = Path(__file__).resolve().parent / ".checkpoints"
 
 
-# ── KVBoost-specific telemetry parsing ──────────────────────────────────────
-
-def _parse_kvboost_headers(headers: Dict[str, str]) -> Dict[str, Optional[float]]:
-    """Pull ``X-KVBoost-*`` response headers (lowercased by httpx)."""
-    lc = {k.lower(): v for k, v in headers.items()}
-
-    def _num(name: str) -> Optional[float]:
-        v = lc.get(name.lower())
-        if v is None:
-            return None
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
-
-    return {
-        "ttft_ms":          _num("X-KVBoost-Ttft-Ms"),
-        "total_ms":         _num("X-KVBoost-Total-Ms"),
-        "prompt_tokens":    _num("X-KVBoost-Prompt-Tokens"),
-        "cached_tokens":    _num("X-KVBoost-Cached-Tokens"),
-        "generated_tokens": _num("X-KVBoost-Generated-Tokens"),
-        "kv_reuse_ratio":   _num("X-KVBoost-Kv-Reuse-Ratio"),
-    }
-
-
 # ── Per-conversation worker ─────────────────────────────────────────────────
 
-async def _process_conversation_kvboost(
+async def _process_conversation_llamacpp(
     *,
     conv: dict,
     client: httpx.AsyncClient,
@@ -116,57 +95,38 @@ async def _process_conversation_kvboost(
         prompt = history + f"Human: {turn['value']}\nAssistant:"
         history_tokens = count_tokens(prompt)
         turn_start_iso = datetime.now(timezone.utc).isoformat()
-        t_turn = time.perf_counter()
 
         body = {
-            "model":       model_name,
-            "prompts":     [prompt],
-            "max_tokens":  max_new_tokens,
-            "temperature": 0.0,
-            "do_sample":   False,
-            "stream":      False,
+            "model":          model_name,
+            "prompt":         prompt,
+            "max_tokens":     max_new_tokens,
+            "temperature":    0.0,
+            "cache_prompt":   True,            # llama-server: reuse KV across requests
+            "stream_options": {"include_usage": True},
         }
 
         error_msg: Optional[str] = None
-        kv: Dict[str, Optional[float]] = {}
         output_text = ""
-        out_tok = 0
-        prompt_tokens = history_tokens
-        cached = 0
         ttft_ms = 0.0
         total_ms = 0.0
+        usage: Optional[dict] = None
 
         try:
-            resp, headers = await srv.post_with_retry(
+            output_text, ttft_ms, total_ms, _hdrs, usage = await srv.post_stream_with_retry(
                 client, completions_url, body,
                 max_retries=max_retries,
                 base_delay=base_delay,
                 max_delay=max_delay,
             )
-            kv = _parse_kvboost_headers(headers)
-            choices = resp.get("choices") or []
-            output_text = (choices[0].get("text") if choices else "") or ""
-
-            wall_total_ms = (time.perf_counter() - t_turn) * 1000.0
-            ttft_ms  = kv.get("ttft_ms")  if kv.get("ttft_ms")  is not None else wall_total_ms
-            total_ms = kv.get("total_ms") if kv.get("total_ms") is not None else wall_total_ms
-            usage    = resp.get("usage") or {}
-            out_tok  = int(kv.get("generated_tokens") or usage.get("completion_tokens") or 0)
-            prompt_tokens = int(kv.get("prompt_tokens") or usage.get("prompt_tokens") or history_tokens)
-            cached   = int(kv.get("cached_tokens") or 0)
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
             log.error("Conv %s turn %d failed: %s", conv_id, human_turn_idx, error_msg)
 
         if error_msg is not None:
             tr = TurnResult(
-                conv_id=conv_id,
-                turn_idx=human_turn_idx,
-                n_turns_total=n_human,
-                history_tokens=history_tokens,
-                prompt_tokens=history_tokens,
-                cached_tokens=0,
-                cache_hit_ratio=0.0,
+                conv_id=conv_id, turn_idx=human_turn_idx, n_turns_total=n_human,
+                history_tokens=history_tokens, prompt_tokens=history_tokens,
+                cached_tokens=0, cache_hit_ratio=0.0,
                 ttft_ms=0.0, total_ms=0.0, decode_ms=0.0,
                 output_tokens=0, itl_ms=0.0, decode_tps=0.0,
                 error=error_msg, stop_reason="error",
@@ -175,6 +135,13 @@ async def _process_conversation_kvboost(
             conv_result.turns.append(tr)
             conv_result.error_count += 1
             break
+
+        # llama-server doesn't expose per-request KV reuse in OpenAI usage.
+        # If a future build adds it under prompt_tokens_details, pick it up.
+        details = (usage or {}).get("prompt_tokens_details") or {}
+        cached = int(details.get("cached_tokens") or 0)
+        prompt_tokens = int((usage or {}).get("prompt_tokens") or history_tokens)
+        out_tok       = int((usage or {}).get("completion_tokens") or 0)
 
         decode_ms = max(total_ms - ttft_ms, 0.0)
         itl_ms = decode_ms / max(out_tok - 1, 1)
@@ -201,8 +168,7 @@ async def _process_conversation_kvboost(
             output_text=output_text if save_output_text else None,
             turn_start_iso=turn_start_iso,
             backend_telemetry={
-                "kv_reuse_ratio_header": kv.get("kv_reuse_ratio"),
-                "wall_total_ms":         (time.perf_counter() - t_turn) * 1000.0,
+                "usage": usage,
             },
         )
         conv_result.turns.append(tr)
@@ -218,17 +184,21 @@ async def _process_conversation_kvboost(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="KVBoost server-mode 3-way ShareGPT runner (parallel)",
+        description="llama.cpp server-mode 3-way ShareGPT runner (parallel)",
     )
     add_common_args(parser)
-    parser.add_argument("--server-url", default="http://localhost:8000",
-                        help="kvboost-server base URL (default: http://localhost:8000)")
-    parser.add_argument("--model", default=None,
-                        help="Model id; default: GET /v1/models")
-    parser.add_argument("--concurrency", type=int, default=8,
-                        help="Conversations in flight at once (default: 8)")
-    parser.add_argument("--tokenizer", default=None,
-                        help="HF tokenizer id (default: --model)")
+    parser.add_argument("--server-url", default="http://localhost:8002",
+                        help="llama-server base URL (default: http://localhost:8002)")
+    parser.add_argument("--model", default="default",
+                        help="Model id sent in request (llama-server doesn't validate "
+                             "strictly; default 'default' usually works).")
+    parser.add_argument("--tokenizer", required=True,
+                        help="HF tokenizer id for prompt token counting / dataset "
+                             "filtering. llama-server uses its own tokenizer for "
+                             "the model but this client needs HF for the filter "
+                             "pipeline. Use the model's HF id, e.g. "
+                             "Qwen/Qwen2.5-7B-Instruct.")
+    parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--max-retries", type=int, default=20)
     parser.add_argument("--base-delay", type=float, default=0.5)
     parser.add_argument("--max-delay", type=float, default=30.0)
@@ -236,24 +206,26 @@ def main():
     args = parser.parse_args()
 
     setup_logging(args.verbose, args.debug)
-    print(f"\n{'=' * 72}\n  KVBoost server-mode (parallel) — ShareGPT 3-way\n{'=' * 72}")
+    print(f"\n{'=' * 72}\n  llama.cpp server-mode (parallel) — ShareGPT 3-way\n{'=' * 72}")
     print(f"  server      = {args.server_url}")
     print(f"  concurrency = {args.concurrency}")
+    print(f"  tokenizer   = {args.tokenizer}")
 
-    models_resp = srv.check_openai_server(args.server_url)
-    loaded = (models_resp.get("data") or [{}])[0].get("id", "<unknown>")
-    model_name = args.model or loaded
-    print(f"  model       = {model_name}  (server loaded: {loaded})")
+    # llama-server exposes /v1/models — use it to fail fast.
+    try:
+        srv.check_openai_server(args.server_url)
+    except SystemExit:
+        raise
     print(f"  n_samples   = {args.n_samples}  turns={args.min_turns}-{args.max_turns}")
     print(f"{'=' * 72}\n")
 
-    out_path = Path(args.output) if args.output else RESULTS_DIR / "kvboost_server.json"
+    out_path = Path(args.output) if args.output else RESULTS_DIR / "llamacpp_server.json"
     if not args.no_checkpoint and is_run_complete(out_path, args.n_samples):
         print(f"[skip] {out_path} already covers {args.n_samples} conversations.")
         return
 
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
     conversations = load_sharegpt(
         n_conversations=args.n_samples,
@@ -267,11 +239,11 @@ def main():
         sys.exit("No conversations after filtering.")
 
     ck_path = CHECKPOINT_DIR / (
-        f"kvboost_server_{checkpoint_key('kvboost_server', model_name, args.n_samples, args.max_turns)}.json"
+        f"llamacpp_server_{checkpoint_key('llamacpp_server', args.tokenizer, args.n_samples, args.max_turns)}.json"
     )
     meta = {
-        "backend":     "kvboost_server",
-        "model":       model_name,
+        "backend":     "llamacpp_server",
+        "tokenizer":   args.tokenizer,
         "server_url":  args.server_url,
         "concurrency": args.concurrency,
     }
@@ -290,7 +262,7 @@ def main():
         "request_timeout":     args.request_timeout,
         "reset_between_conversations": False,
     }
-    run_metadata = capture_run_metadata("kvboost_server", config)
+    run_metadata = capture_run_metadata("llamacpp_server", config)
 
     def count_tokens(s: str) -> int:
         return len(tokenizer.encode(s, add_special_tokens=True))
@@ -299,10 +271,10 @@ def main():
 
     t0 = time.perf_counter()
     results = asyncio.run(srv.replay_parallel(
-        process_conv_fn=_process_conversation_kvboost,
+        process_conv_fn=_process_conversation_llamacpp,
         process_conv_kwargs=dict(
             completions_url=completions_url,
-            model_name=model_name,
+            model_name=args.model,
             max_new_tokens=args.max_new_tokens,
             count_tokens=count_tokens,
             save_output_text=args.save_output_text,
@@ -318,18 +290,19 @@ def main():
         no_checkpoint=args.no_checkpoint,
         progress_every=args.progress_every,
         request_timeout=args.request_timeout,
-        backend_label="kvboost_server",
+        backend_label="llamacpp_server",
     ))
     wall_s = time.perf_counter() - t0
     run_metadata.end_iso = datetime.now(timezone.utc).isoformat()
 
     metrics = compute_metrics(results, total_wall_s=wall_s)
-    print_summary("kvboost_server", metrics)
+    print_summary("llamacpp_server", metrics)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
-        "backend":      "kvboost_server",
-        "model":        model_name,
+        "backend":      "llamacpp_server",
+        "tokenizer":    args.tokenizer,
+        "model":        args.model,
         "server_url":   args.server_url,
         "concurrency":  args.concurrency,
         "config":       config,

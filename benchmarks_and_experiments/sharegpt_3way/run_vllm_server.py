@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
 """
-3-way ShareGPT benchmark — KVBoost **server-mode** runner (parallel).
+3-way ShareGPT benchmark — vLLM **server-mode** runner (parallel).
 
-Talks to a running ``kvboost-server`` over HTTP and fires N conversations
-concurrently. The server's BatchQueue handles batching and back-pressure:
-when ``--max-queue-size`` is exceeded the server returns 503, and this
-client backs off and retries — concurrency gracefully drops to whatever
-the GPU can actually absorb.
+Talks to a running ``vllm serve`` (OpenAI-compatible API) over HTTP and fires
+N conversations concurrently. vLLM's async engine already does continuous
+batching with prefix caching across requests; this client just keeps the
+queue full and falls back to sequential under back-pressure.
 
-Telemetry source: ``X-KVBoost-*`` response headers attached by
-``src/kvboost/server/app.py`` (engine ttft_ms, cached_tokens, kv_reuse_ratio).
+Telemetry
+---------
+TTFT comes from streaming SSE (time to first content chunk — accurate).
+Total wall time from stream completion. Cached-tokens from
+``usage.prompt_tokens_details.cached_tokens`` if vLLM populates it; else 0.
 
 Quick start
 -----------
     # shell 1: start the server
-    kvboost-server --model Qwen/Qwen2.5-7B-Instruct-AWQ \\
-        --awq-streaming --streaming-mode full_resident \\
-        --max-batch-size 8 --max-queue-size 64
+    vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ \\
+        --enable-prefix-caching \\
+        --gpu-memory-utilization 0.85 \\
+        --max-model-len 4096 \\
+        --port 8001
 
     # shell 2: parallel replay
-    python run_kvboost_server.py --concurrency 8 --n-samples 500
+    python run_vllm_server.py --server-url http://localhost:8001 \\
+        --concurrency 8 --n-samples 500
 
 Methodology caveat
 ------------------
-The in-process variant resets the KV cache between conversations to measure
-the cold→warm climb. Server mode CANNOT reset (cache is shared across
-concurrent clients) — the numbers describe multi-tenant warm steady-state,
-not single-conversation cold-start. Recorded as
+Same as run_kvboost_server.py: prefix cache is shared across concurrent
+clients, so per-conversation cold-start is no longer measurable. The numbers
+describe multi-tenant warm steady-state. Recorded as
 ``reset_between_conversations=false`` in metadata.
 """
 
@@ -44,7 +48,6 @@ from typing import Dict, Optional
 
 import httpx
 
-import _common as common
 import _server_common as srv
 from _common import (
     ConvResult, TurnResult, add_common_args, capture_run_metadata,
@@ -56,34 +59,21 @@ RESULTS_DIR    = Path(__file__).resolve().parent / "results"
 CHECKPOINT_DIR = Path(__file__).resolve().parent / ".checkpoints"
 
 
-# ── KVBoost-specific telemetry parsing ──────────────────────────────────────
+# ── vLLM-specific telemetry ─────────────────────────────────────────────────
 
-def _parse_kvboost_headers(headers: Dict[str, str]) -> Dict[str, Optional[float]]:
-    """Pull ``X-KVBoost-*`` response headers (lowercased by httpx)."""
-    lc = {k.lower(): v for k, v in headers.items()}
-
-    def _num(name: str) -> Optional[float]:
-        v = lc.get(name.lower())
-        if v is None:
-            return None
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
-
-    return {
-        "ttft_ms":          _num("X-KVBoost-Ttft-Ms"),
-        "total_ms":         _num("X-KVBoost-Total-Ms"),
-        "prompt_tokens":    _num("X-KVBoost-Prompt-Tokens"),
-        "cached_tokens":    _num("X-KVBoost-Cached-Tokens"),
-        "generated_tokens": _num("X-KVBoost-Generated-Tokens"),
-        "kv_reuse_ratio":   _num("X-KVBoost-Kv-Reuse-Ratio"),
-    }
+def _vllm_cached_tokens(usage: Optional[dict]) -> int:
+    """vLLM populates ``usage.prompt_tokens_details.cached_tokens`` when
+    prefix caching is on. Older versions may use a flat ``cached_tokens``
+    field. Returns 0 if neither is present."""
+    if not usage:
+        return 0
+    details = usage.get("prompt_tokens_details") or {}
+    return int(details.get("cached_tokens") or usage.get("cached_tokens") or 0)
 
 
 # ── Per-conversation worker ─────────────────────────────────────────────────
 
-async def _process_conversation_kvboost(
+async def _process_conversation_vllm(
     *,
     conv: dict,
     client: httpx.AsyncClient,
@@ -116,57 +106,38 @@ async def _process_conversation_kvboost(
         prompt = history + f"Human: {turn['value']}\nAssistant:"
         history_tokens = count_tokens(prompt)
         turn_start_iso = datetime.now(timezone.utc).isoformat()
-        t_turn = time.perf_counter()
 
+        # vLLM accepts the OpenAI text-completion schema (single "prompt").
         body = {
-            "model":       model_name,
-            "prompts":     [prompt],
-            "max_tokens":  max_new_tokens,
-            "temperature": 0.0,
-            "do_sample":   False,
-            "stream":      False,
+            "model":         model_name,
+            "prompt":        prompt,
+            "max_tokens":    max_new_tokens,
+            "temperature":   0.0,
+            "stream_options": {"include_usage": True},
         }
 
         error_msg: Optional[str] = None
-        kv: Dict[str, Optional[float]] = {}
         output_text = ""
-        out_tok = 0
-        prompt_tokens = history_tokens
-        cached = 0
         ttft_ms = 0.0
         total_ms = 0.0
+        usage: Optional[dict] = None
 
         try:
-            resp, headers = await srv.post_with_retry(
+            output_text, ttft_ms, total_ms, _headers, usage = await srv.post_stream_with_retry(
                 client, completions_url, body,
                 max_retries=max_retries,
                 base_delay=base_delay,
                 max_delay=max_delay,
             )
-            kv = _parse_kvboost_headers(headers)
-            choices = resp.get("choices") or []
-            output_text = (choices[0].get("text") if choices else "") or ""
-
-            wall_total_ms = (time.perf_counter() - t_turn) * 1000.0
-            ttft_ms  = kv.get("ttft_ms")  if kv.get("ttft_ms")  is not None else wall_total_ms
-            total_ms = kv.get("total_ms") if kv.get("total_ms") is not None else wall_total_ms
-            usage    = resp.get("usage") or {}
-            out_tok  = int(kv.get("generated_tokens") or usage.get("completion_tokens") or 0)
-            prompt_tokens = int(kv.get("prompt_tokens") or usage.get("prompt_tokens") or history_tokens)
-            cached   = int(kv.get("cached_tokens") or 0)
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
             log.error("Conv %s turn %d failed: %s", conv_id, human_turn_idx, error_msg)
 
         if error_msg is not None:
             tr = TurnResult(
-                conv_id=conv_id,
-                turn_idx=human_turn_idx,
-                n_turns_total=n_human,
-                history_tokens=history_tokens,
-                prompt_tokens=history_tokens,
-                cached_tokens=0,
-                cache_hit_ratio=0.0,
+                conv_id=conv_id, turn_idx=human_turn_idx, n_turns_total=n_human,
+                history_tokens=history_tokens, prompt_tokens=history_tokens,
+                cached_tokens=0, cache_hit_ratio=0.0,
                 ttft_ms=0.0, total_ms=0.0, decode_ms=0.0,
                 output_tokens=0, itl_ms=0.0, decode_tps=0.0,
                 error=error_msg, stop_reason="error",
@@ -176,6 +147,9 @@ async def _process_conversation_kvboost(
             conv_result.error_count += 1
             break
 
+        cached = _vllm_cached_tokens(usage)
+        prompt_tokens = int((usage or {}).get("prompt_tokens") or history_tokens)
+        out_tok       = int((usage or {}).get("completion_tokens") or 0)
         decode_ms = max(total_ms - ttft_ms, 0.0)
         itl_ms = decode_ms / max(out_tok - 1, 1)
         decode_tps = (out_tok / (decode_ms / 1000.0)) if decode_ms > 0 else 0.0
@@ -201,8 +175,7 @@ async def _process_conversation_kvboost(
             output_text=output_text if save_output_text else None,
             turn_start_iso=turn_start_iso,
             backend_telemetry={
-                "kv_reuse_ratio_header": kv.get("kv_reuse_ratio"),
-                "wall_total_ms":         (time.perf_counter() - t_turn) * 1000.0,
+                "usage": usage,
             },
         )
         conv_result.turns.append(tr)
@@ -218,15 +191,14 @@ async def _process_conversation_kvboost(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="KVBoost server-mode 3-way ShareGPT runner (parallel)",
+        description="vLLM server-mode 3-way ShareGPT runner (parallel)",
     )
     add_common_args(parser)
-    parser.add_argument("--server-url", default="http://localhost:8000",
-                        help="kvboost-server base URL (default: http://localhost:8000)")
+    parser.add_argument("--server-url", default="http://localhost:8001",
+                        help="vllm serve base URL (default: http://localhost:8001)")
     parser.add_argument("--model", default=None,
                         help="Model id; default: GET /v1/models")
-    parser.add_argument("--concurrency", type=int, default=8,
-                        help="Conversations in flight at once (default: 8)")
+    parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--tokenizer", default=None,
                         help="HF tokenizer id (default: --model)")
     parser.add_argument("--max-retries", type=int, default=20)
@@ -236,7 +208,7 @@ def main():
     args = parser.parse_args()
 
     setup_logging(args.verbose, args.debug)
-    print(f"\n{'=' * 72}\n  KVBoost server-mode (parallel) — ShareGPT 3-way\n{'=' * 72}")
+    print(f"\n{'=' * 72}\n  vLLM server-mode (parallel) — ShareGPT 3-way\n{'=' * 72}")
     print(f"  server      = {args.server_url}")
     print(f"  concurrency = {args.concurrency}")
 
@@ -247,7 +219,7 @@ def main():
     print(f"  n_samples   = {args.n_samples}  turns={args.min_turns}-{args.max_turns}")
     print(f"{'=' * 72}\n")
 
-    out_path = Path(args.output) if args.output else RESULTS_DIR / "kvboost_server.json"
+    out_path = Path(args.output) if args.output else RESULTS_DIR / "vllm_server.json"
     if not args.no_checkpoint and is_run_complete(out_path, args.n_samples):
         print(f"[skip] {out_path} already covers {args.n_samples} conversations.")
         return
@@ -267,10 +239,10 @@ def main():
         sys.exit("No conversations after filtering.")
 
     ck_path = CHECKPOINT_DIR / (
-        f"kvboost_server_{checkpoint_key('kvboost_server', model_name, args.n_samples, args.max_turns)}.json"
+        f"vllm_server_{checkpoint_key('vllm_server', model_name, args.n_samples, args.max_turns)}.json"
     )
     meta = {
-        "backend":     "kvboost_server",
+        "backend":     "vllm_server",
         "model":       model_name,
         "server_url":  args.server_url,
         "concurrency": args.concurrency,
@@ -290,7 +262,7 @@ def main():
         "request_timeout":     args.request_timeout,
         "reset_between_conversations": False,
     }
-    run_metadata = capture_run_metadata("kvboost_server", config)
+    run_metadata = capture_run_metadata("vllm_server", config)
 
     def count_tokens(s: str) -> int:
         return len(tokenizer.encode(s, add_special_tokens=True))
@@ -299,7 +271,7 @@ def main():
 
     t0 = time.perf_counter()
     results = asyncio.run(srv.replay_parallel(
-        process_conv_fn=_process_conversation_kvboost,
+        process_conv_fn=_process_conversation_vllm,
         process_conv_kwargs=dict(
             completions_url=completions_url,
             model_name=model_name,
@@ -318,17 +290,17 @@ def main():
         no_checkpoint=args.no_checkpoint,
         progress_every=args.progress_every,
         request_timeout=args.request_timeout,
-        backend_label="kvboost_server",
+        backend_label="vllm_server",
     ))
     wall_s = time.perf_counter() - t0
     run_metadata.end_iso = datetime.now(timezone.utc).isoformat()
 
     metrics = compute_metrics(results, total_wall_s=wall_s)
-    print_summary("kvboost_server", metrics)
+    print_summary("vllm_server", metrics)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
-        "backend":      "kvboost_server",
+        "backend":      "vllm_server",
         "model":        model_name,
         "server_url":   args.server_url,
         "concurrency":  args.concurrency,
