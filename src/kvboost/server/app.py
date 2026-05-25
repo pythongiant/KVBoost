@@ -292,8 +292,15 @@ def build_app(
             and req.tool_choice != "none"
         )
         if tools_active:
+            # Build an allowlist of declared tool names — the parser uses it
+            # to drop calls naming hallucinated / unrelated functions, which
+            # also prevents misclassifying incidental ```json blocks as calls.
+            tool_names = {
+                t.function.name for t in (req.tools or [])
+                if t.function and t.function.name
+            }
             cleaned_text, parsed_calls = tool_parsers.parse(
-                result.output_text, _parser_name,
+                result.output_text, _parser_name, tool_names=tool_names,
             )
             parsed_calls = _filter_tool_choice(parsed_calls, req.tool_choice)
             if parsed_calls:
@@ -489,8 +496,16 @@ async def _stream_chat(
     tools_active = (
         auto_tools and bool(req.tools) and req.tool_choice != "none"
     )
+    stream_tool_names = (
+        {
+            t.function.name for t in (req.tools or [])
+            if t.function and t.function.name
+        }
+        if tools_active else None
+    )
     stream_parser = (
-        tool_parsers.make_streaming_parser(parser_name) if tools_active else None
+        tool_parsers.make_streaming_parser(parser_name, tool_names=stream_tool_names)
+        if tools_active else None
     )
     emitted_tool_calls = []  # list of ToolCall, used to set finish_reason
     tool_call_index = 0       # OpenAI delta indexing within this completion

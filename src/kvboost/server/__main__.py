@@ -198,9 +198,17 @@ def parse_args():
                         "the server forwards 'tools' to the chat template and parses "
                         "tool calls out of the model output using --tool-call-parser.")
     p.add_argument("--tool-call-parser", default="hermes",
-                   choices=["hermes"],
-                   help="Format used by the model to emit tool calls. "
-                        "'hermes' = <tool_call>{json}</tool_call> (Qwen2.5/3, Hermes 2/3).")
+                   choices=["hermes", "json_codeblock", "qwen3_coder",
+                            "llama", "mistral", "auto"],
+                   help="Format used by the model to emit tool calls.\n"
+                        "  hermes         = <tool_call>{json}</tool_call> (Qwen2.5/3, Hermes 2/3)\n"
+                        "  json_codeblock = ```json\\n{...}\\n``` (Qwen2.5-Coder agent, mixed-format models)\n"
+                        "  qwen3_coder    = <function=X><parameter=K>V</parameter> XML attr style\n"
+                        "  llama          = <|python_tag|>{json}<|eom_id|> (Llama 3.1/3.2/3.3)\n"
+                        "  mistral        = [TOOL_CALLS][...] prefix + JSON array\n"
+                        "  auto           = try each parser in order; first match wins.\n"
+                        "Recommended: 'auto' when serving mixed/unknown formats; pin to a specific one\n"
+                        "for the model you're serving.")
 
     # Pre-warm
     p.add_argument("--warm", default=None,
@@ -455,8 +463,9 @@ def main():
             max_retries=args.oom_max_retries,
         )
         log.info(
-            "OOM recovery enabled: max_retries=%d, streaming=%s",
-            args.oom_max_retries, args.awq_streaming,
+            "OOM recovery enabled: max_retries=%s, streaming=%s",
+            args.oom_max_retries if args.oom_max_retries is not None else "default",
+            args.awq_streaming,
         )
 
     worker = EngineWorker(
