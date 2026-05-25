@@ -184,10 +184,13 @@ def parse_args():
     p.add_argument("--no-oom-recovery", action="store_false", dest="oom_recovery",
                    help="Disable OOM recovery (originally-emitted CUDA OOM errors "
                         "will propagate to the client unchanged).")
-    p.add_argument("--oom-max-retries", type=int, default=2,
-                   help="Max OOM recovery attempts per request before giving up "
-                        "(default: 2). Mid-stream requests never retry; the knob "
-                        "still gets adjusted so the NEXT request benefits.")
+    p.add_argument("--oom-max-retries", type=int, default=None,
+                   help="Max OOM recovery attempts per request. Default: unbounded "
+                        "— recovery keeps shrinking knobs until the call succeeds "
+                        "or every knob hits its floor (capped at SAFETY_CAP=16 "
+                        "attempts as an absolute safety limit). Set to an integer "
+                        "to bound it tighter. Mid-stream requests never retry; the "
+                        "knob still gets adjusted so the NEXT request benefits.")
 
     # Tool / function calling
     p.add_argument("--enable-auto-tool-choice", action="store_true",
