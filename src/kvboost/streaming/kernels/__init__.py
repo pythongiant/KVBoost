@@ -134,7 +134,7 @@ def _torch_awq_linear(
     bias: Optional[torch.Tensor],
     group_size: int,
     *,
-    chunk_groups: int = 16,
+    chunk_groups: Optional[int] = None,
 ) -> torch.Tensor:
     """Fused dequant + matmul, chunked along input groups.
 
@@ -143,8 +143,12 @@ def _torch_awq_linear(
     group_size`` rows) at a time and accumulates into the output. Peak
     additional GPU memory per call is roughly
     ``chunk_groups * group_size * out_features * 2 bytes`` (e.g. for
-    ``chunk_groups=16, group_size=128, out_features=5120`` that's ~20 MB,
-    vs ~280 MB for the dense materialization).
+    ``chunk_groups=8, group_size=128, out_features=13824`` that's ~28 MB).
+
+    On a tight-VRAM box where Marlin / ExLlamaV2 failed to load and the
+    fallback is what you actually have, set ``KVBOOST_TORCH_AWQ_CHUNK_GROUPS``
+    (env) to 4 or even 2 to trade throughput for headroom. Default is 8,
+    which is a safer setting than the older 16 default on 12 GB cards.
 
     Mathematically equivalent (within fp16 rounding) to
     ``x @ awq_dequantize_reference(...) + bias``. Used by
@@ -152,6 +156,13 @@ def _torch_awq_linear(
     is the common case for larger models on small GPUs where the dense
     materialization would OOM.
     """
+    if chunk_groups is None:
+        import os
+        try:
+            chunk_groups = int(os.environ.get("KVBOOST_TORCH_AWQ_CHUNK_GROUPS", "8"))
+        except ValueError:
+            chunk_groups = 8
+        chunk_groups = max(1, chunk_groups)
     pack = 8
     in_features = qweight.shape[0]
     out_features = qweight.shape[1] * pack
