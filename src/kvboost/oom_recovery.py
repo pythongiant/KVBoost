@@ -9,11 +9,14 @@ the message), inspect *which* knob is the likely culprit and adjust it:
   * KV cache "low" → lower streaming residency (``keep_first_k`` /
     ``keep_last_k``). Layers drop out of VRAM, costing streaming overhead
     but unblocking the request.
+  * Cache nearly empty AND streaming disabled → lower ``prefill_chunk_size``
+    on the engine. Cuts peak prefill activation memory (the real culprit
+    for long prompts, where neither knob above can help).
 
-A repeated OOM with the *same* knob just adjusted flips to the other knob,
+A repeated OOM with the *same* knob just adjusted flips to the next knob,
 so a single persistent bottleneck still gets fully addressed. Each knob has
-a floor (``MIN_CACHE_BYTES`` / ``MIN_KEEP``); when both are exhausted the
-original exception re-raises.
+a floor (``MIN_CACHE_BYTES`` / ``MIN_KEEP`` / ``MIN_PREFILL_CHUNK``); when
+all are exhausted the original exception re-raises.
 
 This module is used by:
   * the kvboost inference server (``kvboost.server.engine_worker``)
@@ -45,20 +48,24 @@ class Diagnosis:
         once per request to avoid masking real OOMs.
       * ``"cache_dominant"`` — cache holds ≥ 1.5× tried-alloc; eviction will
         free more than the failed allocation needs.
+      * ``"prefill_bound"`` — cache holds < 0.5× tried-alloc AND streaming
+        can't help (disabled or exhausted); the OOM is prefill activation
+        memory, not KV cache. Lower ``prefill_chunk_size`` on the engine.
       * ``"residency_bound"`` — cache holds < 0.5× tried-alloc; cache can't
         plausibly close the gap, must lower streaming residency.
-      * ``"mixed"`` — neither knob is the obvious culprit; pick the one with
+      * ``"mixed"`` — no knob is the obvious culprit; pick the one with
         more remaining headroom (% from floor), cache wins ties (cheaper).
     """
 
     tier: str
-    action: str  # "empty_cache_only" | "lower_cache" | "lower_streaming"
+    action: str  # "empty_cache_only" | "lower_cache" | "lower_streaming" | "lower_prefill_chunk"
     reason: str
     parsed_oom: Dict[str, Optional[float]] = field(default_factory=dict)
     cache_used_mb: float = 0.0
     cache_budget_mb: float = 0.0
     cache_headroom_frac: float = 0.0
     stream_headroom_frac: float = 0.0
+    prefill_headroom_frac: float = 0.0
 
 
 # Regexes for torch's CUDA OOM message format. Defensive: any field that
@@ -126,8 +133,13 @@ class OOMRecovery:
 
     CACHE_SHRINK = 0.7
     STREAM_SHRINK = 0.5
+    PREFILL_SHRINK = 0.5
     MIN_CACHE_BYTES = int(2.5e8)   # 250 MB floor
     MIN_KEEP = 1                   # absolute floor — at least 1 resident layer each side
+    MIN_PREFILL_CHUNK = 32         # absolute floor for prefill chunk size
+    # Starting value when the engine was launched with prefill_chunk_size=0
+    # (single-shot prefill) and we need to enable chunking on first OOM.
+    INITIAL_PREFILL_CHUNK_ON_OOM = 2048
     SAFETY_CAP = 16                # absolute attempt cap to avoid pathological loops
 
     def __init__(
@@ -138,6 +150,7 @@ class OOMRecovery:
         initial_keep_first_k: Optional[int],
         initial_keep_last_k: Optional[int],
         streaming_enabled: bool,
+        initial_prefill_chunk_size: int = 0,
         max_retries: Optional[int] = None,
     ):
         """Initialise recovery state.
@@ -152,6 +165,7 @@ class OOMRecovery:
         self.keep_first_k = initial_keep_first_k
         self.keep_last_k = initial_keep_last_k
         self.streaming_enabled = streaming_enabled
+        self.prefill_chunk_size = int(initial_prefill_chunk_size)
         self.max_retries = max_retries
         self.events: List[Dict[str, Any]] = []
         # Lifetime counter (across all calls) for fragmentation diagnoses;
@@ -195,6 +209,16 @@ class OOMRecovery:
             return 0.0
         return (self.keep_first_k - self.MIN_KEEP) / self.keep_first_k
 
+    def _prefill_headroom_frac(self) -> float:
+        """How much room is left to shrink prefill chunk size. A current value
+        of 0 (single-shot prefill) counts as full headroom — we can switch to
+        ``INITIAL_PREFILL_CHUNK_ON_OOM`` on first OOM."""
+        if self.prefill_chunk_size == 0:
+            return 1.0
+        if self.prefill_chunk_size <= self.MIN_PREFILL_CHUNK:
+            return 0.0
+        return (self.prefill_chunk_size - self.MIN_PREFILL_CHUNK) / self.prefill_chunk_size
+
     # ── 4-tier diagnosis ──
     def _diagnose(self, err: BaseException, *, allow_fragmentation_tier: bool) -> Diagnosis:
         """Classify an OOM into one of four tiers and pick the cheapest action.
@@ -208,6 +232,7 @@ class OOMRecovery:
         cache_budget_mb = self.max_cache_bytes / (1024.0 ** 2)
         cache_h = self._cache_headroom_frac()
         stream_h = self._stream_headroom_frac()
+        prefill_h = self._prefill_headroom_frac()
 
         tried = parsed["tried_alloc_mb"]
         frag = parsed["reserved_unalloc_mb"]
@@ -230,25 +255,39 @@ class OOMRecovery:
                 cache_budget_mb=cache_budget_mb,
                 cache_headroom_frac=cache_h,
                 stream_headroom_frac=stream_h,
+                prefill_headroom_frac=prefill_h,
             )
 
         # ── No tried_alloc → fall back to a simple budget-fraction heuristic ──
-        # Old behaviour: if cache > HIGH_FRAC × budget, lower cache; else streaming.
+        # Cache-empty + parseless OOM = almost always prefill activation.
+        # Pick prefill_chunk first if it has headroom, then fall back to the
+        # legacy cache-fraction heuristic.
         if tried is None:
-            cache_dominant = cache_used_mb > 0.5 * cache_budget_mb
-            action = "lower_cache" if cache_dominant or not self.streaming_enabled else "lower_streaming"
+            cache_nearly_empty = cache_used_mb < 0.1 * max(cache_budget_mb, 1.0)
+            if cache_nearly_empty and prefill_h > 0:
+                action = "lower_prefill_chunk"
+                reason = (
+                    f"OOM message unparseable; cache is nearly empty "
+                    f"({cache_used_mb:.0f}/{cache_budget_mb:.0f} MiB) "
+                    f"→ lowering prefill chunk"
+                )
+            else:
+                cache_dominant = cache_used_mb > 0.5 * cache_budget_mb
+                action = "lower_cache" if cache_dominant or not self.streaming_enabled else "lower_streaming"
+                reason = (
+                    f"OOM message unparseable; legacy heuristic: cache_used "
+                    f"{cache_used_mb:.0f}/{cache_budget_mb:.0f} MiB → {action}"
+                )
             return Diagnosis(
                 tier="mixed",
                 action=action,
-                reason=(
-                    f"OOM message unparseable; legacy heuristic: cache_used "
-                    f"{cache_used_mb:.0f}/{cache_budget_mb:.0f} MiB → {action}"
-                ),
+                reason=reason,
                 parsed_oom=parsed,
                 cache_used_mb=cache_used_mb,
                 cache_budget_mb=cache_budget_mb,
                 cache_headroom_frac=cache_h,
                 stream_headroom_frac=stream_h,
+                prefill_headroom_frac=prefill_h,
             )
 
         # ── Tier 2: Cache dominant ──
@@ -266,9 +305,33 @@ class OOMRecovery:
                 cache_budget_mb=cache_budget_mb,
                 cache_headroom_frac=cache_h,
                 stream_headroom_frac=stream_h,
+                prefill_headroom_frac=prefill_h,
             )
 
-        # ── Tier 3: Residency bound ──
+        # ── Tier 3a: Prefill bound (cache can't help; streaming can't either) ──
+        # cache_used << tried and either streaming is disabled or already at
+        # its floor → the OOM is almost certainly prefill activation memory.
+        # Lower prefill_chunk_size on the engine to cap peak per-step memory.
+        if (cache_used_mb < self.TIER_RESIDENCY_BOUND * tried
+                and prefill_h > 0
+                and (not self.streaming_enabled or stream_h <= 0.0)):
+            return Diagnosis(
+                tier="prefill_bound",
+                action="lower_prefill_chunk",
+                reason=(
+                    f"cache_used {cache_used_mb:.0f} MiB << tried-alloc "
+                    f"{tried:.0f} MiB and streaming can't help — OOM is "
+                    f"prefill activation, lowering chunk size"
+                ),
+                parsed_oom=parsed,
+                cache_used_mb=cache_used_mb,
+                cache_budget_mb=cache_budget_mb,
+                cache_headroom_frac=cache_h,
+                stream_headroom_frac=stream_h,
+                prefill_headroom_frac=prefill_h,
+            )
+
+        # ── Tier 3b: Residency bound ──
         if cache_used_mb < self.TIER_RESIDENCY_BOUND * tried and self.streaming_enabled:
             return Diagnosis(
                 tier="residency_bound",
@@ -283,25 +346,29 @@ class OOMRecovery:
                 cache_budget_mb=cache_budget_mb,
                 cache_headroom_frac=cache_h,
                 stream_headroom_frac=stream_h,
+                prefill_headroom_frac=prefill_h,
             )
 
         # ── Tier 4: Mixed ──
-        # Cache wins ties because eviction is cheaper (and stream headroom is
-        # -1.0 when streaming is off, so cache also wins by default there).
-        action = "lower_streaming" if stream_h > cache_h else "lower_cache"
+        # Highest remaining headroom wins; cache breaks ties (cheapest).
+        candidates = [("lower_cache", cache_h), ("lower_streaming", stream_h),
+                      ("lower_prefill_chunk", prefill_h)]
+        action = max(candidates, key=lambda kv: kv[1])[0]
         return Diagnosis(
             tier="mixed",
             action=action,
             reason=(
                 f"ambiguous (cache_used {cache_used_mb:.0f} MiB ≈ tried "
                 f"{tried:.0f} MiB): cache_headroom={cache_h:.0%}, "
-                f"stream_headroom={stream_h:.0%} → {action}"
+                f"stream_headroom={stream_h:.0%}, "
+                f"prefill_headroom={prefill_h:.0%} → {action}"
             ),
             parsed_oom=parsed,
             cache_used_mb=cache_used_mb,
             cache_budget_mb=cache_budget_mb,
             cache_headroom_frac=cache_h,
             stream_headroom_frac=stream_h,
+            prefill_headroom_frac=prefill_h,
         )
 
     # ── Knob adjusters ──
@@ -388,6 +455,31 @@ class OOMRecovery:
             "old_keep_last_k": old_last,
             "keep_first_k": new_first,
             "keep_last_k": new_last,
+        }
+
+    def _lower_prefill_chunk(self) -> Optional[Dict[str, Any]]:
+        """Reduce engine.prefill_chunk_size to cap peak prefill activation
+        memory. From 0 (single-shot) we jump to ``INITIAL_PREFILL_CHUNK_ON_OOM``;
+        otherwise we halve down to ``MIN_PREFILL_CHUNK``. Returns None when the
+        engine doesn't expose the knob or we've hit the floor."""
+        if not hasattr(self.engine, "prefill_chunk_size"):
+            return None
+        old = self.prefill_chunk_size
+        if old == 0:
+            new = self.INITIAL_PREFILL_CHUNK_ON_OOM
+        else:
+            new = max(self.MIN_PREFILL_CHUNK, int(old * self.PREFILL_SHRINK))
+            if new >= old:
+                return None
+        try:
+            self.engine.prefill_chunk_size = new
+        except Exception:
+            return None
+        self.prefill_chunk_size = new
+        return {
+            "action": "lower_prefill_chunk",
+            "old_prefill_chunk_size": old,
+            "new_prefill_chunk_size": new,
         }
 
     # ── Driver ──
@@ -527,32 +619,45 @@ class OOMRecovery:
         # ── Tiers 2-4: knob change ──
         # For cache-action tiers, _lower_cache calls cm.clear() itself, so we
         # don't pre-emptively reset_cache (that would lose chunks before the
-        # knob even applies). For residency tiers, we keep the cache intact —
-        # losing it doesn't help residency pressure and gives up valuable reuse.
+        # knob even applies). For residency / prefill tiers, we keep the cache
+        # intact — losing it doesn't help and gives up valuable reuse.
+        knobs = {
+            "lower_cache": self._lower_cache,
+            "lower_streaming": self._lower_streaming,
+            "lower_prefill_chunk": self._lower_prefill_chunk,
+        }
         primary_name = dx.action
-        secondary_name = "lower_streaming" if primary_name == "lower_cache" else "lower_cache"
-        primary = self._lower_cache if primary_name == "lower_cache" else self._lower_streaming
-        secondary = self._lower_streaming if primary_name == "lower_cache" else self._lower_cache
+        # Fallback order: try the diagnosed knob first, then the others in a
+        # fixed order (cache → prefill → streaming). Prefill before streaming
+        # because most cache-empty OOMs are prefill activations, not weights.
+        fallback_chain = [primary_name] + [
+            k for k in ("lower_cache", "lower_prefill_chunk", "lower_streaming")
+            if k != primary_name
+        ]
 
-        change = primary()
-        flipped = False
-        if change is None:
-            log.warning(
-                "OOM recovery: diagnosed action '%s' unavailable (floor reached or disabled); "
-                "falling back to '%s'.",
-                primary_name, secondary_name,
-            )
-            change = secondary()
-            flipped = True
+        change = None
+        flipped_to = None
+        for i, knob_name in enumerate(fallback_chain):
+            change = knobs[knob_name]()
+            if change is not None:
+                if i > 0:
+                    flipped_to = knob_name
+                    log.warning(
+                        "OOM recovery: diagnosed action '%s' unavailable; "
+                        "falling back to '%s'.",
+                        primary_name, knob_name,
+                    )
+                break
 
         if change is None:
             log.error(
                 "OOM recovery EXHAUSTED at attempt %d (tier=%s): "
-                "cache=%.2f GB (floor=%.2f GB), keep=%s/%s (floor=%d). "
-                "Re-raising original CUDA OOM.",
+                "cache=%.2f GB (floor=%.2f GB), keep=%s/%s (floor=%d), "
+                "prefill_chunk=%d (floor=%d). Re-raising original CUDA OOM.",
                 attempt_idx, dx.tier,
                 self.max_cache_bytes / 1e9, self.MIN_CACHE_BYTES / 1e9,
                 self.keep_first_k, self.keep_last_k, self.MIN_KEEP,
+                self.prefill_chunk_size, self.MIN_PREFILL_CHUNK,
             )
             return None
 
@@ -565,31 +670,39 @@ class OOMRecovery:
         change["cache_budget_mb"] = dx.cache_budget_mb
         change["cache_headroom_frac"] = dx.cache_headroom_frac
         change["stream_headroom_frac"] = dx.stream_headroom_frac
-        change["flipped_to_secondary"] = flipped
+        change["prefill_headroom_frac"] = dx.prefill_headroom_frac
+        change["flipped_to_secondary"] = flipped_to is not None
+        if flipped_to is not None:
+            change["flipped_to"] = flipped_to
         self.events.append(change)
 
-        if change["action"] == "lower_cache":
+        action = change["action"]
+        if action == "lower_cache":
             summary = (
                 f"lower_cache: max_cache_bytes "
                 f"{change['old_max_cache_bytes'] / 1e9:.2f} GB → "
                 f"{change['new_max_cache_bytes'] / 1e9:.2f} GB"
             )
-            change["summary"] = summary
-            log.warning(
-                "OOM recovery → %s (×%.2f, tier=%s, attempt=%d). Will retry.",
-                summary, self.CACHE_SHRINK, dx.tier, attempt_idx,
-            )
-        else:
+            shrink = self.CACHE_SHRINK
+        elif action == "lower_streaming":
             summary = (
                 f"lower_streaming: keep_first_k {change['old_keep_first_k']}→"
                 f"{change['keep_first_k']}, keep_last_k "
                 f"{change['old_keep_last_k'] or 0}→{change['keep_last_k']}"
             )
-            change["summary"] = summary
-            log.warning(
-                "OOM recovery → %s (×%.2f, tier=%s, attempt=%d). Will retry.",
-                summary, self.STREAM_SHRINK, dx.tier, attempt_idx,
+            shrink = self.STREAM_SHRINK
+        else:  # lower_prefill_chunk
+            summary = (
+                f"lower_prefill_chunk: prefill_chunk_size "
+                f"{change['old_prefill_chunk_size']} → "
+                f"{change['new_prefill_chunk_size']}"
             )
+            shrink = self.PREFILL_SHRINK
+        change["summary"] = summary
+        log.warning(
+            "OOM recovery → %s (×%.2f, tier=%s, attempt=%d). Will retry.",
+            summary, shrink, dx.tier, attempt_idx,
+        )
         return change
 
     def snapshot(self) -> Dict[str, Any]:
@@ -600,5 +713,6 @@ class OOMRecovery:
             "max_cache_bytes": self.max_cache_bytes,
             "keep_first_k": self.keep_first_k,
             "keep_last_k": self.keep_last_k,
+            "prefill_chunk_size": self.prefill_chunk_size,
             "events": list(self.events),
         }

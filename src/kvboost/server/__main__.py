@@ -460,6 +460,7 @@ def main():
             initial_keep_first_k=args.keep_first_k if args.awq_streaming else None,
             initial_keep_last_k=args.keep_last_k if args.awq_streaming else None,
             streaming_enabled=args.awq_streaming,
+            initial_prefill_chunk_size=args.prefill_chunk_size,
             max_retries=args.oom_max_retries,
         )
         log.info(
