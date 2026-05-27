@@ -158,6 +158,7 @@ class OOMRecovery:
         streaming_enabled: bool,
         initial_prefill_chunk_size: int = 0,
         max_retries: Optional[int] = None,
+        cost_coefficients: Optional["Any"] = None,
     ):
         """Initialise recovery state.
 
@@ -173,6 +174,7 @@ class OOMRecovery:
         self.streaming_enabled = streaming_enabled
         self.prefill_chunk_size = int(initial_prefill_chunk_size)
         self.max_retries = max_retries
+        self.cost_coefficients = cost_coefficients
         self.events: List[Dict[str, Any]] = []
         # Lifetime counter (across all calls) for fragmentation diagnoses;
         # the once-per-request gate lives inside attempt() itself.
@@ -243,10 +245,10 @@ class OOMRecovery:
         tried = parsed["tried_alloc_mb"]
         frag = parsed["reserved_unalloc_mb"]
 
-        # ── Tier 1: Fragmentation ──
-        # Only fire when the message is parseable AND the caller hasn't used
-        # this tier on this request yet. Repeated "fragmentation" diagnoses
-        # would mask a real residency/cache OOM.
+        # ── Fragmentation pre-check (always first; free fix) ──
+        # Whether scoring is enabled or not, fragmentation should be tried
+        # before any knob change — empty_cache() costs nothing and unblocks
+        # a real class of OOMs without losing chunk reuse / changing knobs.
         if (allow_fragmentation_tier and tried is not None and frag is not None
                 and frag >= tried):
             return Diagnosis(
@@ -263,6 +265,42 @@ class OOMRecovery:
                 stream_headroom_frac=stream_h,
                 prefill_headroom_frac=prefill_h,
             )
+
+        # ── Scoring path (used when cost coefficients were probed at startup) ──
+        # Pick the knob with the highest `freed_bytes / wall_time_cost` score,
+        # subject to "can close the OOM gap alone" (a knob whose freed_bytes <
+        # tried_alloc is downweighted but not eliminated — it can still help
+        # combined with later attempts). This replaces the tier ladder when
+        # coefficients are available, since the ladder is a coarse
+        # approximation to what scoring computes exactly.
+        if self.cost_coefficients is not None:
+            scores = self._score_all_knobs(tried)
+            best = max(scores, key=scores.get)
+            best_score = scores[best]
+            score_str = ", ".join(
+                f"{k}={'-inf' if v == float('-inf') else f'{v:.1f}'}"
+                for k, v in scores.items()
+            )
+            if best_score == float("-inf"):
+                # Every knob said "can't help" — fall through to legacy ladder
+                # so callers still get a Diagnosis (will return action whose
+                # knob_fn will return None → recovery exhausted).
+                log.warning(
+                    "OOM scoring: all knobs unable to help (scores: %s); "
+                    "falling through to legacy diagnosis", score_str,
+                )
+            else:
+                return Diagnosis(
+                    tier="scored",
+                    action=best,
+                    reason=f"scored: {score_str} → {best}",
+                    parsed_oom=parsed,
+                    cache_used_mb=cache_used_mb,
+                    cache_budget_mb=cache_budget_mb,
+                    cache_headroom_frac=cache_h,
+                    stream_headroom_frac=stream_h,
+                    prefill_headroom_frac=prefill_h,
+                )
 
         # ── No tried_alloc → fall back to a simple budget-fraction heuristic ──
         # Cache-empty + parseless OOM = almost always prefill activation.
@@ -589,6 +627,114 @@ class OOMRecovery:
 
         assert last_err is not None
         raise last_err
+
+    # ── Scoring (used when cost_coefficients is provided) ──
+    def _freed_bytes_mb(self, knob: str, tried_mb: Optional[float]) -> float:
+        """Closed-form estimate of MiB freed by one shrink step on this knob.
+
+        These numbers are STRUCTURAL — they encode what kind of memory each
+        knob can free, not just how many bytes nominally. E.g. halving
+        prefill chunk size halves activation memory only; it doesn't touch
+        KV cache. When the OOM is cache pressure, prefill chunking returns
+        ~0 freed bytes by design — the scoring framework then correctly
+        deprioritizes it.
+        """
+        cache_used_mb = self._cache_bytes_used() / (1024.0 ** 2)
+
+        if knob == "lower_cache":
+            return cache_used_mb
+
+        if knob == "lower_prefill_chunk":
+            # Prefill chunking ONLY addresses activation-bound OOMs. If the
+            # cache is the dominant memory consumer (cache_used >> tried),
+            # the OOM is cache pressure and halving the chunk does nothing
+            # useful. Signal effective_freed = 0 in that case so scoring
+            # never picks this knob for cache-bound OOMs.
+            if tried_mb is not None and cache_used_mb >= 1.5 * tried_mb:
+                return 0.0
+            if tried_mb is None:
+                return 256.0   # rough fallback
+            return tried_mb * 0.5
+
+        if knob == "lower_streaming":
+            # Streaming residency reduction frees model-weight memory.
+            # Always physically frees bytes, regardless of OOM class.
+            if not self.streaming_enabled or self.cost_coefficients is None:
+                return 0.0
+            old = self.keep_first_k or 0
+            new = max(self.MIN_KEEP, int(old * self.STREAM_SHRINK))
+            delta = max(0, old - new) * 2  # halve both ends → 2× delta
+            return delta * self.cost_coefficients.per_layer_mb
+
+        return 0.0
+
+    def _cost_seconds(self, knob: str, tried_mb: Optional[float]) -> float:
+        """Wall-time cost of one shrink step on this knob, in seconds.
+        Returns inf when the knob can't apply (at floor, disabled, etc.)."""
+        cc = self.cost_coefficients
+        if cc is None:
+            return 1.0   # equal-cost fallback (never reached: scoring is gated on cc)
+
+        if knob == "lower_cache":
+            evict_mb = self._cache_bytes_used() / (1024.0 ** 2)
+            if evict_mb <= 0:
+                return float("inf")
+            return cc.cost_lower_cache(evict_mb)
+
+        if knob == "lower_prefill_chunk":
+            if not hasattr(self.engine, "prefill_chunk_size"):
+                return float("inf")
+            old = self.prefill_chunk_size
+            if old == 0:
+                new = self.INITIAL_PREFILL_CHUNK_ON_OOM
+            else:
+                new = max(self.MIN_PREFILL_CHUNK, int(old * self.PREFILL_SHRINK))
+                if new >= old:
+                    return float("inf")
+            # Don't know exact prompt length here — let cost function use its default.
+            return cc.cost_lower_prefill_chunk(old or self.INITIAL_PREFILL_CHUNK_ON_OOM, new)
+
+        if knob == "lower_streaming":
+            if not self.streaming_enabled or not self.keep_first_k:
+                return float("inf")
+            old = self.keep_first_k
+            new = max(self.MIN_KEEP, int(old * self.STREAM_SHRINK))
+            if new >= old:
+                return float("inf")
+            delta_layers = (old - new) * 2  # both ends shrink
+            return cc.cost_lower_streaming(delta_layers)
+
+        return float("inf")
+
+    def _score_all_knobs(self, tried_mb: Optional[float]) -> Dict[str, float]:
+        """Return ``{knob: freed_bytes_mb / cost_seconds}`` for all knobs.
+
+        Higher is better. ``-inf`` means the knob can't help — either it
+        physically can't free bytes for this class of OOM (e.g. prefill
+        chunking when the cache is dominant), or it's at its floor.
+
+        Note: we use pure efficiency (``freed / cost``), NOT "prefer
+        knobs that fully close the gap in one step." A cheap iterative
+        knob is usually better than an expensive single-shot knob —
+        e.g. two halvings of prefill chunk (cost ~0.1 s) beat one
+        streaming-residency cut (cost ~50 s of decode tax) even if the
+        first halving alone doesn't fully resolve the OOM. The
+        structural check inside ``_freed_bytes_mb`` already prevents
+        prefill chunking from being picked for cache-bound OOMs, so
+        cache_dominant scenarios still correctly pick ``lower_cache``.
+        """
+        scores: Dict[str, float] = {}
+        for knob in ("lower_cache", "lower_prefill_chunk", "lower_streaming"):
+            cost = self._cost_seconds(knob, tried_mb)
+            if cost == float("inf") or cost <= 0:
+                scores[knob] = float("-inf")
+                continue
+            freed = self._freed_bytes_mb(knob, tried_mb)
+            if freed <= 0:
+                scores[knob] = float("-inf")
+                continue
+            scores[knob] = freed / cost
+        return scores
 
     def _mixed_candidates(self, dx: Diagnosis) -> List[str]:
         """For the ``mixed`` tier, return knob names ordered by headroom,

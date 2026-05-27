@@ -465,6 +465,21 @@ def main():
     oom_recovery = None
     if args.oom_recovery:
         from ..oom_recovery import OOMRecovery
+        from ..cost_model import probe_cost_coefficients
+
+        # Probe once at startup: VRAM, per-layer bytes, PCIe & HBM bandwidth.
+        # Used to score recovery actions in seconds rather than via a tier
+        # ladder. Bounded probe time (~2 s); falls back to defaults on
+        # non-CUDA devices or if any individual probe fails.
+        try:
+            cost_coefficients = probe_cost_coefficients(engine)
+        except Exception as e:
+            log.warning(
+                "Cost-coefficient probe failed (%s); OOM recovery will use "
+                "the legacy tier ladder.", e,
+            )
+            cost_coefficients = None
+
         oom_recovery = OOMRecovery(
             engine,
             initial_max_cache_bytes=int(args.max_cache_bytes),
@@ -473,11 +488,13 @@ def main():
             streaming_enabled=args.awq_streaming,
             initial_prefill_chunk_size=args.prefill_chunk_size,
             max_retries=args.oom_max_retries,
+            cost_coefficients=cost_coefficients,
         )
         log.info(
-            "OOM recovery enabled: max_retries=%s, streaming=%s",
+            "OOM recovery enabled: max_retries=%s, streaming=%s, scoring=%s",
             args.oom_max_retries if args.oom_max_retries is not None else "default",
             args.awq_streaming,
+            "on" if cost_coefficients is not None else "off (legacy ladder)",
         )
 
     worker = EngineWorker(
