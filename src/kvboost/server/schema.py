@@ -37,7 +37,7 @@ def _request_id() -> str:
 class CompletionRequest(BaseModel):
     model: str
     prompt: Union[str, List[str]]
-    max_tokens: int = Field(default=128, ge=1, le=8192)
+    max_tokens: int = Field(default=4096, ge=1, le=131072)
     temperature: float = Field(default=1.0, ge=0.0, le=2.0)
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
     n: int = Field(default=1, ge=1, le=16)
@@ -151,7 +151,7 @@ class Tool(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
-    max_tokens: int = Field(default=128, ge=1, le=32768)
+    max_tokens: int = Field(default=4096, ge=1, le=131072)
     temperature: float = Field(default=1.0, ge=0.0, le=2.0)
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
     n: int = Field(default=1, ge=1, le=16)
