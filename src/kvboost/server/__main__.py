@@ -192,6 +192,17 @@ def parse_args():
                         "to bound it tighter. Mid-stream requests never retry; the "
                         "knob still gets adjusted so the NEXT request benefits.")
 
+    # Server-side max_tokens cap. Schema-level cap is 131072 (Qwen3-YaRN
+    # ceiling) but real-world VRAM rarely supports that. This flag is the
+    # operator's say-so: any incoming request's max_tokens is clamped down
+    # to this value before reaching the engine. Set to a value that fits
+    # comfortably in your KV-cache budget at int8.
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="Server-side ceiling on request max_tokens (1..131072). "
+                        "Incoming requests with higher values are clamped down. "
+                        "Default: no clamp (schema default of 4096 still applies "
+                        "when the client doesn't send max_tokens).")
+
     # Tool / function calling
     p.add_argument("--enable-auto-tool-choice", action="store_true",
                    help="Enable OpenAI-compatible tool/function calling. When set, "
@@ -480,11 +491,19 @@ def main():
         oom_recovery=oom_recovery,
     )
 
+    if args.max_tokens is not None:
+        if not (1 <= args.max_tokens <= 131072):
+            raise SystemExit(
+                f"ERROR: --max-tokens must be in [1, 131072], got {args.max_tokens}"
+            )
+        log.info("Server-side max_tokens cap: %d", args.max_tokens)
+
     app = build_app(
         worker,
         model_name=args.model_name or args.model,
         enable_auto_tool_choice=args.enable_auto_tool_choice,
         tool_call_parser=args.tool_call_parser,
+        max_tokens_cap=args.max_tokens,
     )
 
     # Pre-warm synchronously before accepting requests

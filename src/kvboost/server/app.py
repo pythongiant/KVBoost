@@ -97,6 +97,7 @@ def build_app(
     model_name: Optional[str] = None,
     enable_auto_tool_choice: bool = False,
     tool_call_parser: str = "hermes",
+    max_tokens_cap: Optional[int] = None,
 ) -> FastAPI:
     """
     Construct and return the FastAPI application.
@@ -108,10 +109,29 @@ def build_app(
     enable_auto_tool_choice  : if True, parse model output for tool calls when
                                the request includes `tools`
     tool_call_parser         : parser name (see tool_parsers.PARSERS)
+    max_tokens_cap           : if set, clamp each request's ``max_tokens`` down
+                               to this value before dispatching to the engine.
+                               Independent of the schema-level cap (131072) so
+                               the operator can pick a safe ceiling for the
+                               actual VRAM/KV-cache budget on this server.
     """
     _model_name = model_name or worker._model_name
     _auto_tools = enable_auto_tool_choice
     _parser_name = tool_call_parser
+    _max_tokens_cap = max_tokens_cap
+
+    def _clamp_max_tokens(req) -> None:
+        """Mutate ``req.max_tokens`` down to ``_max_tokens_cap`` if set.
+        Logs once per clamp so operators can see when clients are asking for
+        more than this server will serve."""
+        if _max_tokens_cap is None:
+            return
+        if req.max_tokens > _max_tokens_cap:
+            io_log.info(
+                "max_tokens clamped: %d → %d (server cap)",
+                req.max_tokens, _max_tokens_cap,
+            )
+            req.max_tokens = _max_tokens_cap
 
     app = FastAPI(
         title="KVBoost Inference Server",
@@ -198,6 +218,7 @@ def build_app(
     @app.post("/v1/completions", tags=["completions"])
     async def completions(req: CompletionRequest, response: Response):
         _validate_model(req.model, _model_name)
+        _clamp_max_tokens(req)
 
         io_log.info(
             "COMPLETIONS in: model=%s n_prompts=%d max_tokens=%d temp=%s stream=%s",
@@ -248,6 +269,7 @@ def build_app(
     @app.post("/v1/chat/completions", tags=["chat"])
     async def chat_completions(req: ChatCompletionRequest, response: Response):
         _validate_model(req.model, _model_name)
+        _clamp_max_tokens(req)
 
         prompt = req.to_prompt(worker.engine.tokenizer)
 
