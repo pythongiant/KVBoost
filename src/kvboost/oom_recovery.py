@@ -13,10 +13,16 @@ the message), inspect *which* knob is the likely culprit and adjust it:
     on the engine. Cuts peak prefill activation memory (the real culprit
     for long prompts, where neither knob above can help).
 
-A repeated OOM with the *same* knob just adjusted flips to the next knob,
-so a single persistent bottleneck still gets fully addressed. Each knob has
-a floor (``MIN_CACHE_BYTES`` / ``MIN_KEEP`` / ``MIN_PREFILL_CHUNK``); when
-all are exhausted the original exception re-raises.
+Each tier is authoritative: cache-dominant OOMs touch *only* the cache,
+prefill-bound OOMs touch *only* prefill_chunk_size, residency-bound OOMs
+touch *only* streaming residency. Falling back to a different knob would
+damage unrelated state (e.g. dropping KV reuse when the real problem was
+prompt length) without addressing the cause. The only tier with cross-knob
+fallback is ``mixed`` — by definition genuinely ambiguous — and even there
+candidates are filtered to those that can plausibly help. A repeated OOM
+gets a fresh diagnosis, so a shifting bottleneck still ends up at the
+right knob across attempts. When the diagnosed knob is at its floor, the
+original exception re-raises.
 
 This module is used by:
   * the kvboost inference server (``kvboost.server.engine_worker``)
@@ -376,29 +382,46 @@ class OOMRecovery:
     # decrease is possible (clamped at floor, or initial value was already
     # below the floor) is the signal to the caller that this knob is exhausted.
     def _lower_cache(self) -> Optional[Dict[str, Any]]:
-        old_bytes = self.max_cache_bytes
-        # Apply shrink, then clamp UP to the floor so we never go below it,
-        # then require strict decrease relative to old (which prevents the
-        # floor clamp from ever raising the value).
-        new_bytes = max(self.MIN_CACHE_BYTES, int(old_bytes * self.CACHE_SHRINK))
-        if new_bytes >= old_bytes:
-            return None
+        """Free KV cache memory. The freeing happens via ``cm.clear()``;
+        lowering the budget is just a prophylactic so it doesn't refill to
+        the same level on the next request.
+
+        Returns None when this knob can't help — either the budget is at
+        floor AND the cache is empty (nothing to clear, no room to shrink),
+        or ``cm.clear()`` is unavailable. When the budget is at floor but
+        the cache is still populated, we still evict (budget unchanged).
+        """
         cm = self.engine.cache_manager
-        for attr in ("max_cache_bytes", "_max_cache_bytes", "max_bytes"):
-            if hasattr(cm, attr):
-                try:
-                    setattr(cm, attr, new_bytes)
-                except Exception:
-                    pass
-        self.max_cache_bytes = new_bytes
-        try:
-            cm.clear()
-        except Exception:
-            pass
+        old_bytes = self.max_cache_bytes
+        new_bytes = max(self.MIN_CACHE_BYTES, int(old_bytes * self.CACHE_SHRINK))
+        cache_used = self._cache_bytes_used()
+
+        budget_can_shrink = new_bytes < old_bytes
+        evict_can_help = cache_used > 0
+
+        if not budget_can_shrink and not evict_can_help:
+            return None
+
+        if budget_can_shrink:
+            for attr in ("max_cache_bytes", "_max_cache_bytes", "max_bytes"):
+                if hasattr(cm, attr):
+                    try:
+                        setattr(cm, attr, new_bytes)
+                    except Exception:
+                        pass
+            self.max_cache_bytes = new_bytes
+
+        if evict_can_help:
+            try:
+                cm.clear()
+            except Exception:
+                pass
+
         return {
             "action": "lower_cache",
             "old_max_cache_bytes": old_bytes,
-            "new_max_cache_bytes": new_bytes,
+            "new_max_cache_bytes": self.max_cache_bytes,
+            "evicted_bytes": cache_used if evict_can_help else 0,
         }
 
     def _lower_streaming(self) -> Optional[Dict[str, Any]]:
@@ -492,16 +515,17 @@ class OOMRecovery:
     ) -> Any:
         """Call ``fn(*args, **kwargs)`` with OOM-aware retry.
 
-        On every OOM we run ``_diagnose(err)`` to pick one of four tiers,
-        then ``_apply_diagnosis(...)`` to execute it. Tier 1 (fragmentation)
-        is allowed at most once per request — repeated "fragmentation"
-        diagnoses would mask a real residency/cache OOM. Tiers 2-4 each
-        shrink a knob (or skip when both are exhausted).
+        On every OOM we run ``_diagnose(err)`` to pick a tier, then
+        ``_apply_diagnosis(...)`` to execute it. Tier 1 (fragmentation) is
+        allowed at most once per request — repeated "fragmentation"
+        diagnoses would mask a real OOM. Non-``mixed`` tiers each touch a
+        single specific knob (no cross-knob fallback); ``mixed`` tries
+        candidates filtered by "can plausibly help" in headroom order.
 
         Loop terminates when:
           * ``fn`` returns normally
-          * Both knobs hit floor AND fragmentation has been used (no remaining
-            recovery action)
+          * The diagnosed knob is at its floor (or, in ``mixed``, every
+            plausibly-helpful knob is exhausted) — re-raise.
           * ``can_retry()`` returns False (mid-stream after partial output) —
             the knob still gets adjusted for the next request, then re-raise.
           * The safety cap is reached.
@@ -539,15 +563,8 @@ class OOMRecovery:
 
             change = self._apply_diagnosis(diagnosis, attempt_idx)
             if change is None:
-                # All recovery paths exhausted (knobs at floor, fragmentation already used).
-                log.error(
-                    "OOM recovery cannot reduce further: cache=%.2f GB (floor=%.2f GB), "
-                    "keep_first_k=%s keep_last_k=%s (floor=%d), fragmentation_used=%s. "
-                    "Re-raising.",
-                    self.max_cache_bytes / 1e9, self.MIN_CACHE_BYTES / 1e9,
-                    self.keep_first_k, self.keep_last_k, self.MIN_KEEP,
-                    fragmentation_used,
-                )
+                # Diagnosed knob (or every plausibly-helpful knob in `mixed`)
+                # is at floor. _apply_diagnosis already logged the details.
                 break
             oom_events.append(change)
 
@@ -572,6 +589,41 @@ class OOMRecovery:
 
         assert last_err is not None
         raise last_err
+
+    def _mixed_candidates(self, dx: Diagnosis) -> List[str]:
+        """For the ``mixed`` tier, return knob names ordered by headroom,
+        keeping only knobs that can plausibly help this OOM.
+
+        Filter rules:
+          * ``lower_cache`` — kept only when eviction would free at least the
+            failed allocation. ``cm.clear()`` drops at most ``cache_used_mb``;
+            if that's already less than ``tried_alloc_mb``, the OOM persists
+            after the clear, so the knob is provably insufficient. When
+            ``tried`` is unknown, fall back to a 50 MiB absolute threshold.
+          * ``lower_prefill_chunk`` — kept whenever there's any room to shrink
+            (``prefill_headroom > 0``).
+          * ``lower_streaming`` — kept whenever streaming is enabled and has
+            residency headroom (``stream_headroom > 0``).
+
+        The result is sorted by headroom descending; ties break in the order
+        cache → prefill → streaming (cheapest first).
+        """
+        tried = dx.parsed_oom.get("tried_alloc_mb")
+        cache_can_help = (
+            dx.cache_used_mb >= tried if tried is not None
+            else dx.cache_used_mb >= 50.0
+        )
+
+        candidates: List[tuple] = []
+        if cache_can_help:
+            candidates.append(("lower_cache", dx.cache_headroom_frac, 0))
+        if dx.prefill_headroom_frac > 0:
+            candidates.append(("lower_prefill_chunk", dx.prefill_headroom_frac, 1))
+        if dx.stream_headroom_frac > 0:
+            candidates.append(("lower_streaming", dx.stream_headroom_frac, 2))
+
+        candidates.sort(key=lambda kv: (-kv[1], kv[2]))
+        return [name for name, _, _ in candidates]
 
     # ── Apply a Diagnosis ──
     def _apply_diagnosis(
@@ -617,45 +669,53 @@ class OOMRecovery:
             return event
 
         # ── Tiers 2-4: knob change ──
-        # For cache-action tiers, _lower_cache calls cm.clear() itself, so we
-        # don't pre-emptively reset_cache (that would lose chunks before the
-        # knob even applies). For residency / prefill tiers, we keep the cache
-        # intact — losing it doesn't help and gives up valuable reuse.
+        # Each non-`mixed` tier is authoritative: it identified the actual
+        # bottleneck, so we touch *only* that knob. Falling back to a
+        # different knob would damage unrelated state (e.g. dropping KV
+        # reuse when the real problem was prompt length) without addressing
+        # the OOM cause. If the diagnosed knob is exhausted, recovery is
+        # genuinely out of moves for this tier — re-raise.
+        #
+        # `mixed` is the only tier with real ambiguity, so it's the only
+        # tier that tries multiple knobs. Even there we filter candidates
+        # to those that can *plausibly* help — a cache-eviction step that
+        # would free fewer bytes than the failed allocation tried is
+        # provably useless and gets skipped.
         knobs = {
             "lower_cache": self._lower_cache,
             "lower_streaming": self._lower_streaming,
             "lower_prefill_chunk": self._lower_prefill_chunk,
         }
-        primary_name = dx.action
-        # Fallback order: try the diagnosed knob first, then the others in a
-        # fixed order (cache → prefill → streaming). Prefill before streaming
-        # because most cache-empty OOMs are prefill activations, not weights.
-        fallback_chain = [primary_name] + [
-            k for k in ("lower_cache", "lower_prefill_chunk", "lower_streaming")
-            if k != primary_name
-        ]
+
+        if dx.tier == "mixed":
+            ordered = self._mixed_candidates(dx)
+        else:
+            ordered = [dx.action]
 
         change = None
         flipped_to = None
-        for i, knob_name in enumerate(fallback_chain):
+        for i, knob_name in enumerate(ordered):
             change = knobs[knob_name]()
             if change is not None:
                 if i > 0:
                     flipped_to = knob_name
                     log.warning(
-                        "OOM recovery: diagnosed action '%s' unavailable; "
-                        "falling back to '%s'.",
-                        primary_name, knob_name,
+                        "OOM recovery (mixed): primary '%s' unavailable; "
+                        "using '%s' instead.",
+                        dx.action, knob_name,
                     )
                 break
 
         if change is None:
             log.error(
-                "OOM recovery EXHAUSTED at attempt %d (tier=%s): "
-                "cache=%.2f GB (floor=%.2f GB), keep=%s/%s (floor=%d), "
-                "prefill_chunk=%d (floor=%d). Re-raising original CUDA OOM.",
-                attempt_idx, dx.tier,
-                self.max_cache_bytes / 1e9, self.MIN_CACHE_BYTES / 1e9,
+                "OOM recovery EXHAUSTED at attempt %d (tier=%s, action=%s): "
+                "cache_used=%.0f MiB cache_budget=%.0f MiB (floor=%.0f MiB), "
+                "keep=%s/%s (floor=%d), prefill_chunk=%d (floor=%d). "
+                "The diagnosed knob is at its floor and no fallback could help. "
+                "Re-raising original CUDA OOM.",
+                attempt_idx, dx.tier, dx.action,
+                dx.cache_used_mb, dx.cache_budget_mb,
+                self.MIN_CACHE_BYTES / (1024.0 ** 2),
                 self.keep_first_k, self.keep_last_k, self.MIN_KEEP,
                 self.prefill_chunk_size, self.MIN_PREFILL_CHUNK,
             )
@@ -678,11 +738,20 @@ class OOMRecovery:
 
         action = change["action"]
         if action == "lower_cache":
-            summary = (
-                f"lower_cache: max_cache_bytes "
-                f"{change['old_max_cache_bytes'] / 1e9:.2f} GB → "
-                f"{change['new_max_cache_bytes'] / 1e9:.2f} GB"
-            )
+            old_gb = change["old_max_cache_bytes"] / 1e9
+            new_gb = change["new_max_cache_bytes"] / 1e9
+            evicted_mb = change.get("evicted_bytes", 0) / (1024.0 ** 2)
+            if old_gb == new_gb:
+                # Budget at floor — pure eviction step.
+                summary = (
+                    f"lower_cache: evict-only, freed {evicted_mb:.0f} MiB "
+                    f"(budget pinned at {new_gb:.2f} GB floor)"
+                )
+            else:
+                summary = (
+                    f"lower_cache: max_cache_bytes {old_gb:.2f} GB → "
+                    f"{new_gb:.2f} GB (freed {evicted_mb:.0f} MiB)"
+                )
             shrink = self.CACHE_SHRINK
         elif action == "lower_streaming":
             summary = (
