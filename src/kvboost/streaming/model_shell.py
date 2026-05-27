@@ -331,6 +331,14 @@ class StreamingCausalLM(nn.Module):
         #     they're also skipped.
         hf_model.to(dtype)
 
+        # 4c. Defensive cast at the lm_head boundary. `.to(dtype)` above sets
+        #     every parameter to `dtype`, but some transformers versions emit
+        #     fp32 activations from the final RMSNorm regardless of weight
+        #     dtype, which trips lm_head's matmul. The pre-hook casts the
+        #     input to lm_head.weight.dtype on the way in — no-op when they
+        #     already match.
+        _install_lm_head_dtype_guard(hf_model)
+
         # 5. One-shot bind for the resident-layer StreamingQLinears: load
         #    their packed AWQ tensors from disk and call .rebind() once.
         if resident_qlinears:
@@ -450,6 +458,11 @@ class StreamingCausalLM(nn.Module):
 
         # 6. Bind every StreamingQLinear with its permanent weights on MPS.
         loader.bind_streaming_qlinears(replacements, device=mps_device)
+
+        # 7. Same dtype guard the CUDA path uses — mixed-dtype checkpoints
+        #    cause the same fp32→lm_head crash here too.
+        hf_model.to(dtype)
+        _install_lm_head_dtype_guard(hf_model)
 
         # Empty streamed_qlinears dict → no hooks installed → no scheduler.
         return cls(
@@ -605,6 +618,40 @@ class StreamingCausalLM(nn.Module):
 
 
 # ── Module-tree helpers ─────────────────────────────────────────────────────
+
+
+def _install_lm_head_dtype_guard(hf_model: nn.Module) -> None:
+    """Install a forward pre-hook on ``lm_head`` that casts its input to
+    match ``lm_head.weight.dtype``.
+
+    Some Qwen3 / DeepSeek-R1-Distill AWQ checkpoints carry mixed dtypes
+    that survive a top-level ``hf_model.to(dtype)``: the final RMSNorm
+    output reaches ``lm_head`` as fp32 even though every parameter is
+    fp16, producing ``RuntimeError: expected mat1 and mat2 to have the
+    same dtype, but got: float != c10::Half``.
+
+    The right place to enforce this isn't deep inside transformers (the
+    upcast varies by version) — it's at the boundary. ``lm_head`` is the
+    final projection; it should accept whatever activation dtype the body
+    produced and cast at the seam.
+
+    The hook is a no-op when dtypes already agree, so this is free in the
+    common case.
+    """
+    lm_head = getattr(hf_model, "lm_head", None)
+    if lm_head is None or not hasattr(lm_head, "weight"):
+        return
+
+    def _cast_input_to_weight_dtype(module: nn.Module, args: tuple):
+        if not args:
+            return None
+        x = args[0]
+        target = module.weight.dtype
+        if isinstance(x, torch.Tensor) and x.dtype != target:
+            return (x.to(target),) + args[1:]
+        return None
+
+    lm_head.register_forward_pre_hook(_cast_input_to_weight_dtype)
 
 
 def _strip_quantization_config(cfg: Any) -> Any:
