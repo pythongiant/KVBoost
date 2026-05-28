@@ -30,7 +30,6 @@ from _common import (
 from dataclasses import asdict
 from datetime import datetime, timezone
 
-from kvboost.oom_recovery import OOMRecovery
 
 RESULTS_DIR    = Path(__file__).resolve().parent / "results"
 CHECKPOINT_DIR = Path(__file__).resolve().parent / ".checkpoints"
@@ -79,7 +78,7 @@ def build_engine(args):
     )
 
 
-def make_run_turn(engine, max_new_tokens: int, oom_recovery: "OOMRecovery | None" = None):
+def make_run_turn(engine, max_new_tokens: int):
     from kvboost import GenerationMode
 
     def _full_spec_snapshot() -> dict:
@@ -174,13 +173,7 @@ def make_run_turn(engine, max_new_tokens: int, oom_recovery: "OOMRecovery | None
             "backend_telemetry": backend_telemetry,
         }
 
-    if oom_recovery is None:
-        return _do_run_turn
-
-    def run_turn_with_oom(prompt: str) -> dict:
-        return oom_recovery.attempt(_do_run_turn, prompt)
-
-    return run_turn_with_oom
+    return _do_run_turn
 
 
 def main():
@@ -206,12 +199,6 @@ def main():
                                  "ffn_only_stream", "full_stream"])
     parser.add_argument("--keep-first-k", type=int, default=1024)
     parser.add_argument("--keep-last-k", type=int, default=1024)
-    parser.add_argument("--oom-recovery", action="store_true", default=True,
-                        help="Catch CUDA OOM, lower KV cache or streaming residency, retry. "
-                             "Default on; pass --no-oom-recovery to disable.")
-    parser.add_argument("--no-oom-recovery", action="store_false", dest="oom_recovery")
-    parser.add_argument("--oom-max-retries", type=int, default=2,
-                        help="Max OOM retries per turn before giving up (default: 2).")
     args = parser.parse_args()
 
     setup_logging(args.verbose, args.debug)
@@ -260,26 +247,12 @@ def main():
         "max_context_tokens": args.max_context_tokens,
         "max_tokens_per_turn": args.max_tokens_per_turn,
         "save_output_text": args.save_output_text,
-        "oom_recovery": args.oom_recovery,
-        "oom_max_retries": args.oom_max_retries,
     }
     run_metadata = capture_run_metadata("kvboost", config)
 
-    oom_recovery = None
-    if args.oom_recovery:
-        oom_recovery = OOMRecovery(
-            engine,
-            initial_max_cache_bytes=int(args.max_cache_bytes),
-            initial_keep_first_k=args.keep_first_k if args.awq_streaming else None,
-            initial_keep_last_k=args.keep_last_k if args.awq_streaming else None,
-            streaming_enabled=args.awq_streaming,
-            initial_prefill_chunk_size=getattr(args, "prefill_chunk_size", 0),
-            max_retries=args.oom_max_retries,
-        )
-
     t0 = time.perf_counter()
     results = replay_conversations(
-        run_turn=make_run_turn(engine, args.max_new_tokens, oom_recovery=oom_recovery),
+        run_turn=make_run_turn(engine, args.max_new_tokens),
         count_tokens=lambda s: len(engine.tokenizer.encode(s, add_special_tokens=True)),
         reset_between_convs=engine.reset_cache,
         conversations=conversations,
@@ -307,14 +280,6 @@ def main():
         "run_metadata": asdict(run_metadata),
         "wall_s": wall_s,
         "metrics": metrics,
-        "oom_recovery": {
-            "enabled": args.oom_recovery,
-            "n_events": len(oom_recovery.events) if oom_recovery else 0,
-            "final_max_cache_bytes": oom_recovery.max_cache_bytes if oom_recovery else int(args.max_cache_bytes),
-            "final_keep_first_k": oom_recovery.keep_first_k if oom_recovery else (args.keep_first_k if args.awq_streaming else None),
-            "final_keep_last_k": oom_recovery.keep_last_k if oom_recovery else (args.keep_last_k if args.awq_streaming else None),
-            "events": oom_recovery.events if oom_recovery else [],
-        },
         "results": [asdict(r) for r in results],
     }
     with open(out_path, "w") as f:

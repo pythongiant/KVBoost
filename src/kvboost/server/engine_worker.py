@@ -37,7 +37,10 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 
 from ..engine import InferenceEngine, GenerationResult
 from ..batch import group_by_prefix
-from ..oom_recovery import OOMRecovery
+from ..oom_planner import (
+    OOMPlanner, RequestPlan, RequestTooLargeError,
+    gpu_mem_snapshot, format_snapshot,
+)
 from .batch_queue import Batch, BatchQueue, QueuedRequest
 from .schema import PendingRequest
 
@@ -71,7 +74,7 @@ class EngineWorker:
         max_queue_size: int = 256,
         release_cache_after_request: bool = False,
         rewarm_text: Optional[str] = None,
-        oom_recovery: Optional[OOMRecovery] = None,
+        planner: Optional[OOMPlanner] = None,
     ) -> None:
         self.engine = engine
         self.loop = loop  # may be overridden in start() with the running loop
@@ -81,7 +84,7 @@ class EngineWorker:
         )
         self._release_cache = release_cache_after_request
         self._rewarm_text = rewarm_text
-        self.oom_recovery = oom_recovery
+        self.planner = planner
 
         self.queue = BatchQueue(
             tokenize_fn=self._tokenize,
@@ -156,38 +159,46 @@ class EngineWorker:
         """
         token_q: asyncio.Queue = asyncio.Queue()
         loop = self.loop
-        # Threading note: _on_token runs on the worker thread; emitted_count
-        # is read by OOMRecovery's can_retry() in the SAME thread (also worker),
-        # so no lock needed. The asyncio queue handoff is thread-safe.
-        emitted_count = [0]
 
         def _on_token(tok: int) -> None:
-            emitted_count[0] += 1
             loop.call_soon_threadsafe(token_q.put_nowait, ("token", tok))
-
-        def _do_generate():
-            # Reset the per-call counter so retries on a fresh attempt start at 0.
-            # The recovery class only retries if can_retry() is True (i.e.,
-            # no tokens have been emitted on this attempt).
-            emitted_count[0] = 0
-            return self.engine.generate(
-                prompt=prompt,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
-                on_token=_on_token,
-            )
 
         def _run() -> None:
             try:
-                if self.oom_recovery is not None:
-                    result = self.oom_recovery.attempt(
-                        _do_generate,
-                        can_retry=lambda: emitted_count[0] == 0,
+                effective_prompt = prompt
+                plan: Optional[RequestPlan] = None
+                if self.planner is not None:
+                    prompt_tokens = len(self._tokenize(prompt))
+                    plan = self.planner.plan(prompt_tokens, max_new_tokens=max_tokens)
+                    if plan.truncated_from is not None:
+                        toks = self._tokenize(prompt)[:plan.prompt_tokens]
+                        effective_prompt = self.engine.tokenizer.decode(toks)
+                    self.planner.log_pre_request(plan)
+
+                def _do_generate():
+                    return self.engine.generate(
+                        prompt=effective_prompt,
+                        max_new_tokens=max_tokens,
+                        temperature=temperature,
+                        do_sample=do_sample,
+                        on_token=_on_token,
+                        # Per-call overrides — engine restores its own state
+                        # in a try/finally. Planner doesn't mutate anything.
+                        prefill_chunk_size=plan.chunk_size if plan is not None else None,
+                        kv_cache_bits=plan.kv_bits if plan is not None else None,
                     )
-                else:
-                    result = _do_generate()
+
+                try:
+                    result = self._run_with_oom_logging(_do_generate, request_id, plan)
+                finally:
+                    if plan is not None:
+                        prompt_tokens = plan.prompt_tokens
+                        self.planner.log_post_request(plan, prompt_tokens)
+
                 loop.call_soon_threadsafe(token_q.put_nowait, ("done", result))
+            except RequestTooLargeError as exc:
+                log.warning("Request %s rejected by planner: %s", request_id, exc)
+                loop.call_soon_threadsafe(token_q.put_nowait, ("error", exc))
             except Exception as exc:
                 log.exception("Streaming generation failed for %s", request_id)
                 loop.call_soon_threadsafe(token_q.put_nowait, ("error", exc))
@@ -217,9 +228,15 @@ class EngineWorker:
         freed tensors to the allocator. Useful on 8 GB-class GPUs where
         a populated cache + activations otherwise OOMs request N+1.
         Trades cache reuse for headroom; skip it on bigger GPUs.
+
+        Logs pre/post GPU memory so operators can quantify how much
+        cleanup actually freed — useful for deciding whether the
+        `--release-cache-after-request` overhead is worth the headroom.
         """
         if not self._release_cache:
             return
+        device = getattr(self.engine, "device", None)
+        pre = gpu_mem_snapshot(device)
         try:
             self.engine.reset_cache()
         except Exception as exc:
@@ -231,6 +248,13 @@ class EngineWorker:
                 torch.cuda.empty_cache()
         except Exception as exc:
             log.debug("empty_cache failed: %s", exc)
+        post = gpu_mem_snapshot(device)
+        if pre and post:
+            freed = post.get("free_mb", 0) - pre.get("free_mb", 0)
+            log.info(
+                "Cleanup | pre: %s | post: %s | freed=%.0fMiB",
+                format_snapshot(pre), format_snapshot(post), freed,
+            )
 
         if self._rewarm_text:
             try:
@@ -239,6 +263,66 @@ class EngineWorker:
                 log.warning("rewarm after release failed: %s", exc)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _run_with_oom_logging(self, fn, request_id, plan):
+        """Run ``fn()`` and log a full GPU memory snapshot if it OOMs.
+
+        The planner promised the request would fit, so a CUDA OOM here is a
+        planner mis-prediction (or an external memory pressure source). We
+        capture the live memory state at the moment of failure, attempt an
+        emergency ``empty_cache()``, capture the post-cleanup state, then
+        re-raise so the request fails cleanly.
+
+        The point of the logging is operator visibility — these events should
+        be rare, and when they happen the snapshot tells us *what fragmented*
+        and *whether cleanup recovered anything*. That's how we tune the
+        planner's safety margin over time.
+        """
+        import torch
+        device = getattr(self.engine, "device", None)
+        try:
+            return fn()
+        except torch.cuda.OutOfMemoryError as exc:
+            self._log_oom_event(request_id, exc, plan, device)
+            raise
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "out of memory" in msg or "cuda oom" in msg:
+                self._log_oom_event(request_id, exc, plan, device)
+            raise
+
+    def _log_oom_event(self, request_id, exc, plan, device) -> None:
+        """Emit the OOM telemetry the operator needs to debug a slip-through.
+
+        Three sections of state get logged: the GPU memory at the moment of
+        failure, the OOM error text itself (PyTorch's message has the tried-
+        alloc / reserved / free breakdown), and what the planner had
+        committed to. We then attempt one emergency ``empty_cache()`` and log
+        the post-cleanup snapshot so the operator can see whether the
+        allocator was holding fragmented blocks vs truly out of memory.
+        """
+        import gc, torch
+        pre = gpu_mem_snapshot(device)
+        log.error(
+            "OOM slipped past planner for %s | mem-at-failure: %s | error: %s",
+            request_id, format_snapshot(pre), str(exc).splitlines()[0],
+        )
+        if plan is not None:
+            log.error("  plan was: %s", plan)
+        try:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            log.debug("emergency empty_cache failed: %s", e)
+        post = gpu_mem_snapshot(device)
+        if pre and post:
+            freed = post.get("free_mb", 0) - pre.get("free_mb", 0)
+            log.error(
+                "  post-cleanup: %s | freed=%.0fMiB %s",
+                format_snapshot(post), freed,
+                "(fragmentation, not true OOM)" if freed > 100 else "(true OOM — request was too big)",
+            )
 
     def _tokenize(self, prompt: str) -> List[int]:
         return self.engine.tokenizer.encode(prompt, add_special_tokens=False)
@@ -271,19 +355,47 @@ class EngineWorker:
     def _run_batch(self, batch: Batch) -> List[GenerationResult]:
         """Runs in the worker thread (blocking).
 
-        Non-streaming, so OOM is fully retriable — callers haven't seen any
-        bytes from this request yet.
+        Non-streaming. The planner sees the longest prompt in the batch
+        and picks one configuration for the entire dispatch — batch
+        members share KV bits and prefill chunk size for the duration.
         """
         t0 = time.perf_counter()
         reqs = batch.requests
 
+        # Re-bind prompts; planner may truncate them in place for this batch.
+        prompts: List[str] = [r.prompt for r in reqs]
+
+        # Plan against the largest prompt — that's the one driving peak memory.
+        plan: Optional[RequestPlan] = None
+        if self.planner is not None:
+            token_lengths = [len(self._tokenize(p)) for p in prompts]
+            max_prompt_tokens = max(token_lengths)
+            max_new = max(r.max_tokens for r in reqs)
+            plan = self.planner.plan(max_prompt_tokens, max_new_tokens=max_new)
+            if plan.truncated_from is not None:
+                # Truncate every prompt in the batch to the planned cap.
+                # Simpler than per-request planning and preserves batch-
+                # invariant config across members.
+                cap = plan.prompt_tokens
+                for i, (p, n) in enumerate(zip(prompts, token_lengths)):
+                    if n > cap:
+                        toks = self._tokenize(p)[:cap]
+                        prompts[i] = self.engine.tokenizer.decode(toks)
+            self.planner.log_pre_request(plan)
+
+        # Build the actual generate calls with explicit per-call overrides.
+        plan_chunk = plan.chunk_size if plan is not None else None
+        plan_bits = plan.kv_bits if plan is not None else None
+
         def _singleton():
             r = reqs[0]
             result = self.engine.generate(
-                prompt=r.prompt,
+                prompt=prompts[0],
                 max_new_tokens=r.max_tokens,
                 temperature=r.temperature,
                 do_sample=r.do_sample,
+                prefill_chunk_size=plan_chunk,
+                kv_cache_bits=plan_bits,
             )
             log.debug(
                 "Singleton generate: req=%s ttft=%.0fms",
@@ -292,7 +404,6 @@ class EngineWorker:
             return [result]
 
         def _batched():
-            prompts = [r.prompt for r in reqs]
             max_tokens = max(r.max_tokens for r in reqs)
             temperature = reqs[0].temperature
             do_sample = reqs[0].do_sample
@@ -301,14 +412,18 @@ class EngineWorker:
                 max_new_tokens=max_tokens,
                 temperature=temperature,
                 do_sample=do_sample,
+                prefill_chunk_size=plan_chunk,
+                kv_cache_bits=plan_bits,
             )
 
         try:
             target = _singleton if len(reqs) == 1 else _batched
-            if self.oom_recovery is not None:
-                results = self.oom_recovery.attempt(target)
-            else:
-                results = target()
+            batch_id = reqs[0].request_id if len(reqs) == 1 else f"batch[{len(reqs)}]"
+            try:
+                results = self._run_with_oom_logging(target, batch_id, plan)
+            finally:
+                if plan is not None:
+                    self.planner.log_post_request(plan, plan.prompt_tokens)
         finally:
             self._release_gpu_memory()
 
@@ -341,6 +456,6 @@ class EngineWorker:
         spec_stats = self.engine.speculative_stats()
         if spec_stats:
             out["speculative"] = spec_stats
-        if self.oom_recovery is not None:
-            out["oom_recovery"] = self.oom_recovery.snapshot()
+        if self.planner is not None:
+            out["planner"] = self.planner.snapshot()
         return out

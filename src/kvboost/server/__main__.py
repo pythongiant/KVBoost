@@ -174,23 +174,29 @@ def parse_args():
                         "allocator cache from request N can prevent prefill "
                         "from fitting in request N+1. Costs ~5-20 ms per request.")
 
-    # OOM recovery — catch CUDA OOM mid-request, lower the right knob, retry.
-    # Default on: the server should survive single-request OOMs by trimming
-    # the KV-cache budget (if cache is "high") or shrinking AWQ-streaming
-    # residency (if cache is "low"). See kvboost.oom_recovery for the policy.
-    p.add_argument("--oom-recovery", action="store_true", default=True,
-                   help="Catch CUDA OOM mid-request, lower KV cache or streaming "
-                        "residency, retry (default: on). Use --no-oom-recovery to disable.")
-    p.add_argument("--no-oom-recovery", action="store_false", dest="oom_recovery",
-                   help="Disable OOM recovery (originally-emitted CUDA OOM errors "
-                        "will propagate to the client unchanged).")
-    p.add_argument("--oom-max-retries", type=int, default=None,
-                   help="Max OOM recovery attempts per request. Default: unbounded "
-                        "— recovery keeps shrinking knobs until the call succeeds "
-                        "or every knob hits its floor (capped at SAFETY_CAP=16 "
-                        "attempts as an absolute safety limit). Set to an integer "
-                        "to bound it tighter. Mid-stream requests never retry; the "
-                        "knob still gets adjusted so the NEXT request benefits.")
+    # OOM planning — proactively pick a (prefill_chunk_size, kv_cache_bits)
+    # combo per request so that peak memory is predicted to fit. Replaces
+    # the older reactive OOMRecovery loop, which caught OOMs mid-request
+    # and cascaded through knob shrinks (slow failure, mutated global state).
+    p.add_argument("--oom-planning", action="store_true", default=True,
+                   help="Pre-flight every request: estimate peak VRAM and "
+                        "pick chunk_size/kv_bits that fit (default: on). "
+                        "Use --no-oom-planning to disable.")
+    p.add_argument("--no-oom-planning", action="store_false", dest="oom_planning",
+                   help="Disable proactive planning. CUDA OOMs propagate to "
+                        "the client unchanged. Use this only for debugging.")
+    p.add_argument("--auto-truncate", action="store_true", default=False,
+                   help="If a request's predicted peak exceeds available "
+                        "VRAM even at the most aggressive plan (smallest "
+                        "chunk + int4 KV), silently truncate the prompt "
+                        "to the largest prefix that fits. Default: off "
+                        "(server returns HTTP 413 with an explanation).")
+    p.add_argument("--planner-safety-margin", type=float, default=0.15,
+                   help="Fraction of free VRAM reserved as headroom above "
+                        "the planner's prediction. Covers allocator "
+                        "fragmentation + model approximation error. "
+                        "Default: 0.15 (15%%). Lower for tighter packing, "
+                        "higher if you see surprise OOMs slip through.")
 
     # Server-side max_tokens cap. Schema-level cap is 131072 (Qwen3-YaRN
     # ceiling) but real-world VRAM rarely supports that. This flag is the
@@ -462,39 +468,39 @@ def main():
     warm_text = args.always_warm or args.warm
     rewarm_text = args.always_warm
 
-    oom_recovery = None
-    if args.oom_recovery:
-        from ..oom_recovery import OOMRecovery
+    planner = None
+    if args.oom_planning:
+        from ..oom_planner import OOMPlanner
         from ..cost_model import probe_cost_coefficients
 
-        # Probe once at startup: VRAM, per-layer bytes, PCIe & HBM bandwidth.
-        # Used to score recovery actions in seconds rather than via a tier
-        # ladder. Bounded probe time (~2 s); falls back to defaults on
-        # non-CUDA devices or if any individual probe fails.
+        # Probe once at startup: VRAM, per-layer bytes, PCIe & HBM bandwidth,
+        # model shape. The planner uses these to predict peak transient
+        # memory for each request and pick (chunk_size, kv_bits) accordingly.
+        # Bounded probe time (~2 s); falls back to defaults on non-CUDA
+        # devices or if any individual probe fails.
         try:
             cost_coefficients = probe_cost_coefficients(engine)
         except Exception as e:
             log.warning(
-                "Cost-coefficient probe failed (%s); OOM recovery will use "
-                "the legacy tier ladder.", e,
+                "Cost-coefficient probe failed (%s); planning will use "
+                "conservative defaults.", e,
             )
-            cost_coefficients = None
+            from ..cost_model import CostCoefficients
+            cost_coefficients = CostCoefficients(
+                total_vram_mb=0.0, per_layer_mb=150.0, num_layers=32,
+                pcie_h2d_gibps=4.0, hbm_bandwidth_gibps=200.0,
+                step_latency_ms=50.0,
+            )
 
-        oom_recovery = OOMRecovery(
+        planner = OOMPlanner(
             engine,
-            initial_max_cache_bytes=int(args.max_cache_bytes),
-            initial_keep_first_k=args.keep_first_k if args.awq_streaming else None,
-            initial_keep_last_k=args.keep_last_k if args.awq_streaming else None,
-            streaming_enabled=args.awq_streaming,
-            initial_prefill_chunk_size=args.prefill_chunk_size,
-            max_retries=args.oom_max_retries,
-            cost_coefficients=cost_coefficients,
+            cost_coefficients,
+            auto_truncate=args.auto_truncate,
+            safety_margin_frac=args.planner_safety_margin,
         )
         log.info(
-            "OOM recovery enabled: max_retries=%s, streaming=%s, scoring=%s",
-            args.oom_max_retries if args.oom_max_retries is not None else "default",
-            args.awq_streaming,
-            "on" if cost_coefficients is not None else "off (legacy ladder)",
+            "OOM planning enabled: auto_truncate=%s, safety_margin=%.0f%%",
+            args.auto_truncate, args.planner_safety_margin * 100,
         )
 
     worker = EngineWorker(
@@ -505,7 +511,7 @@ def main():
         max_queue_size=args.max_queue_size,
         release_cache_after_request=args.release_cache_after_request,
         rewarm_text=rewarm_text,
-        oom_recovery=oom_recovery,
+        planner=planner,
     )
 
     if args.max_tokens is not None:

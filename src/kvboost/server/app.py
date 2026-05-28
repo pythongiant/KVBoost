@@ -416,6 +416,7 @@ def _validate_model(requested: str, available: str) -> None:
 
 
 async def _run_single(prompt, max_tokens, temperature, do_sample, worker, model_name):
+    from ..oom_planner import RequestTooLargeError
     request_id = f"cmpl-{uuid.uuid4().hex[:12]}"
     try:
         result = await worker.generate(
@@ -431,6 +432,20 @@ async def _run_single(prompt, max_tokens, temperature, do_sample, worker, model_
         raise
     except asyncio.TimeoutError:
         raise
+    except RequestTooLargeError as exc:
+        # 413 with the planner's diagnostic in the body so the client knows
+        # exactly how much they need to trim. No retry will help.
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error": "prompt_too_large",
+                "message": str(exc),
+                "prompt_tokens": exc.prompt_tokens,
+                "predicted_peak_mb": exc.peak_mb,
+                "free_vram_mb": exc.free_mb,
+                "suggested_max_tokens": exc.suggested_max_tokens,
+            },
+        )
     except Exception as exc:
         log.exception("Generation error for request %s", request_id)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -619,11 +634,23 @@ async def _stream_chat(
             elif kind == "done":
                 final_result = payload
             elif kind == "error":
-                error_chunk = json.dumps({"error": {
-                    "message": str(payload) or payload.__class__.__name__,
-                    "type": "server_error",
-                    "code": 500,
-                }})
+                from ..oom_planner import RequestTooLargeError
+                if isinstance(payload, RequestTooLargeError):
+                    error_chunk = json.dumps({"error": {
+                        "message": str(payload),
+                        "type": "prompt_too_large",
+                        "code": 413,
+                        "prompt_tokens": payload.prompt_tokens,
+                        "predicted_peak_mb": payload.peak_mb,
+                        "free_vram_mb": payload.free_mb,
+                        "suggested_max_tokens": payload.suggested_max_tokens,
+                    }})
+                else:
+                    error_chunk = json.dumps({"error": {
+                        "message": str(payload) or payload.__class__.__name__,
+                        "type": "server_error",
+                        "code": 500,
+                    }})
                 yield f"data: {error_chunk}\n\n"
                 return
     except Exception as exc:

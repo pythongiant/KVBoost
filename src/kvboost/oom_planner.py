@@ -1,0 +1,591 @@
+"""Proactive OOM avoidance via per-request planning.
+
+The previous design caught CUDA OOMs mid-request and reactively shrank
+knobs until something fit (or didn't). It worked but had two flaws:
+
+1. **Slow failure**: a too-big prompt could spend minutes cascading
+   through knob shrinks before the GPU finally collapsed.
+2. **Silent harm**: every shrink mutated global engine state and didn't
+   always restore it, so a failed request could degrade subsequent
+   requests without anyone noticing.
+
+The new design plans BEFORE dispatch. Given the request's prompt size
+and the live GPU memory snapshot, it picks a ``(chunk_size, kv_bits)``
+configuration that is *predicted* to fit, applies it for the duration
+of that request only, and restores afterward. If no configuration
+fits, the request is rejected up-front (HTTP 413) or — under
+``--auto-truncate`` — truncated to the largest prefix that does fit.
+
+What it does NOT do:
+  - Touch layer streaming (residency is a server-wide knob — flipping
+    it per request would yank weights in/out of VRAM and shred decode
+    latency for everyone).
+  - Evict the global KV cache (only the per-request KV bits and chunk
+    size are adjusted; the cache stays exactly as it was).
+  - Catch unexpected OOMs. The thin safety net for those is a separate
+    concern; the planner's promise is "if I commit to a plan, I'm
+    saying it will fit, with 15% margin."
+
+Memory model
+------------
+For a request with N prompt tokens, configured chunk size K and KV
+bits B, peak transient memory is::
+
+    peak_mb = kv_total + activation + attention_scratch
+
+where::
+
+    kv_total          = (N + max_new) × bytes_per_token_kv(B) × layers
+    activation        = K × hidden_dim × 4_bytes  (per-layer, but
+                        not all layers materialize simultaneously —
+                        we cost the worst case: one layer's worth)
+    attention_scratch = K × N × n_heads × 4_bytes × 2  (scores + softmax
+                        intermediate; bounded by attention's O(KN)
+                        compute pattern)
+
+These coefficients are derived from the same probe ``cost_model.py``
+runs at startup. Numbers are deliberately conservative — we add a
+15% safety margin on top of the prediction to absorb allocator
+fragmentation, scratchpads, and CUDA's reserved-but-unallocated
+blocks.
+"""
+
+from __future__ import annotations
+
+import logging
+import statistics
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Deque, List, Optional, Tuple
+
+log = logging.getLogger(__name__)
+
+
+# ── Calibration tracker ───────────────────────────────────────────────────────
+
+
+@dataclass
+class _Residual:
+    """One observation: predicted vs actual peak memory."""
+    chunk_size: int
+    kv_bits: int
+    prompt_tokens: int
+    predicted_mb: float
+    actual_mb: float
+
+    @property
+    def error_frac(self) -> float:
+        """Relative residual: (actual − predicted) / predicted.
+
+        Positive means we underestimated (risky; planner thought it
+        would use less than it actually did). Negative means we
+        overestimated (safe but wasteful)."""
+        if self.predicted_mb <= 0:
+            return 0.0
+        return (self.actual_mb - self.predicted_mb) / self.predicted_mb
+
+
+class CalibrationTracker:
+    """Rolling window of prediction residuals + suggested safety margin.
+
+    Operator-visible stats answer two questions:
+
+      1. "Is my safety margin enough?" — look at the p95 residual.
+         If p95 > current margin, you have request-killing surprises.
+
+      2. "Where is the planner systematically wrong?" — slice
+         residuals by ``(chunk_size, kv_bits)`` cohort. A bias in one
+         cohort points at a missing term in the memory model.
+
+    Bounded ring buffer (``maxlen=window``); old samples evict.
+    """
+
+    def __init__(self, window: int = 256):
+        self.window = window
+        self.residuals: Deque[_Residual] = deque(maxlen=window)
+
+    def record(
+        self, *,
+        chunk_size: int, kv_bits: int, prompt_tokens: int,
+        predicted_mb: float, actual_mb: float,
+    ) -> None:
+        self.residuals.append(_Residual(
+            chunk_size=chunk_size, kv_bits=kv_bits,
+            prompt_tokens=prompt_tokens,
+            predicted_mb=predicted_mb, actual_mb=actual_mb,
+        ))
+
+    def suggested_margin(self, default: float = 0.15) -> float:
+        """Suggested safety margin = p95 of recent residuals, floored
+        at 5% and capped at 50%. Returns ``default`` until we have at
+        least 16 samples (avoid reacting to startup noise)."""
+        if len(self.residuals) < 16:
+            return default
+        errs = sorted(r.error_frac for r in self.residuals)
+        # p95 — index ceil(0.95 × n) − 1
+        idx = max(0, int(0.95 * len(errs)) - 1)
+        p95 = errs[idx]
+        # Floor + cap protect against degenerate measurements
+        return max(0.05, min(0.50, p95 if p95 > 0 else default))
+
+    def stats(self) -> dict:
+        """Aggregate stats for ``/v1/stats`` or operator inspection."""
+        if not self.residuals:
+            return {"n_samples": 0}
+        errs = [r.error_frac for r in self.residuals]
+        return {
+            "n_samples": len(self.residuals),
+            "window": self.window,
+            "residual_median": statistics.median(errs),
+            "residual_p95": sorted(errs)[max(0, int(0.95 * len(errs)) - 1)],
+            "residual_max": max(errs),
+            "residual_min": min(errs),
+            "suggested_margin": self.suggested_margin(),
+            "cohorts": self._cohort_stats(),
+        }
+
+    def _cohort_stats(self) -> dict:
+        """Per-(chunk, kv_bits) median error — surfaces systematic bias."""
+        buckets: dict = {}
+        for r in self.residuals:
+            key = f"chunk={r.chunk_size},kv={r.kv_bits}"
+            buckets.setdefault(key, []).append(r.error_frac)
+        return {
+            k: {"n": len(v), "median_err": statistics.median(v)}
+            for k, v in buckets.items()
+        }
+
+
+# ── GPU memory introspection ──────────────────────────────────────────────────
+
+
+def gpu_mem_snapshot(device: Any = None) -> dict:
+    """Live snapshot of GPU memory state, all in MiB.
+
+    Captured fields:
+      - ``free_mb``      : memory the CUDA driver reports as free.
+      - ``allocated_mb`` : bytes currently held by live PyTorch tensors.
+      - ``reserved_mb``  : bytes PyTorch's caching allocator has claimed
+                           (allocated + reserved-but-unallocated).
+      - ``peak_mb``      : peak allocator usage since last reset
+                           (call ``reset_peak_memory_stats()`` to zero it).
+      - ``total_mb``     : device total memory.
+
+    The ``reserved − allocated`` gap is the allocator's cache — useful for
+    spotting fragmentation (high cache, low free). Returns an empty dict on
+    CPU / MPS / probe failure so callers can safely ``snapshot.get(...)``.
+    """
+    try:
+        import torch
+        if device is None:
+            if not torch.cuda.is_available():
+                return {}
+            idx = torch.cuda.current_device()
+        else:
+            dev = torch.device(device)
+            if dev.type != "cuda":
+                return {}
+            idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(idx)
+        return {
+            "free_mb": free_bytes / (1024.0 ** 2),
+            "total_mb": total_bytes / (1024.0 ** 2),
+            "allocated_mb": torch.cuda.memory_allocated(idx) / (1024.0 ** 2),
+            "reserved_mb": torch.cuda.memory_reserved(idx) / (1024.0 ** 2),
+            "peak_mb": torch.cuda.max_memory_allocated(idx) / (1024.0 ** 2),
+        }
+    except Exception:
+        return {}
+
+
+def format_snapshot(snap: dict) -> str:
+    """Compact one-line representation for log messages."""
+    if not snap:
+        return "<no GPU>"
+    frag = snap.get("reserved_mb", 0) - snap.get("allocated_mb", 0)
+    return (
+        f"free={snap.get('free_mb', 0):.0f}MiB "
+        f"alloc={snap.get('allocated_mb', 0):.0f}MiB "
+        f"resv={snap.get('reserved_mb', 0):.0f}MiB "
+        f"frag={frag:.0f}MiB "
+        f"peak={snap.get('peak_mb', 0):.0f}MiB"
+    )
+
+
+def reset_peak_mem_stats(device: Any = None) -> None:
+    """Reset the per-device peak-allocated counter. Call before a request to
+    measure peak usage on a per-request basis."""
+    try:
+        import torch
+        if device is None:
+            if not torch.cuda.is_available():
+                return
+            idx = torch.cuda.current_device()
+        else:
+            dev = torch.device(device)
+            if dev.type != "cuda":
+                return
+            idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        torch.cuda.reset_peak_memory_stats(idx)
+    except Exception:
+        pass
+
+
+# Configurations tried in order of preference (cheapest first).
+# Each entry is (chunk_size, kv_bits). The planner walks this list and
+# picks the first configuration whose predicted peak fits.
+#
+# Ordering rationale:
+#   - Larger chunks are faster (fewer forward passes per prompt) but
+#     have higher per-step activation peaks. Prefer largest viable.
+#   - int16 KV (no quantization) is highest quality but heaviest.
+#     int8 is essentially free-quality. int4 has measurable but small
+#     accuracy impact. Walk down only as forced.
+_PLAN_LADDER: List[Tuple[int, int]] = [
+    (1024, 16), (1024, 8),
+    (512, 16),  (512, 8),
+    (256, 8),
+    (128, 8),   (128, 4),
+    (64, 4),
+    (32, 4),
+]
+
+# Margin we keep between predicted peak and free VRAM. Covers allocator
+# fragmentation, scratch tensors, CUDA reserved-but-unallocated blocks,
+# and approximation error in our memory model. 15% is empirically the
+# point where prediction misses become rare on H100/L4/4090-class cards.
+_SAFETY_MARGIN_FRAC = 0.15
+
+
+@dataclass
+class RequestPlan:
+    """A concrete per-request configuration the engine should adopt.
+
+    Constructed by ``OOMPlanner.plan()``. Applied via the
+    ``OOMPlanner.apply()`` context manager which mutates engine
+    attributes for the request's duration and restores them after.
+    """
+    chunk_size: int            # prefill_chunk_size to use during this request
+    kv_bits: int               # 16 | 8 | 4
+    prompt_tokens: int         # how many prompt tokens to actually process
+                               # (may be < the request's original prompt
+                               # length if auto-truncate kicked in)
+    estimated_peak_mb: float   # predicted peak VRAM during prefill
+    free_vram_mb: float        # what was free when we planned
+    truncated_from: Optional[int] = None  # original prompt length if truncated
+
+    def __str__(self) -> str:
+        base = (
+            f"chunk={self.chunk_size}, kv_bits={self.kv_bits}, "
+            f"prompt_tokens={self.prompt_tokens}, "
+            f"peak={self.estimated_peak_mb:.0f}/{self.free_vram_mb:.0f} MiB"
+        )
+        if self.truncated_from is not None:
+            base += f" (truncated from {self.truncated_from})"
+        return base
+
+
+class RequestTooLargeError(Exception):
+    """Raised when no configuration on the plan ladder fits.
+
+    HTTP layer should translate this to 413 Payload Too Large with a
+    body that names ``prompt_tokens``, the predicted peak, and the
+    available VRAM so the caller knows how much they need to trim.
+    """
+    def __init__(
+        self,
+        prompt_tokens: int,
+        peak_mb: float,
+        free_mb: float,
+        suggested_max_tokens: Optional[int] = None,
+    ):
+        self.prompt_tokens = prompt_tokens
+        self.peak_mb = peak_mb
+        self.free_mb = free_mb
+        self.suggested_max_tokens = suggested_max_tokens
+        msg = (
+            f"prompt of {prompt_tokens} tokens cannot fit on this GPU at "
+            f"any planner configuration (predicted peak {peak_mb:.0f} MiB "
+            f"vs {free_mb:.0f} MiB free)"
+        )
+        if suggested_max_tokens is not None:
+            msg += f"; reduce to ~{suggested_max_tokens} tokens or use a smaller model"
+        super().__init__(msg)
+
+
+class OOMPlanner:
+    """Plans a per-request ``(chunk_size, kv_bits)`` configuration.
+
+    Lifecycle:
+        1. Constructed once at server start with ``engine`` and the
+           probed ``cost_coefficients``.
+        2. ``planner.plan(prompt_tokens, max_new_tokens)`` returns a
+           ``RequestPlan`` or raises ``RequestTooLargeError``.
+        3. ``with planner.apply(plan): engine.generate(...)`` adopts
+           the plan, runs the request, and restores engine state.
+    """
+
+    def __init__(
+        self,
+        engine,
+        cost_coefficients,
+        *,
+        auto_truncate: bool = False,
+        safety_margin_frac: float = _SAFETY_MARGIN_FRAC,
+        calibration_window: int = 256,
+    ):
+        self.engine = engine
+        self.cc = cost_coefficients
+        self.auto_truncate = auto_truncate
+        self.safety_margin_frac = safety_margin_frac
+        self.calibration = CalibrationTracker(window=calibration_window)
+
+        # Cached model-shape derivatives — these don't change request to
+        # request, so we compute them once. ``num_layers`` and
+        # ``per_layer_mb`` come from the cost-model probe.
+        cfg = getattr(engine.model, "config", None)
+        self.hidden_dim = (
+            getattr(cfg, "hidden_size", None)
+            or getattr(cfg, "n_embd", None)
+            or 4096
+        )
+        self.num_layers = cost_coefficients.num_layers
+        self.num_heads = (
+            getattr(cfg, "num_attention_heads", None)
+            or getattr(cfg, "n_head", None)
+            or 32
+        )
+        self.num_kv_heads = (
+            getattr(cfg, "num_key_value_heads", None) or self.num_heads
+        )
+        self.head_dim = self.hidden_dim // max(self.num_heads, 1)
+
+    # ── Memory estimation ────────────────────────────────────────────
+
+    def _bytes_per_token_kv(self, kv_bits: int) -> float:
+        """Per-token KV cache size across all layers in BYTES.
+
+        ``2`` factor covers K and V tensors. ``kv_bits/8`` converts
+        precision to bytes. GQA models have fewer KV heads than
+        attention heads, which we account for via ``num_kv_heads``.
+        """
+        per_head = self.head_dim * (kv_bits / 8.0)
+        per_layer = 2 * self.num_kv_heads * per_head
+        return per_layer * self.num_layers
+
+    def estimate_peak_mb(
+        self,
+        prompt_tokens: int,
+        chunk_size: int,
+        kv_bits: int,
+        max_new_tokens: int = 0,
+    ) -> float:
+        """Predicted peak transient VRAM during prefill, in MiB.
+
+        Three components:
+          - **KV total**: every prompt token + every generated token
+            gets a KV entry. At ``kv_bits`` precision.
+          - **Activation**: one chunk's worth of hidden states sitting
+            in flight. We size this for fp16 (the compute dtype) even
+            if KV is more compressed — the activations aren't quantized.
+          - **Attention scratch**: the chunk's queries attending to
+            *all* accumulated KV. Peaks at the end of prefill when
+            ``accum_kv ≈ prompt_tokens``. Size is ``K × N × heads × 4
+            bytes × 2`` (scores + softmax buffer).
+        """
+        total_tokens = prompt_tokens + max_new_tokens
+
+        kv_bytes = total_tokens * self._bytes_per_token_kv(kv_bits)
+
+        # One chunk's activation, fp16 (2 bytes). Conservative: assumes
+        # one layer's intermediate is in flight at peak.
+        activation_bytes = chunk_size * self.hidden_dim * 2
+
+        # Attention scores at the worst-case point of prefill (last chunk).
+        # 4 bytes for fp32 softmax accumulator, ×2 for scores + temp buffer.
+        scratch_bytes = chunk_size * prompt_tokens * self.num_heads * 4 * 2
+
+        peak = kv_bytes + activation_bytes + scratch_bytes
+        return peak / (1024.0 ** 2)
+
+    def _free_vram_mb(self) -> float:
+        """Live snapshot of free VRAM on the engine's device."""
+        try:
+            import torch
+            device = self.engine.device
+            if not str(device).startswith("cuda"):
+                return float("inf")
+            idx = torch.device(device).index
+            if idx is None:
+                idx = torch.cuda.current_device()
+            free_bytes, _ = torch.cuda.mem_get_info(idx)
+            return free_bytes / (1024.0 ** 2)
+        except Exception as e:
+            log.warning("mem_get_info failed (%s); assuming infinite VRAM", e)
+            return float("inf")
+
+    # ── Planning ─────────────────────────────────────────────────────
+
+    def plan(self, prompt_tokens: int, max_new_tokens: int = 0) -> RequestPlan:
+        """Pick a configuration that fits within the safety margin.
+
+        Tries ``_PLAN_LADDER`` in order (cheapest first), returns the
+        first config whose predicted peak ≤ ``free_vram × (1 - margin)``.
+        If nothing fits and ``auto_truncate=False``, raises
+        ``RequestTooLargeError``. If ``auto_truncate=True``, binary
+        searches for the longest prefix that fits with the most
+        aggressive config.
+        """
+        free_mb = self._free_vram_mb()
+        budget_mb = free_mb * (1.0 - self.safety_margin_frac)
+
+        for chunk_size, kv_bits in _PLAN_LADDER:
+            peak = self.estimate_peak_mb(
+                prompt_tokens, chunk_size, kv_bits, max_new_tokens
+            )
+            if peak <= budget_mb:
+                log.debug(
+                    "Plan committed: chunk=%d kv_bits=%d peak=%.0f MiB ≤ "
+                    "budget=%.0f MiB (free=%.0f MiB)",
+                    chunk_size, kv_bits, peak, budget_mb, free_mb,
+                )
+                return RequestPlan(
+                    chunk_size=chunk_size,
+                    kv_bits=kv_bits,
+                    prompt_tokens=prompt_tokens,
+                    estimated_peak_mb=peak,
+                    free_vram_mb=free_mb,
+                )
+
+        # Nothing on the ladder fits at this prompt size.
+        most_aggressive = _PLAN_LADDER[-1]
+        worst_peak = self.estimate_peak_mb(
+            prompt_tokens, most_aggressive[0], most_aggressive[1], max_new_tokens
+        )
+
+        if not self.auto_truncate:
+            # Binary search for a *suggested* max prompt size to put in the
+            # 413 error message — not used, just informational.
+            suggested = self._find_max_fitting_prompt(
+                budget_mb, max_new_tokens, most_aggressive,
+            )
+            raise RequestTooLargeError(
+                prompt_tokens=prompt_tokens,
+                peak_mb=worst_peak,
+                free_mb=free_mb,
+                suggested_max_tokens=suggested,
+            )
+
+        # Auto-truncate path: find the largest prefix that fits at the
+        # most aggressive config, return a plan with truncated prompt.
+        max_fitting = self._find_max_fitting_prompt(
+            budget_mb, max_new_tokens, most_aggressive,
+        )
+        if max_fitting is None or max_fitting <= 0:
+            raise RequestTooLargeError(
+                prompt_tokens=prompt_tokens,
+                peak_mb=worst_peak,
+                free_mb=free_mb,
+            )
+        truncated_peak = self.estimate_peak_mb(
+            max_fitting, most_aggressive[0], most_aggressive[1], max_new_tokens
+        )
+        log.warning(
+            "Auto-truncating prompt from %d to %d tokens to fit (peak %.0f "
+            "MiB ≤ budget %.0f MiB)",
+            prompt_tokens, max_fitting, truncated_peak, budget_mb,
+        )
+        return RequestPlan(
+            chunk_size=most_aggressive[0],
+            kv_bits=most_aggressive[1],
+            prompt_tokens=max_fitting,
+            estimated_peak_mb=truncated_peak,
+            free_vram_mb=free_mb,
+            truncated_from=prompt_tokens,
+        )
+
+    def _find_max_fitting_prompt(
+        self,
+        budget_mb: float,
+        max_new_tokens: int,
+        config: Tuple[int, int],
+    ) -> Optional[int]:
+        """Binary search the largest ``prompt_tokens`` that fits in budget
+        at the given (chunk, kv_bits) config. Returns None if even 1
+        token doesn't fit (model + overhead is already over budget)."""
+        chunk_size, kv_bits = config
+        lo, hi = 1, 1_000_000   # 1M tokens upper bound; will narrow fast
+        if self.estimate_peak_mb(1, chunk_size, kv_bits, max_new_tokens) > budget_mb:
+            return None
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            peak = self.estimate_peak_mb(mid, chunk_size, kv_bits, max_new_tokens)
+            if peak <= budget_mb:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    # ── Pre/post telemetry hooks ─────────────────────────────────────
+
+    def log_pre_request(self, plan: RequestPlan) -> None:
+        """Log mem snapshot before dispatch and reset the peak counter so
+        the post-request snapshot reflects only this request's usage.
+
+        Call this immediately before passing the plan into
+        ``engine.generate(prefill_chunk_size=..., kv_cache_bits=...)``.
+        """
+        device = getattr(self.engine, "device", None)
+        reset_peak_mem_stats(device)
+        pre = gpu_mem_snapshot(device)
+        log.info("Plan committed: %s | mem-pre: %s", plan, format_snapshot(pre))
+
+    def log_post_request(self, plan: RequestPlan, prompt_tokens: int) -> None:
+        """Log mem snapshot after the request returns and record the
+        prediction residual in the calibration tracker.
+
+        ``prompt_tokens`` is needed so the calibration tracker can index
+        residuals by request shape (helps separate "small prompts always
+        overshoot" from "long prompts always undershoot")."""
+        device = getattr(self.engine, "device", None)
+        post = gpu_mem_snapshot(device)
+        actual_peak = post.get("peak_mb", 0)
+        predicted = plan.estimated_peak_mb
+        if actual_peak > 0 and predicted > 0:
+            error_pct = (actual_peak - predicted) / predicted * 100.0
+            log.info(
+                "Request done | mem-post: %s | "
+                "predicted=%.0fMiB actual=%.0fMiB err=%+.1f%%",
+                format_snapshot(post), predicted, actual_peak, error_pct,
+            )
+            self.calibration.record(
+                chunk_size=plan.chunk_size,
+                kv_bits=plan.kv_bits,
+                prompt_tokens=prompt_tokens,
+                predicted_mb=predicted,
+                actual_mb=actual_peak,
+            )
+        else:
+            log.info("Request done | mem-post: %s", format_snapshot(post))
+
+    # ── Telemetry ────────────────────────────────────────────────────
+
+    def snapshot(self) -> dict:
+        """Stats payload for ``/v1/stats``. Per-request history is logged
+        at INFO; this returns aggregate calibration stats."""
+        return {
+            "auto_truncate": self.auto_truncate,
+            "safety_margin_frac": self.safety_margin_frac,
+            "ladder": [
+                {"chunk_size": c, "kv_bits": b} for c, b in _PLAN_LADDER
+            ],
+            "model_shape": {
+                "hidden_dim": self.hidden_dim,
+                "num_layers": self.num_layers,
+                "num_heads": self.num_heads,
+                "num_kv_heads": self.num_kv_heads,
+                "head_dim": self.head_dim,
+            },
+            "free_vram_mb_now": self._free_vram_mb(),
+            "calibration": self.calibration.stats(),
+        }

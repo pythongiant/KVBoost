@@ -27,6 +27,7 @@
   <a href="#speculative-decoding-stacked-on-awq-streaming">Speculative</a> &bull;
   <a href="#benchmarks">Benchmarks</a> &bull;
   <a href="#how-it-works">How it works</a> &bull;
+  <a href="#oom-planning-proactive-not-reactive">OOM planning</a> &bull;
   <a href="#api-reference">API</a>
 </p>
 
@@ -66,6 +67,7 @@ rewrites, no custom training format, no engine to learn.
 | **Serving** | OpenAI-compatible HTTP server | `/v1/completions` and `/v1/chat/completions` with async prefix-grouped batching. Drop-in for the OpenAI SDK, LangChain, LlamaIndex, Instructor, and friends. |
 | | Multi-backend | CUDA (full feature set), MPS (Apple Silicon, unified memory), CPU paged attention. |
 | | Telemetry | `result.ttft_ms`, `result.kv_reuse_ratio`, scheduler hit rates, speculative acceptance histograms  surfaced through both the Python API and a `/v1/stats` endpoint. |
+| | Proactive OOM planning | Predicts peak VRAM per request and picks `(prefill_chunk_size, kv_cache_bits)` that fits — before dispatch. Rejects with HTTP 413 when nothing fits, or auto-truncates the prompt. State is per-request and restored after; no global mutation. |
 
 ## Quick start
 
@@ -1068,6 +1070,215 @@ Back-pressure: if the queue exceeds `--max-queue-size`, new requests receive HTT
 | `--max-queue-size` | `256` | Queue capacity before 503 |
 | `--warm` |  | Pre-warm text (loaded before accepting traffic) |
 | `--workers` | `1` | Engine thread-pool size (keep 1 for GPU) |
+| `--max-tokens` | none | Server-side ceiling on request `max_tokens` (1..131072). Incoming requests with higher values are clamped down. |
+| `--prefill-chunk-size` | `0` | Process the prompt in slices of N tokens. `0` = single-shot. Set 512–2048 to fit long prompts on small GPUs. |
+| `--oom-planning` / `--no-oom-planning` | on | Pre-flight every request: predict peak VRAM and pick a `(chunk_size, kv_bits)` that fits. See section below. |
+| `--auto-truncate` | off | When even the most aggressive plan won't fit, silently truncate the prompt to the largest prefix that fits (instead of returning 413). |
+| `--planner-safety-margin` | `0.15` | Fraction of free VRAM reserved as headroom above the predicted peak. |
+
+---
+
+## OOM Planning (proactive, not reactive)
+
+OOMs aren't survived after the fact — they're **predicted and avoided** before
+the request hits the engine. At server startup KVBoost probes VRAM, PCIe
+bandwidth, HBM bandwidth, and model shape. For every incoming request the
+planner estimates peak transient memory and picks the cheapest
+`(prefill_chunk_size, kv_cache_bits)` configuration that fits — *for this
+specific request*, passed in as explicit kwargs to `engine.generate(...)`.
+
+This replaces the older reactive design (catch OOM → shrink a knob → retry).
+That approach worked but had two real costs: a too-big prompt could spend
+minutes cascading through knob shrinks before the GPU finally collapsed, and
+every shrink mutated global engine state — a failed request could silently
+degrade subsequent ones.
+
+### Two knobs, per-request, fully explicit
+
+```python
+engine.generate(
+    prompt=...,
+    max_new_tokens=...,
+    prefill_chunk_size=plan.chunk_size,   # per-call override
+    kv_cache_bits=plan.kv_bits,           # per-call override
+)
+```
+
+| Knob | What it does | Cost scope |
+|---|---|---|
+| `prefill_chunk_size` | Splits the prompt into smaller forward passes. Caps peak activation memory. | THIS request only |
+| `kv_cache_bits` | Stores NEW KV entries at int16 / int8 / int4. Existing cache stays at its original precision. | THIS request only |
+
+The planner is a **pure function** of the request: `plan(prompt_tokens,
+max_new_tokens) → RequestPlan`. It never mutates engine state. The engine
+itself encapsulates the per-call override via `_scoped_overrides()` — a
+`try/finally` that's correct under both success and exception. This makes
+the planner trivially safe under future concurrency expansions: if max_workers
+ever goes above 1, the only change needed is at the engine level, not in the
+planner-facing contract.
+
+Layer streaming residency and global cache eviction are deliberately **not**
+per-request knobs — both have server-wide effects (decode latency for
+everyone, chunk-reuse hits for everyone) that should be set by the operator,
+not pulled per request.
+
+### Plan ladder
+
+The planner walks this list and picks the first config whose predicted peak
+fits inside `free_vram × (1 − safety_margin)`:
+
+```
+(chunk=1024, kv_bits=16)  ← cheapest: largest chunk, full precision
+(chunk=1024, kv_bits=8)
+(chunk=512,  kv_bits=16)
+(chunk=512,  kv_bits=8)
+(chunk=256,  kv_bits=8)
+(chunk=128,  kv_bits=8)
+(chunk=128,  kv_bits=4)
+(chunk=64,   kv_bits=4)
+(chunk=32,   kv_bits=4)   ← last resort: smallest chunk, most compressed
+```
+
+If none of these fit, the request is rejected with **HTTP 413** and an error
+body that names `prompt_tokens`, `predicted_peak_mb`, `free_vram_mb`, and a
+`suggested_max_tokens` — the client knows exactly how much they need to trim.
+With `--auto-truncate`, the planner instead binary-searches for the longest
+prefix that fits at the most aggressive config and silently truncates.
+
+### Memory model
+
+For a request with `N` prompt tokens, planned chunk `K`, KV bits `B`:
+
+```
+peak_mb = kv_total + activation + attention_scratch
+
+  kv_total          = (N + max_new) × bytes_per_token(B) × layers
+  activation        = K × hidden_dim × 2 bytes
+  attention_scratch = K × N × n_heads × 4 bytes × 2   (scores + softmax)
+```
+
+Coefficients come from a one-shot probe at server start:
+
+| Field | How it's probed |
+|---|---|
+| `total_vram_mb` | `torch.cuda.get_device_properties(idx).total_memory` |
+| `free_vram_mb` (per request) | `torch.cuda.mem_get_info(idx)` — live snapshot |
+| `num_layers`, `hidden_dim`, `num_kv_heads` | From `model.config` |
+| `per_layer_mb` | Sum of parameter + buffer + AWQ packed-tensor bytes, divided by `num_hidden_layers` |
+| `pcie_h2d_gibps` | Timed pinned-host → device transfer of a 64 MiB fp16 buffer |
+| `hbm_bandwidth_gibps` | Timed device→device `copy_()` of a 256 MiB fp16 buffer |
+
+Probe wall time is bounded at ~2 s. Every individual probe is wrapped in
+try/except; failures fall back to conservative defaults so the planner never
+crashes the server on startup.
+
+### Worked example
+
+Request: 8000-token prompt, 1024-token generation, on a GPU with 2000 MiB free.
+
+```
+Try (1024, 16): peak = 2950 MiB  — too big, skip
+Try (1024,  8): peak = 1735 MiB  ✓ fits, commit
+```
+
+Result: `RequestPlan(chunk_size=1024, kv_bits=8, prompt_tokens=8000, peak=1735/2000 MiB)`.
+
+The engine processes the request at chunk 1024 / int8 KV. After the request
+finishes (or fails), `engine.prefill_chunk_size` and `cache_manager.kv_cache_bits`
+are restored to their original values. No other request sees the change.
+
+### 413 response shape
+
+```json
+{
+  "error": {
+    "message": "prompt of 50000 tokens cannot fit on this GPU at any planner configuration (predicted peak 2221 MiB vs 100 MiB free); reduce to ~296 tokens or use a smaller model",
+    "type": "prompt_too_large",
+    "code": 413,
+    "prompt_tokens": 50000,
+    "predicted_peak_mb": 2221,
+    "free_vram_mb": 100,
+    "suggested_max_tokens": 296
+  }
+}
+```
+
+Streaming endpoints surface the same payload as the final SSE `data:` event
+before terminating the stream.
+
+### Calibration tracker
+
+Every request logs its predicted-vs-actual peak memory; the planner keeps a
+rolling window (default 256) of residuals so operators can see whether the
+memory model is too conservative, too aggressive, or biased toward a specific
+`(chunk_size, kv_bits)` cohort.
+
+Available via `/v1/stats` → `planner.calibration`:
+
+```json
+{
+  "n_samples": 142,
+  "residual_median": -0.04,
+  "residual_p95":     0.07,
+  "residual_max":     0.18,
+  "residual_min":    -0.21,
+  "suggested_margin": 0.07,
+  "cohorts": {
+    "chunk=1024,kv=8":  {"n": 80, "median_err": -0.03},
+    "chunk=512,kv=8":   {"n": 40, "median_err":  0.05},
+    "chunk=256,kv=4":   {"n": 22, "median_err":  0.11}
+  }
+}
+```
+
+Interpretation:
+
+- `residual_p95` > current safety margin ⇒ tighten the margin (or you'll see
+  surprise OOMs slip through).
+- `residual_p95` ≪ current safety margin ⇒ loosen it; you're wasting headroom.
+- A cohort with high positive bias ⇒ the memory model is missing a term for
+  that configuration (most often: attention scratch on long prompts at small
+  chunks). File an issue with the cohort log and prompt-length distribution.
+
+`suggested_margin` is the p95 of recent residuals, floored at 5% and capped
+at 50%. It returns `default` (the `--planner-safety-margin` value) until at
+least 16 samples have accumulated — small windows are too noisy to act on.
+
+### Decode-step latency probe
+
+`step_latency_ms` is measured at startup by running a real decode forward
+through the loaded model (2 warmup steps + 5 timed steps, median taken).
+This captures kernel-launch latency, attention scratch, optional speculative
+draft cost, and streaming-layer DMA — every overhead source the
+`model_bytes / hbm_bandwidth` roofline misses. If the probe fails (e.g. on
+CPU/MPS), the roofline lower bound is used as a fallback. The startup log
+line tells you which:
+
+```
+Probed cost coefficients: VRAM=12.0 GiB, layers=36 × 152 MiB,
+  PCIe H→D=11.4 GiB/s, HBM=712 GiB/s, step_latency=23.4 ms (measured)
+```
+
+### Disabling
+
+```bash
+python -m kvboost.server ... --no-oom-planning
+```
+
+Disables pre-flight planning entirely. CUDA OOMs from oversized prompts will
+propagate to the client unchanged. Useful for debugging the planner's memory
+model itself.
+
+### Research grounding
+
+- LLM-in-a-Flash ([arxiv:2312.11514](https://arxiv.org/abs/2312.11514)) —
+  inference cost as `T = compute + I/O`, optimize against bandwidth.
+- Sarathi-Serve / Chunked Prefill
+  ([ACM SIGOPS 2025](https://dl.acm.org/doi/10.1145/3759441.3759444)) — the
+  `prompt_tokens / chunk_size` step-count model that justifies per-request
+  `prefill_chunk_size` selection.
+- PreScope ([arxiv:2509.23638](https://arxiv.org/pdf/2509.23638)) — global
+  cost model probed once and reused across decisions.
 
 ---
 

@@ -138,7 +138,7 @@ class KVCacheManager:
         """Remove a content_hash from the permanent pin set."""
         self._pinned_content_hashes.discard(content_hash)
 
-    def store(self, chunk: CachedChunk) -> None:
+    def store(self, chunk: CachedChunk, *, kv_cache_bits: Optional[int] = None) -> None:
         """
         Store a chunk under the strict byte budget.
 
@@ -149,7 +149,13 @@ class KVCacheManager:
              importance first — until the new chunk fits in the budget.
           4. If the new chunk still doesn't fit after evicting everything
              outside the window, it is rejected (pruned = evicted).
+
+        ``kv_cache_bits`` overrides ``self.kv_cache_bits`` for THIS call
+        only — used by the planner to write a particular request's
+        chunks at a different precision without mutating shared state.
+        ``None`` (default) means use the cache-wide setting.
         """
+        bits = self.kv_cache_bits if kv_cache_bits is None else kv_cache_bits
         key = chunk.prefix_hash or chunk.chunk_id
 
         if key in self._hot:
@@ -162,15 +168,15 @@ class KVCacheManager:
         chunk.past_key_values = self._move_kv(chunk.past_key_values, self.device)
 
         # Quantize for compressed storage (if enabled)
-        if self.kv_cache_bits < 16:
-            qkv = quantize_kv(chunk.past_key_values, bits=self.kv_cache_bits)
+        if bits < 16:
+            qkv = quantize_kv(chunk.past_key_values, bits=bits)
             self._quantized[key] = qkv
             # Release the full-precision tensors — they'll be dequantized on get()
             chunk.past_key_values = ()  # empty sentinel
             log.debug(
                 "Stored chunk %s quantized int%d (%.2fMB → %.2fMB)",
-                key[:8], self.kv_cache_bits,
-                qkv.memory_bytes() / 1e6 * (16 / self.kv_cache_bits),
+                key[:8], bits,
+                qkv.memory_bytes() / 1e6 * (16 / bits),
                 qkv.memory_bytes() / 1e6,
             )
 

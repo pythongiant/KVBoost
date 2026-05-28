@@ -1,19 +1,18 @@
-"""Auto-calibrated cost coefficients for OOM recovery decisions.
+"""Probed hardware + model coefficients, consumed by ``oom_planner``.
 
-The OOM recovery scoring framework picks knobs by maximizing
-``freed_bytes / wall_time_cost_seconds``. The numerator is easy — every
-knob has a closed-form for how many bytes it frees. The denominator
-(cost in seconds) depends on hardware (VRAM, PCIe bandwidth, GPU
-memory bandwidth) and model (param count, layer count). Hardcoding
-these numbers would make recovery picks wrong on every GPU that isn't
-the one they were tuned on.
+The OOM planner needs concrete numbers about THIS hardware + THIS
+model to predict request memory usage:
+  - total VRAM, per-layer bytes, num layers, hidden dim, num heads
+  - PCIe host-to-device bandwidth (for cost of any future host offload)
+  - HBM bandwidth (for the decode-step latency roofline)
+  - step_latency_ms (measured directly, with roofline as fallback)
 
-This module probes the GPU and the loaded model once at server startup
-and produces a :class:`CostCoefficients` instance that the recovery
-loop consults. All probes are bounded (<2 s total) and defensive — if
-any probe fails the field falls back to a conservative default that
-makes the corresponding knob look expensive (and so avoided unless
-nothing else can help).
+This module probes those values once at server startup and returns a
+:class:`CostCoefficients` instance. All probes are bounded (<3 s
+total) and defensive — if any probe fails the field falls back to a
+conservative default. The planner is responsible for the actual cost
+arithmetic (see ``oom_planner.estimate_peak_mb``); this module just
+supplies the inputs.
 
 Cost framing follows three converging lines of work:
 
@@ -24,12 +23,8 @@ Cost framing follows three converging lines of work:
   prefill cost as a function of chunk size and accumulated KV length;
   halving chunk size roughly doubles the per-prompt step count.
 * **PreScope** (arxiv:2509.23638) — explicitly argues that
-  resource-constrained MoE/streaming inference needs a *global cost
-  model* computed once and reused, not re-derived per decision.
-
-The signature: ``score(knob) = freed_bytes(knob) / cost_seconds(knob)``.
-Knob with the highest finite score wins; ``-inf`` means the knob
-can't help at all (e.g. cache is empty, can't evict).
+  resource-constrained inference needs a *global cost model* computed
+  once and reused, not re-derived per decision.
 """
 
 from __future__ import annotations
@@ -37,7 +32,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -55,12 +50,16 @@ _DEFAULT_NUM_LAYERS = 32
 
 @dataclass
 class CostCoefficients:
-    """Per-knob cost inputs, all probed from the live model and GPU.
+    """Hardware + model coefficients probed once at server startup.
 
     Units are explicit in the field names to avoid the classic
-    "is this MB or MiB" footgun. All bandwidth fields are GiB/s
-    (binary), all memory fields are MiB (binary), all times are
-    seconds or milliseconds as suffixed.
+    "is this MB or MiB" footgun. Bandwidth fields are GiB/s (binary),
+    memory fields are MiB (binary), times are ms.
+
+    This dataclass is pure data — the planner does the cost arithmetic
+    so that the formulas live next to the policy that uses them.
+    Keeping ``step_latency_ms`` etc. here (rather than re-deriving in
+    the planner) means a single source of truth for hardware probes.
     """
 
     # ── Memory shape ──
@@ -71,79 +70,10 @@ class CostCoefficients:
     # ── Speeds ──
     pcie_h2d_gibps: float           # host→device transfer rate, GiB/s
     hbm_bandwidth_gibps: float      # device memory bandwidth, GiB/s
-    step_latency_ms: float          # one forward pass at small batch, ms
-
-    # ── Workload assumptions (operator overrides; reasonable defaults) ──
-    expected_decode_tokens: int = 1024
-    expected_cache_hit_rate: float = 0.3
-
-    # ── Cost functions per knob ─────────────────────────────────────
-    #
-    # Each returns expected wall-time penalty in SECONDS applied to
-    # this request and (where relevant) the future stream of requests.
-
-    def cost_lower_cache(self, evict_mb: float) -> float:
-        """Cost of clearing ``evict_mb`` of cached KV state.
-
-        Penalty hits future requests that would have hit the evicted
-        chunks. Model: each cached MiB stores roughly ``MiB ÷ 72 KB =
-        14 tokens`` of context at int8 KV (or 7 at fp16), each of
-        which costs one prefill step on a future hit. Probability of
-        hit is ``expected_cache_hit_rate``.
-        """
-        if evict_mb <= 0:
-            return float("inf")
-        # int8 KV ≈ 72 KB/token; fp16 ≈ 144 KB/token. Use 100 KB as
-        # a tier-agnostic average. Tweak via field if needed.
-        tokens_per_mib = 1024.0 / 100.0     # ~10 tokens per MiB
-        tokens_lost = evict_mb * tokens_per_mib
-        prefill_seconds = tokens_lost * (self.step_latency_ms / 1000.0)
-        return prefill_seconds * self.expected_cache_hit_rate
-
-    def cost_lower_prefill_chunk(
-        self,
-        old_chunk: int,
-        new_chunk: int,
-        prompt_tokens: Optional[int] = None,
-    ) -> float:
-        """Cost of shrinking prefill chunk from ``old_chunk`` to ``new_chunk``.
-
-        Per Sarathi-Serve framing: prompt is processed in
-        ``ceil(prompt_tokens / chunk)`` forward passes, each costing
-        ~``step_latency_ms``. Halving the chunk roughly doubles step
-        count. Penalty hits THIS request only (single-shot).
-        """
-        if new_chunk >= old_chunk or new_chunk <= 0:
-            return float("inf")
-        # Default: assume a moderately long prompt if not told. The
-        # cost ratio (new/old) is what matters; absolute prompt size
-        # only changes the seconds scale.
-        if prompt_tokens is None:
-            prompt_tokens = 4096
-        old_eff = max(old_chunk, 1) if old_chunk > 0 else prompt_tokens
-        old_steps = max(1, prompt_tokens / old_eff)
-        new_steps = prompt_tokens / new_chunk
-        extra_steps = max(0.0, new_steps - old_steps)
-        return extra_steps * (self.step_latency_ms / 1000.0)
-
-    def cost_lower_streaming(self, delta_resident_layers: int) -> float:
-        """Cost of marking ``delta_resident_layers`` additional layers as
-        streamed.
-
-        Per LLM-in-a-Flash framing: each streamed layer pays one
-        host→device DMA per forward pass. Across all decode tokens
-        of an in-flight request this multiplies. Penalty hits THIS
-        request's decode AND every subsequent request until the
-        knob is restored.
-        """
-        if delta_resident_layers <= 0:
-            return float("inf")
-        bytes_per_layer = self.per_layer_mb * (1024.0 ** 2)
-        per_step_dma_seconds = (
-            bytes_per_layer * delta_resident_layers
-            / (self.pcie_h2d_gibps * (1024.0 ** 3))
-        )
-        return per_step_dma_seconds * self.expected_decode_tokens
+    step_latency_ms: float          # one decode forward pass, ms
+                                    # (measured directly when possible;
+                                    # falls back to model_bytes / HBM_bw)
+    step_latency_source: str = "roofline"  # "measured" | "roofline" | "default"
 
     def summary(self) -> str:
         return (
@@ -151,7 +81,7 @@ class CostCoefficients:
             f"layers={self.num_layers} × {self.per_layer_mb:.0f} MiB, "
             f"PCIe H→D={self.pcie_h2d_gibps:.1f} GiB/s, "
             f"HBM={self.hbm_bandwidth_gibps:.0f} GiB/s, "
-            f"step_latency={self.step_latency_ms:.1f} ms"
+            f"step_latency={self.step_latency_ms:.1f} ms ({self.step_latency_source})"
         )
 
 
@@ -215,6 +145,64 @@ def _probe_hbm_bandwidth(device, *, size_mb: int = 256, repeats: int = 5) -> flo
     return (2 * nbytes / best) / (1024.0 ** 3)
 
 
+def _probe_decode_step_latency_ms(engine, *, warmup: int = 2, repeats: int = 5) -> float:
+    """Time one real decode forward to get an honest ``step_latency_ms``.
+
+    Runs the loaded model with a tiny prompt, then ``repeats`` single-token
+    decode steps with KV cache. The median is returned. This captures every
+    overhead source the roofline misses: kernel launch latency, attention
+    scratch allocation, optional speculative-draft forwards, streaming-layer
+    DMA, etc.
+
+    Bounded by ``warmup + repeats`` forwards. Each forward on an 8B-class
+    model is ~50 ms; total probe is well under a second. Wrapped in
+    try/except by the caller — any failure means we fall back to the
+    roofline estimate (``model_bytes / hbm_bandwidth``).
+    """
+    import torch
+    device = engine.device
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None:
+        raise RuntimeError("engine.tokenizer not available")
+
+    # Build a minimal valid input. Some tokenizers reject empty strings.
+    seed = tokenizer("Hi", return_tensors="pt").input_ids.to(device)
+    bos_id = (
+        tokenizer.bos_token_id
+        if tokenizer.bos_token_id is not None
+        else (tokenizer.eos_token_id or 0)
+    )
+    next_tok = torch.tensor([[bos_id]], device=device, dtype=torch.long)
+
+    model = engine.model
+    with torch.no_grad():
+        # Prime KV cache with the seed prompt.
+        out = model(seed, use_cache=True)
+        past = out.past_key_values
+
+        # Warmup decodes (excluded from timing).
+        for _ in range(warmup):
+            out = model(next_tok, past_key_values=past, use_cache=True)
+            past = out.past_key_values
+
+        if str(device).startswith("cuda"):
+            torch.cuda.synchronize(device)
+
+        # Timed decodes.
+        samples = []
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            out = model(next_tok, past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            if str(device).startswith("cuda"):
+                torch.cuda.synchronize(device)
+            samples.append(time.perf_counter() - t0)
+
+    samples.sort()
+    median = samples[len(samples) // 2]
+    return median * 1000.0
+
+
 def _detect_num_layers(config: Any) -> int:
     for attr in ("num_hidden_layers", "n_layer", "num_layers", "n_layers"):
         v = getattr(config, attr, None)
@@ -270,15 +258,14 @@ def _model_bytes(model) -> int:
 def probe_cost_coefficients(
     engine,
     *,
-    workload_decode_tokens: int = 1024,
-    workload_cache_hit_rate: float = 0.3,
     skip_bandwidth_probes: bool = False,
+    skip_step_latency_probe: bool = False,
 ) -> CostCoefficients:
     """Probe GPU + model and return populated coefficients.
 
     Safe on any device — falls back to defaults for fields that can't
     be measured (e.g. PCIe on CPU). Total probe wall time is bounded
-    at ~2 s (three short transfer benchmarks).
+    at ~3 s (transfer benchmarks + a few decode steps).
     """
     import torch
 
@@ -321,21 +308,32 @@ def probe_cost_coefficients(
             log.warning("HBM bandwidth probe failed (%s); using default %.0f GiB/s",
                         e, _DEFAULT_HBM_GBPS)
 
-    # ── Step latency: derive from HBM bandwidth + model size ──
-    # A decode step is memory-bandwidth-bound on dense LLMs: it must
-    # stream every weight through SMs once. ``step ≈ model_bytes / HBM_bw``.
-    # This is the same lower bound used in Sarathi-Serve and Anyscale's
-    # roofline analyses. The actual step is somewhat higher (overhead),
-    # but for ratio-based cost decisions we only need consistency, not
-    # absolute accuracy.
-    try:
-        model_gib = model_bytes / (1024.0 ** 3)
-        step_latency_ms = (model_gib / hbm_gibps) * 1000.0
-        # Floor at 1 ms — sub-millisecond is suspicious and breaks
-        # downstream cost arithmetic.
-        step_latency_ms = max(1.0, step_latency_ms)
-    except Exception:
-        step_latency_ms = _DEFAULT_STEP_LATENCY_MS
+    # ── Step latency: prefer measured, fall back to roofline ──
+    # A real decode forward captures kernel-launch latency, attention
+    # scratch allocation, optional speculative-draft cost, streaming-
+    # layer DMA — every overhead source the roofline misses. The
+    # roofline (``model_bytes / HBM_bw``) is the theoretical lower
+    # bound; we keep it as fallback so non-CUDA paths still produce a
+    # sensible number.
+    step_latency_ms = _DEFAULT_STEP_LATENCY_MS
+    step_latency_source = "default"
+    if is_cuda and not skip_step_latency_probe:
+        try:
+            step_latency_ms = _probe_decode_step_latency_ms(engine)
+            step_latency_source = "measured"
+        except Exception as e:
+            log.warning(
+                "Decode step probe failed (%s); falling back to roofline estimate.",
+                e,
+            )
+    if step_latency_source != "measured":
+        try:
+            model_gib = model_bytes / (1024.0 ** 3)
+            roofline_ms = (model_gib / hbm_gibps) * 1000.0
+            step_latency_ms = max(1.0, roofline_ms)
+            step_latency_source = "roofline"
+        except Exception:
+            pass  # keep the default
 
     cc = CostCoefficients(
         total_vram_mb=total_vram_mb,
@@ -344,8 +342,7 @@ def probe_cost_coefficients(
         pcie_h2d_gibps=pcie_h2d_gibps,
         hbm_bandwidth_gibps=hbm_gibps,
         step_latency_ms=step_latency_ms,
-        expected_decode_tokens=workload_decode_tokens,
-        expected_cache_hit_rate=workload_cache_hit_rate,
+        step_latency_source=step_latency_source,
     )
     log.info("Probed cost coefficients: %s", cc.summary())
     return cc

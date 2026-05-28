@@ -28,6 +28,7 @@ from __future__ import annotations
 import enum
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -278,6 +279,9 @@ class InferenceEngine:
         do_sample: bool = False,
         cacheable_prefix_len: Optional[int] = None,
         on_token: Optional[Callable[[int], None]] = None,
+        *,
+        prefill_chunk_size: Optional[int] = None,
+        kv_cache_bits: Optional[int] = None,
     ) -> GenerationResult:
         """
         cacheable_prefix_len: if set, only the first N prompt tokens are
@@ -288,26 +292,60 @@ class InferenceEngine:
         on_token: if set, called from the worker thread with each freshly
         sampled token id as decoding progresses. Used by the server's
         streaming path to emit SSE chunks token-by-token.
+
+        prefill_chunk_size, kv_cache_bits: per-call overrides for the
+        engine-wide settings. When passed, they're scoped to this call only —
+        any internal mutation is restored before return (success or
+        exception). This is how the OOMPlanner gets per-request control
+        without leaving residue on the shared engine.
         """
         token_ids = self._encode(prompt)
+        with self._scoped_overrides(prefill_chunk_size, kv_cache_bits):
+            if mode == GenerationMode.BASELINE:
+                return self._generate_baseline(
+                    prompt, token_ids, max_new_tokens, temperature, do_sample,
+                    on_token=on_token,
+                )
+            elif mode == GenerationMode.PREFIX_CACHE:
+                return self._generate_prefix_cache(
+                    prompt, token_ids, max_new_tokens, temperature, do_sample,
+                    on_token=on_token,
+                )
+            elif mode == GenerationMode.CHUNK_KV_REUSE:
+                return self._generate_chunk_reuse(
+                    prompt, token_ids, max_new_tokens, temperature, do_sample,
+                    cacheable_prefix_len=cacheable_prefix_len,
+                    on_token=on_token,
+                )
+            raise ValueError(f"Unknown mode {mode}")
 
-        if mode == GenerationMode.BASELINE:
-            return self._generate_baseline(
-                prompt, token_ids, max_new_tokens, temperature, do_sample,
-                on_token=on_token,
-            )
-        elif mode == GenerationMode.PREFIX_CACHE:
-            return self._generate_prefix_cache(
-                prompt, token_ids, max_new_tokens, temperature, do_sample,
-                on_token=on_token,
-            )
-        elif mode == GenerationMode.CHUNK_KV_REUSE:
-            return self._generate_chunk_reuse(
-                prompt, token_ids, max_new_tokens, temperature, do_sample,
-                cacheable_prefix_len=cacheable_prefix_len,
-                on_token=on_token,
-            )
-        raise ValueError(f"Unknown mode {mode}")
+    @contextmanager
+    def _scoped_overrides(
+        self,
+        prefill_chunk_size: Optional[int],
+        kv_cache_bits: Optional[int],
+    ):
+        """Apply per-call overrides for ``prefill_chunk_size`` and
+        ``kv_cache_bits``, restore originals on exit (success or exception).
+
+        Both internal subsystems still read ``self.prefill_chunk_size`` and
+        ``cache_manager.kv_cache_bits``; this context manager is the single
+        encapsulated place where mutation happens. Callers see a pure
+        config-in-config-out API. Engine assumes single-threaded use
+        (one request at a time) — the same assumption ``InferenceEngine``
+        was built on; this CM doesn't make it any weaker.
+        """
+        old_chunk = self.prefill_chunk_size
+        old_bits = self.cache_manager.kv_cache_bits
+        if prefill_chunk_size is not None:
+            self.prefill_chunk_size = int(prefill_chunk_size)
+        if kv_cache_bits is not None:
+            self.cache_manager.kv_cache_bits = int(kv_cache_bits)
+        try:
+            yield
+        finally:
+            self.prefill_chunk_size = old_chunk
+            self.cache_manager.kv_cache_bits = old_bits
 
     def generate_batch(
         self,
@@ -315,6 +353,9 @@ class InferenceEngine:
         max_new_tokens: int = 64,
         temperature: float = 1.0,
         do_sample: bool = False,
+        *,
+        prefill_chunk_size: Optional[int] = None,
+        kv_cache_bits: Optional[int] = None,
     ) -> List[GenerationResult]:
         """
         Generate responses for multiple prompts sharing a common prefix.
@@ -325,16 +366,35 @@ class InferenceEngine:
             max_new_tokens: Max tokens to generate per prompt.
             temperature: Sampling temperature.
             do_sample: Greedy (False) or sampling (True).
+            prefill_chunk_size, kv_cache_bits: per-call overrides scoped to
+                this batch. See :meth:`generate` for semantics.
 
         Returns:
             List of GenerationResult, one per prompt.
         """
+        if len(prompts) == 1:
+            return [self.generate(
+                prompts[0], max_new_tokens, temperature=temperature, do_sample=do_sample,
+                prefill_chunk_size=prefill_chunk_size, kv_cache_bits=kv_cache_bits,
+            )]
+
+        with self._scoped_overrides(prefill_chunk_size, kv_cache_bits):
+            return self._generate_batch_impl(
+                prompts, max_new_tokens, temperature, do_sample,
+            )
+
+    def _generate_batch_impl(
+        self,
+        prompts: List[str],
+        max_new_tokens: int,
+        temperature: float,
+        do_sample: bool,
+    ) -> List[GenerationResult]:
+        """Inner batch-prefill+decode body. Wrapped by ``generate_batch``
+        so per-call overrides apply uniformly via ``_scoped_overrides``."""
         from .batch import (
             find_common_chunk_prefix, broadcast_kv, pad_and_mask, batched_decode,
         )
-
-        if len(prompts) == 1:
-            return [self.generate(prompts[0], max_new_tokens, temperature=temperature, do_sample=do_sample)]
 
         t0 = time.perf_counter()
         batch_size = len(prompts)
