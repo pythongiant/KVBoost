@@ -232,7 +232,6 @@ class CPUPagedEngine(InferenceEngine):
                 )
 
             first_token_time = time.perf_counter()
-            import numpy as np
             first_token_logits = out.logits[0, -1, :].cpu().float().numpy()
 
             # Extract and store only the *new* K/V (live tokens portion)
@@ -268,7 +267,6 @@ class CPUPagedEngine(InferenceEngine):
                 )
 
             first_token_time = time.perf_counter()
-            import numpy as np
             first_token_logits = out.logits[0, -1, :].cpu().float().numpy()
 
             new_kv = self._normalize_past_kv(out.past_key_values)
@@ -282,33 +280,48 @@ class CPUPagedEngine(InferenceEngine):
         # ── Step 3: Autoregressive decode via paged attention ─────────────────
         cur_pos = cached_len + len(live_ids)
 
-        while len(generated) < max_new_tokens:
-            if generated[-1] == self.tokenizer.eos_token_id:
-                break
+        # Pre-allocate decode tensors once; fill in-place each step.
+        dec_input = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        dec_pos   = torch.zeros((1, 1), dtype=torch.long, device=self.device)
 
-            cur_id = generated[-1]
-            input_ids = torch.tensor([[cur_id]], dtype=torch.long, device=self.device)
-            pos_tensor = torch.tensor([[cur_pos]], dtype=torch.long, device=self.device)
+        # Install hooks once for the whole loop — avoids O(tokens × layers)
+        # module traversals that _paged_decode_step would otherwise incur.
+        state: Dict = {
+            "allocator":    self.allocator,
+            "block_table":  block_table,
+            "seq_len":      seq_len_in_pool,
+            "_write_slot":  seq_len_in_pool,
+            "_layer_count": 0,
+            "_num_layers":  self._num_layers,
+        }
+        install_paged_attention(self.model, state)
+        try:
+            while len(generated) < max_new_tokens:
+                if generated[-1] == self.tokenizer.eos_token_id:
+                    break
 
-            # Run HF forward for one token — get K/V projections + logits.
-            # We pass no past_key_values so the model computes Q/K/V from
-            # scratch for this single token, then we handle the KV context
-            # ourselves via the block pool.
-            # NOTE: to avoid O(N) attention cost we hook into the model's
-            # attention output using the paged KV gathered from the pool.
-            # For simplicity here we fall back to full past_key_values for the
-            # decode logits but keep the pool as the authoritative KV store.
-            # A full paged decode (intercepting attn) is done via _paged_decode_step.
-            next_token, block_table, seq_len_in_pool = self._paged_decode_step(
-                token_id=cur_id,
-                position=cur_pos,
-                block_table=block_table,
-                seq_len_in_pool=seq_len_in_pool,
-                temperature=temperature,
-                do_sample=do_sample,
-            )
-            generated.append(next_token)
-            cur_pos += 1
+                dec_input[0, 0] = generated[-1]
+                dec_pos[0, 0]   = cur_pos
+
+                state["block_table"]  = block_table
+                state["seq_len"]      = seq_len_in_pool
+                state["_write_slot"]  = seq_len_in_pool
+                state["_layer_count"] = 0
+
+                with torch.no_grad(), last_logit_only(self.model):
+                    out = self.model(
+                        input_ids=dec_input,
+                        position_ids=dec_pos,
+                        use_cache=False,
+                    )
+
+                block_table     = state["block_table"]
+                seq_len_in_pool = state["_write_slot"] + 1
+
+                generated.append(self._sample(out.logits[:, -1, :], temperature, do_sample))
+                cur_pos += 1
+        finally:
+            uninstall_paged_attention(self.model)
 
         t1 = time.perf_counter()
 
@@ -319,8 +332,7 @@ class CPUPagedEngine(InferenceEngine):
         # Store newly computed prompt chunks for future cache hits
         self._store_prompt_chunks(full_token_ids, cacheable_prefix_len=cacheable_prefix_len)
 
-        output_ids = generated[:]
-        output_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+        output_text = self.tokenizer.decode(generated, skip_special_tokens=True)
         ttft_ms = ((first_token_time or t0) - t0) * 1000
         total_ms = (t1 - t0) * 1000
         tps = len(generated) / max((t1 - t0), 1e-6)
