@@ -157,6 +157,34 @@ def parse_args():
                    help="Temperature applied to target logits in sampling mode "
                         "(default: 1.0). Ignored in greedy mode.")
 
+    # SpecBlock-inspired tree speculative decoding. Requires the flat
+    # speculative drafter to be set (uses the same draft model with a
+    # tree-drafting wrapper). The ``ModeSelector`` then picks per-request
+    # between flat-K and tree-(B,D) by expected wall-time tokens/s.
+    p.add_argument("--speculative-tree", action="store_true", default=False,
+                   help="Enable SpecBlock-inspired tree speculative "
+                        "decoding alongside flat. Requires --speculative-"
+                        "draft-model. Per-request mode is auto-selected "
+                        "by the cost model unless --speculative-mode-policy "
+                        "overrides.")
+    p.add_argument("--speculative-mode-policy", default=None,
+                   choices=["auto", "flat", "tree", "none"],
+                   help="Force one speculative mode per request. Default "
+                        "is 'auto' when --speculative-tree is set, else "
+                        "'flat'. 'none' disables speculation entirely.")
+    p.add_argument("--speculative-tree-max-branching", type=int, default=4,
+                   help="Cap on per-node children in the draft tree "
+                        "(default: 4). Higher = wider tree.")
+    p.add_argument("--speculative-tree-max-depth", type=int, default=6,
+                   help="Cap on tree depth (default: 6). Deeper trees "
+                        "win more when acceptance is high.")
+    p.add_argument("--speculative-tree-node-budget", type=int, default=32,
+                   help="Total node-count cap for the tree (default: 32). "
+                        "Hard-bounds the target verifier's cost.")
+    p.add_argument("--speculative-tree-cold-accept", type=float, default=0.5,
+                   help="Seed acceptance prior for the tree EWMA (default: "
+                        "0.5). Used until 16+ samples per (B,D) cohort.")
+
     # Server
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
@@ -363,6 +391,7 @@ def load_engine(args):
                 args.streaming_quant_kernel,
             )
             speculative_cfg = _build_speculative_config(args)
+            tree_speculative_cfg = _build_tree_speculative_config(args)
             engine = InferenceEngine.from_pretrained(
                 args.model,
                 streaming_config=streaming_config,
@@ -375,6 +404,7 @@ def load_engine(args):
                 prefill_chunk_size=args.prefill_chunk_size,
                 device=device,
                 speculative_config=speculative_cfg,
+                tree_speculative_config=tree_speculative_cfg,
             )
             log.info("Model loaded.")
             return engine
@@ -421,6 +451,7 @@ def load_engine(args):
             prefill_chunk_size=args.prefill_chunk_size,
             device=device,
             speculative_config=_build_speculative_config(args),
+            tree_speculative_config=_build_tree_speculative_config(args),
         )
 
     log.info("Model loaded.")
@@ -438,6 +469,34 @@ def _build_speculative_config(args):
         draft_k=args.speculative_gamma,
         mode=args.speculative_mode,
         temperature=args.speculative_temperature,
+    )
+
+
+def _build_tree_speculative_config(args):
+    """Build a TreeSpeculativeConfig from parsed CLI args, or return None
+    when tree mode is disabled.
+
+    Requires the flat drafter (we reuse the same draft model wrapped
+    by ``TreeDraftModel``). When ``--speculative-tree`` is set but no
+    drafter is configured, raise a SystemExit with a clear message —
+    silently disabling tree mode would mask a misconfiguration.
+    """
+    if not getattr(args, "speculative_tree", False):
+        return None
+    if not getattr(args, "speculative_draft_model", None):
+        raise SystemExit(
+            "ERROR: --speculative-tree requires --speculative-draft-model "
+            "(the tree drafter wraps the same small model). Pass both, "
+            "or drop --speculative-tree."
+        )
+    from ..speculative import TreeSpeculativeConfig
+    policy = getattr(args, "speculative_mode_policy", None) or "auto"
+    return TreeSpeculativeConfig(
+        max_branching=args.speculative_tree_max_branching,
+        max_depth=args.speculative_tree_max_depth,
+        node_budget=args.speculative_tree_node_budget,
+        cold_accept=args.speculative_tree_cold_accept,
+        policy=policy,
     )
 
 
@@ -502,6 +561,10 @@ def main():
             "OOM planning enabled: auto_truncate=%s, safety_margin=%.0f%%",
             args.auto_truncate, args.planner_safety_margin * 100,
         )
+        # Same coefficients drive tree-shape selection. The engine
+        # already constructed its tree engine with defaults; this
+        # writes the calibrated values in.
+        engine.set_cost_coefficients(cost_coefficients)
 
     worker = EngineWorker(
         engine=engine,

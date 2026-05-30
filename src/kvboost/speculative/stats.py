@@ -11,8 +11,9 @@ runtime acceptance.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Any, Deque, Dict, List, Optional
 
 
 @dataclass(slots=True)
@@ -57,6 +58,21 @@ class SpeculativeStats:
     # Histogram of acceptance counts per round; index i = times we saw
     # accepted_count == i. Allocated lazily because draft_k may vary.
     _hist: List[int] = field(default_factory=list)
+
+    # ── Tree-mode counters (Wave 4) ─────────────────────────────────
+    # Disjoint from the flat counters above. A round is either flat
+    # OR tree, never both, so totals add cleanly.
+    tree_rounds: int = 0
+    tree_committed_total: int = 0
+    tree_node_total: int = 0
+
+    # ── Mode-selection log (Wave 4) ─────────────────────────────────
+    # Bounded ring buffer of ``ChosenMode`` snapshots so operators
+    # can spot oscillation between modes via /v1/stats. Stores plain
+    # dicts to keep the stats object JSON-serializable.
+    mode_selection_log: Deque[Dict[str, Any]] = field(
+        default_factory=lambda: deque(maxlen=256),
+    )
 
     def record_round(
         self,
@@ -145,7 +161,79 @@ class SpeculativeStats:
             "avg_verify_ms_per_forward": round(avg_verify_ms, 3),
             "avg_rollback_ms_per_round": round(avg_rollback_ms, 3),
             "histogram": list(self._hist),
+            # ── tree-mode (zero if unused) ──
+            "tree_rounds": self.tree_rounds,
+            "tree_committed_total": self.tree_committed_total,
+            "tree_node_total": self.tree_node_total,
+            "tree_avg_committed_per_round": round(
+                self.tree_avg_committed_per_round, 4,
+            ),
+            "tree_avg_nodes_per_round": round(
+                self.tree_avg_nodes_per_round, 4,
+            ),
+            "mode_selection_log_recent": list(self.mode_selection_log)[-16:],
         }
+
+    def record_tree_round(
+        self,
+        *,
+        committed: int,
+        n_nodes: int,
+        accepted_drafted: int,
+        draft_time_s: float = 0.0,
+        verify_time_s: float = 0.0,
+    ) -> None:
+        """Update tree-mode counters after one tree round.
+
+        ``committed`` is the total tokens added to ``generated`` this
+        round (accepted drafted + correction). ``n_nodes`` is the total
+        tree size. ``accepted_drafted`` is the number of drafted tokens
+        on the accepted path (excludes the correction).
+        """
+        self.tree_rounds += 1
+        self.tree_committed_total += int(committed)
+        self.tree_node_total += int(n_nodes)
+        # Also fold into the unified counters so summary metrics stay
+        # comparable across modes.
+        self.target_forwards += 1
+        self.draft_forwards += int(n_nodes)
+        self.draft_time_s += draft_time_s
+        self.verify_time_s += verify_time_s
+        self.committed_total += int(committed)
+        self.accepted_total += int(accepted_drafted)
+
+    def record_mode_choice(self, choice: Any) -> None:
+        """Append a ``ChosenMode`` snapshot. Kept dict-shaped for JSON."""
+        try:
+            entry: Dict[str, Any] = {
+                "mode": getattr(choice, "mode", "?"),
+                "score": getattr(choice, "score_tokens_per_s", 0.0),
+            }
+            shape = getattr(choice, "shape", None)
+            if shape is not None:
+                entry["shape"] = str(shape)
+            flat_k = getattr(choice, "flat_k", None)
+            if flat_k is not None:
+                entry["flat_k"] = flat_k
+            alt = getattr(choice, "alternatives", None)
+            if alt:
+                entry["alternatives"] = dict(alt)
+            self.mode_selection_log.append(entry)
+        except Exception:
+            # Telemetry must never crash the engine.
+            pass
+
+    @property
+    def tree_avg_committed_per_round(self) -> float:
+        if self.tree_rounds == 0:
+            return 0.0
+        return self.tree_committed_total / self.tree_rounds
+
+    @property
+    def tree_avg_nodes_per_round(self) -> float:
+        if self.tree_rounds == 0:
+            return 0.0
+        return self.tree_node_total / self.tree_rounds
 
     def reset(self) -> None:
         self.rounds = 0
@@ -158,3 +246,7 @@ class SpeculativeStats:
         self.verify_time_s = 0.0
         self.rollback_time_s = 0.0
         self._hist = []
+        self.tree_rounds = 0
+        self.tree_committed_total = 0
+        self.tree_node_total = 0
+        self.mode_selection_log.clear()

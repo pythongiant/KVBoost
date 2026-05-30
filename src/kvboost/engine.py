@@ -30,7 +30,10 @@ import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, TYPE_CHECKING, Tuple
+
+if TYPE_CHECKING:
+    from .speculative.tree.config import TreeSpeculativeConfig
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -101,6 +104,11 @@ class InferenceEngine:
         prefill_chunk_size: int = 0,
         # Speculative decoding (None = disabled, baseline decode path)
         speculative_config: Optional["SpeculativeConfig"] = None,
+        # Tree speculative — SpecBlock-inspired, may coexist with flat
+        tree_speculative_config: Optional["TreeSpeculativeConfig"] = None,
+        # Cost coefficients (probed at server startup) for cost-aware
+        # tree shape + mode selection. None = degraded mode (defaults).
+        cost_coefficients: Any = None,
     ):
         if device is None:
             device = default_device()
@@ -160,30 +168,105 @@ class InferenceEngine:
 
         # Speculative decoding (decode-phase orthogonal to recompute_strategy).
         # CacheBlend handles prefill; speculative handles decode. They stack.
+        # Two flavors: flat (token-by-token K draft) and tree (SpecBlock-
+        # inspired). Both may be present; the bridge / ModeSelector picks
+        # per-request when so.
         self.speculative_config = speculative_config
+        self.tree_speculative_config = tree_speculative_config
+        self.cost_coefficients = cost_coefficients
         self.speculative_engine = None
-        if speculative_config is not None:
-            speculative_config.validate()
+        self.tree_speculative_engine = None
+        self.mode_selector = None
+
+        need_draft = (
+            speculative_config is not None
+            or tree_speculative_config is not None
+        )
+        if need_draft:
             from .speculative.draft import DraftModel
-            from .speculative.engine import SpeculativeEngine
             from .speculative.stats import SpeculativeStats
             from .speculative.verifier import TargetVerifier
 
-            log.info(
-                "Speculative decoding enabled: %s",
-                speculative_config.summary(),
-            )
+            # Validate whichever configs are present. The DraftModel
+            # itself needs a flat-style ``SpeculativeConfig`` so its
+            # model-load path stays one code path (the tree config
+            # doesn't carry draft_model_id / draft_streaming_config; if
+            # only tree is wired we still rely on the flat config for
+            # the drafter handle).
+            if speculative_config is not None:
+                speculative_config.validate()
+            if tree_speculative_config is not None:
+                tree_speculative_config.validate()
+
+            # The drafter is shared across flat + tree.
+            if speculative_config is None:
+                raise ValueError(
+                    "tree_speculative_config requires a flat "
+                    "SpeculativeConfig (drafter model handle); pass "
+                    "both."
+                )
+
             self._speculative_stats = SpeculativeStats()
+            log.info(
+                "Speculative decoding enabled: flat=%s tree=%s",
+                speculative_config.summary(),
+                tree_speculative_config.summary()
+                if tree_speculative_config else "off",
+            )
             draft = DraftModel(
                 speculative_config, target_tokenizer=tokenizer
             )
             verifier = TargetVerifier(self.model, device=device)
+
+            # Flat engine: existing path, unchanged.
+            from .speculative.engine import SpeculativeEngine
             self.speculative_engine = SpeculativeEngine(
                 cfg=speculative_config,
                 target_verifier=verifier,
                 draft_model=draft,
                 stats=self._speculative_stats,
             )
+
+            # Tree engine: only when its config is provided.
+            if tree_speculative_config is not None:
+                from .speculative.tree.engine import TreeSpeculativeEngine
+
+                target_step_ms = (
+                    cost_coefficients.step_latency_ms
+                    if cost_coefficients is not None else 50.0
+                )
+                # Draft step latency is unknown without probing the
+                # drafter directly; approximate as a small fraction of
+                # the target step (drafter is ~1/10th model size).
+                draft_step_ms = max(1.0, target_step_ms * 0.15)
+
+                self.tree_speculative_engine = TreeSpeculativeEngine(
+                    cfg=tree_speculative_config,
+                    target_verifier=verifier,
+                    draft_model=draft,
+                    cost_coefficients=cost_coefficients,
+                    target_step_ms=target_step_ms,
+                    draft_step_ms=draft_step_ms,
+                    mode=speculative_config.mode,
+                    temperature=speculative_config.temperature,
+                    stats=self._speculative_stats,
+                )
+
+                # Build the auto-selector. Shares the tree engine's
+                # EWMA so its scoring reads the same observations the
+                # tree engine writes after every round.
+                from .speculative.mode_selector import ModeSelector
+                self.mode_selector = ModeSelector(
+                    target_step_ms=target_step_ms,
+                    draft_step_ms=draft_step_ms,
+                    flat_available=True,
+                    tree_available=True,
+                    tree_config=tree_speculative_config,
+                    flat_k=speculative_config.draft_k,
+                    flat_cold_accept=0.4,
+                    tree_ewma=self.tree_speculative_engine.ewma,
+                    cost_coefficients=cost_coefficients,
+                )
         else:
             self._speculative_stats = None
 
@@ -269,6 +352,35 @@ class InferenceEngine:
         instead of reaching into internals.
         """
         self.cache_manager.clear()
+
+    def set_cost_coefficients(self, cc: Any) -> None:
+        """Populate cost coefficients post-construction.
+
+        The server probes coefficients AFTER engine load (the probe
+        needs the loaded model), then plumbs them back here. They
+        drive tree-shape selection and mode-auto-selection; setting
+        them late just means the first request uses the defaults
+        and subsequent requests are calibrated. Safe to call multiple
+        times (e.g. if the operator updates them via /v1/stats).
+        """
+        self.cost_coefficients = cc
+        if self.tree_speculative_engine is not None:
+            self.tree_speculative_engine.cc = cc
+            # Update measured step latency if available — the tree
+            # engine multiplies this by predicted node count, so a
+            # bad value distorts every shape decision.
+            try:
+                self.tree_speculative_engine.target_step_ms = float(
+                    cc.step_latency_ms
+                )
+            except Exception:
+                pass
+        if self.mode_selector is not None:
+            self.mode_selector.cc = cc
+            try:
+                self.mode_selector.target_step_ms = float(cc.step_latency_ms)
+            except Exception:
+                pass
 
     def generate(
         self,
@@ -877,7 +989,11 @@ class InferenceEngine:
         # We extend past_kv by one forward to cover that first sampled
         # token, then hand off — speculative's invariant is that past_kv
         # exactly covers the input prompt_ids.
-        if self.speculative_engine is not None and len(generated) < max_new_tokens:
+        any_spec = (
+            self.speculative_engine is not None
+            or self.tree_speculative_engine is not None
+        )
+        if any_spec and len(generated) < max_new_tokens:
             extended_pos = cached_len + len(live_ids)
             first_t = torch.tensor(
                 [[generated[-1]]], dtype=torch.long, device=self.device
@@ -896,11 +1012,16 @@ class InferenceEngine:
             extended_prompt_ids = list(full_token_ids) + [generated[-1]]
             from .speculative.bridge import run_speculative_decode
 
+            tree_cfg = self.tree_speculative_config
+            policy = tree_cfg.policy if tree_cfg is not None else "auto"
             spec_generated, past_kv = run_speculative_decode(
                 full_token_ids=extended_prompt_ids,
                 target_past_kv=past_kv,
                 cached_length=len(extended_prompt_ids),
                 spec_engine=self.speculative_engine,
+                tree_engine=self.tree_speculative_engine,
+                mode_selector=self.mode_selector,
+                policy=policy,
                 max_new_tokens=max_new_tokens - len(generated),
                 eos_token_id=self.tokenizer.eos_token_id,
                 on_token=on_token,

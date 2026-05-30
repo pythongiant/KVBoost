@@ -27,12 +27,21 @@ from .bridge import run_speculative_decode
 from .config import SpeculativeConfig, SpeculativeMode
 from .draft import DraftModel
 from .engine import SpeculativeEngine
-from .rollback import truncate_past_kv
+from .mode_selector import ChosenMode, ModeSelector
+from .rollback import gather_kv_columns, truncate_past_kv
 from .sampler import verify_greedy, verify_sampling
 from .stats import SpeculativeStats
+from .tree import (
+    AcceptanceEWMA,
+    TreeShape,
+    TreeSpeculativeConfig,
+    pick_shape,
+)
+from .tree.engine import TreeSpeculativeEngine
 from .verifier import TargetVerifier
 
 __all__ = [
+    # flat
     "SpeculativeConfig",
     "SpeculativeMode",
     "SpeculativeEngine",
@@ -42,5 +51,15 @@ __all__ = [
     "verify_greedy",
     "verify_sampling",
     "truncate_past_kv",
+    "gather_kv_columns",
     "run_speculative_decode",
+    # tree
+    "TreeSpeculativeConfig",
+    "TreeSpeculativeEngine",
+    "TreeShape",
+    "AcceptanceEWMA",
+    "pick_shape",
+    # mode selection
+    "ModeSelector",
+    "ChosenMode",
 ]
