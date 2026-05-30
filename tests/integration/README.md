@@ -35,91 +35,88 @@ Default model: `Qwen/Qwen2.5-3B-Instruct`. Override via
 
 ### Terminal 2: drive the load
 
+The driver **streams tokens** (`stream: true`) so it measures real TTFT
+and decode rate, and shows a **live ANSI dashboard** where each request
+moves through WAITING → PREFILL → STREAM → DONE/ERR/413 with live token
+counts. When stdout isn't a TTY (piped to a file / CI) it falls back to
+one plain log line per completion — no flag needed.
+
 ```bash
 # Realistic production mix (50% short, 20% long-doc, 15% multi-turn,
-# 10% code review, 5% research). Concurrency 4, 30 requests.
+# 10% code review, 5% research). Concurrency 2, 30 requests.
 python tests/integration/load_oom_planner.py \
     --base-url http://localhost:9000 \
     --model Qwen/Qwen2.5-3B-Instruct \
     --workload production \
-    --concurrency 4 \
-    --n-requests 30 \
-    --verbose
+    --concurrency 2 \
+    --n-requests 30
 
 # Heavy mix — biased toward long contexts (9-29K input each).
 # Real stress test for the planner's chunk_size / kv_bits decisions.
-python tests/integration/load_oom_planner.py \
-    --workload heavy --n-requests 20 --concurrency 2 --verbose
+python tests/integration/load_oom_planner.py --workload heavy --n-requests 20
 
-# Burst short — all 80-token prompts. Measures planner *overhead*
-# when the prompt is small (should be invisible).
+# Burst short — all 80-token prompts. Measures TTFT + planner overhead
+# on small prompts (should be near-instant). Higher concurrency OK here.
 python tests/integration/load_oom_planner.py \
     --workload burst --n-requests 100 --concurrency 8
 
 # All-oversized — every request is 80K tokens, expect 100% planned 413s
 # (or 100% truncation-succeeded if server has --auto-truncate).
-python tests/integration/load_oom_planner.py \
-    --workload oversized --n-requests 20 --concurrency 4
+python tests/integration/load_oom_planner.py --workload oversized --n-requests 20
 ```
 
-## Output you'll see
+## Live dashboard (TTY)
+
+While running, each request is a row updating in place:
 
 ```
-Workload: production, 30 requests, concurrency=4
-Per-shape counts:
-  code-review-120: 1
-  code-review-60: 5
-  long-doc-200: 4
-  long-doc-300: 2
-  long-doc-500: 1
-  multi-turn-4: 5
-  multi-turn-8: 1
-  short-chat: 11
+kvboost load — production
+  0 short-chat       DONE    in≈    80 out=  64 ttft=  210ms dec= 88.4t/s   2.6s ██████████
+  1 long-doc-200     STREAM  in≈  9360 out= 412 ttft= 1840ms dec= 31.2t/s  14.9s ████······
+  2 code-review-120  PREFILL in≈ 17628 out=   0 ttft=    ·ms dec=    ·t/s   8.1s
+  3 long-doc-500     413     in≈ 23400 out=   0 ttft=    ·ms dec=    ·t/s   0.4s rejected
+  4 short-chat       WAITING in≈    80 out=   0 ttft=    ·ms dec=    ·t/s   0.0s
+done 1  active 2  rejected(413) 1  errors 0 | out_tokens 476  sys 27.3 tok/s  elapsed 17.4s
+```
 
-Planner snapshot (pre-load):
-  free_vram_mb_now: 8420
-  calibration:
-    n_samples:        0
-    suggested_margin: 15.00%
+State legend: **WAITING** queued · **PREFILL** sent, awaiting first token ·
+**STREAM** receiving tokens (bar = out/max_tokens) · **DONE** · **413**
+planner rejection (counted as success) · **ERR** unexpected failure.
 
-Planner snapshot (midpoint, t≈45s):
-  free_vram_mb_now: 8200
-  calibration:
-    n_samples:        14
-    residual_median:  -3.2%
-    residual_p95:     +6.8%
-    suggested_margin: 15.00%
+## Final summary (printed after the dashboard)
 
-Per-shape latency + throughput:
-shape                  n_ok  413p  413u  5xx tout   p50ms   p95ms   p99ms   tok/s
--------------------------------------------------------------------------------
-code-review-120           1     0     0    0    0    8420    8420    8420    24.3
-code-review-60            5     0     0    0    0    5310    6890    6890    38.6
-long-doc-200              4     0     0    0    0    6820    8200    8200    30.1
-long-doc-300              2     0     0    0    0    9100    9450    9450    22.5
-long-doc-500              1     0     0    0    0   13200   13200   13200    15.5
-multi-turn-4              5     0     0    0    0    1140    1820    1820    44.3
-multi-turn-8              1     0     0    0    0    1980    1980    1980    25.9
-short-chat               11     0     0    0    0     280     410     460    91.2
+```
+Per-shape TTFT + decode throughput:
+shape              ok  413  err  ttftP50  ttftP95  decP50  sysTok/s
+------------------------------------------------------------------
+code-review-120     1    0    0     8120     8120    24.3      22.1
+long-doc-200        4    0    0     1780     2310    31.0      29.5
+long-doc-500        0    1    0        0        0     0.0       0.0
+short-chat         11    0    0      205      290    89.1      84.7
 
-totals: 30 requests, 30 ok / planned-413, 0 unexpected errors
-Overall: 30 requests in 87.3s (0.34 req/s), 0 unexpected errors
+Overall: 30 requests, 8740 output tokens in 92.4s (94.6 sys tok/s), 0 unexpected errors
 ```
 
 ## What to look for
 
-- **`unexpected errors == 0`** — every request either succeeded or got
-  a planned 413 (operator-correct rejection).
-- **`residual_p95` vs `suggested_margin`** — if p95 > current margin,
-  surprise OOMs will slip through; bump `--planner-safety-margin`. If
-  p95 ≪ margin, you're wasting VRAM headroom.
-- **per-shape `p95 / p50` ratio** — high ratio means the planner is
-  occasionally picking a slow config for that shape (e.g. dropping to
-  int4 when int8 would fit). Cross-check against the cohort table.
-- **`413p` (planned-413)** — when running `--workload oversized` this
-  should equal `n-requests`. If you see `413u` (unplanned), the
-  planner thought a request would fit but the HTTP layer disagreed —
-  serious bug worth investigating.
+- **`0 unexpected errors`** — every request either streamed to completion
+  or got a planned 413 (operator-correct rejection). A 413 is **not** an
+  error; it's the planner refusing an unfittable prompt up front.
+- **TTFT p50/p95** — first-token latency. For long-doc shapes this is
+  dominated by prefill; a p95 ≫ p50 means some requests queued behind
+  others (raise concurrency cautiously, or it's just a slow GPU).
+- **decode tok/s (decP50)** — steady-state generation rate, independent
+  of prefill. If this is low (<10 on a 3B), the GPU is the bottleneck,
+  not the planner.
+- **sys tok/s** — system throughput (all output tokens / wall). The
+  number that matters for capacity planning.
+- **`residual_p95` vs `suggested_margin`** (planner snapshot) — if p95 >
+  margin, surprise OOMs will slip through; bump `--planner-safety-margin`.
+  If p95 ≪ margin, you're over-reserving VRAM.
+- **err > 0 on long shapes** — if a long-doc / code-review shape shows
+  `err` with a CUDA-OOM message, the planner mis-predicted (its
+  chunk-based memory model was violated). Cross-check the server log for
+  `OOM slipped past planner`.
 
 ## Server log to grep alongside (Terminal 1)
 
