@@ -75,13 +75,26 @@ class CostCoefficients:
                                     # falls back to model_bytes / HBM_bw)
     step_latency_source: str = "roofline"  # "measured" | "roofline" | "default"
 
+    # ── Activation floor ──
+    # Peak transient activation memory of a SINGLE forward pass,
+    # independent of prompt length. This is the working set across all
+    # decoder layers (intermediate hidden states, attention buffers,
+    # MLP projections) that the allocator high-water-mark captures even
+    # for a 1-token decode. The planner adds this as a constant floor;
+    # without it, short-prompt peak predictions undershoot by the full
+    # model activation working set (the +30000% residuals we observed).
+    # Measured during the decode microbenchmark; 0.0 when unmeasured
+    # (planner then falls back to a per-layer heuristic).
+    baseline_activation_mb: float = 0.0
+
     def summary(self) -> str:
         return (
             f"VRAM={self.total_vram_mb / 1024:.1f} GiB, "
             f"layers={self.num_layers} × {self.per_layer_mb:.0f} MiB, "
             f"PCIe H→D={self.pcie_h2d_gibps:.1f} GiB/s, "
             f"HBM={self.hbm_bandwidth_gibps:.0f} GiB/s, "
-            f"step_latency={self.step_latency_ms:.1f} ms ({self.step_latency_source})"
+            f"step_latency={self.step_latency_ms:.1f} ms ({self.step_latency_source}), "
+            f"act_floor={self.baseline_activation_mb:.0f} MiB"
         )
 
 
@@ -145,25 +158,35 @@ def _probe_hbm_bandwidth(device, *, size_mb: int = 256, repeats: int = 5) -> flo
     return (2 * nbytes / best) / (1024.0 ** 3)
 
 
-def _probe_decode_step_latency_ms(engine, *, warmup: int = 2, repeats: int = 5) -> float:
-    """Time one real decode forward to get an honest ``step_latency_ms``.
+def _probe_decode_step(
+    engine, *, warmup: int = 2, repeats: int = 5,
+) -> "tuple[float, float]":
+    """Probe a real decode forward for ``(step_latency_ms, activation_mb)``.
 
-    Runs the loaded model with a tiny prompt, then ``repeats`` single-token
-    decode steps with KV cache. The median is returned. This captures every
-    overhead source the roofline misses: kernel launch latency, attention
-    scratch allocation, optional speculative-draft forwards, streaming-layer
-    DMA, etc.
+    Two measurements from the same microbenchmark:
 
-    Bounded by ``warmup + repeats`` forwards. Each forward on an 8B-class
-    model is ~50 ms; total probe is well under a second. Wrapped in
-    try/except by the caller — any failure means we fall back to the
-    roofline estimate (``model_bytes / hbm_bandwidth``).
+      - **step_latency_ms**: median single-token decode time. Captures
+        every overhead the roofline misses (kernel launch, attention
+        scratch, speculative-draft forwards, streaming DMA).
+
+      - **activation_mb**: peak transient activation of one forward,
+        measured as ``max_memory_allocated − allocated_before``. This
+        is the working set across all decoder layers that exists for
+        ANY forward regardless of prompt length. The planner uses it
+        as a floor so short-prompt peak predictions don't undershoot
+        by the full model activation working set. Returns 0.0 on
+        non-CUDA devices (no allocator stats).
+
+    Bounded by ``warmup + repeats`` forwards. Wrapped in try/except by
+    the caller — any failure falls back to the roofline latency
+    estimate and a 0.0 activation floor.
     """
     import torch
     device = engine.device
     tokenizer = getattr(engine, "tokenizer", None)
     if tokenizer is None:
         raise RuntimeError("engine.tokenizer not available")
+    is_cuda = str(device).startswith("cuda")
 
     # Build a minimal valid input. Some tokenizers reject empty strings.
     seed = tokenizer("Hi", return_tensors="pt").input_ids.to(device)
@@ -175,6 +198,7 @@ def _probe_decode_step_latency_ms(engine, *, warmup: int = 2, repeats: int = 5) 
     next_tok = torch.tensor([[bos_id]], device=device, dtype=torch.long)
 
     model = engine.model
+    activation_mb = 0.0
     with torch.no_grad():
         # Prime KV cache with the seed prompt.
         out = model(seed, use_cache=True)
@@ -185,8 +209,19 @@ def _probe_decode_step_latency_ms(engine, *, warmup: int = 2, repeats: int = 5) 
             out = model(next_tok, past_key_values=past, use_cache=True)
             past = out.past_key_values
 
-        if str(device).startswith("cuda"):
+        if is_cuda:
             torch.cuda.synchronize(device)
+            # Measure activation high-water-mark of one isolated forward:
+            # the delta between peak-during-forward and the resident set
+            # before it. Excludes weights + KV (both already resident),
+            # leaving the pure transient activation working set.
+            allocated_before = torch.cuda.memory_allocated(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            out = model(next_tok, past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            torch.cuda.synchronize(device)
+            peak = torch.cuda.max_memory_allocated(device)
+            activation_mb = max(0.0, (peak - allocated_before) / (1024.0 ** 2))
 
         # Timed decodes.
         samples = []
@@ -194,13 +229,13 @@ def _probe_decode_step_latency_ms(engine, *, warmup: int = 2, repeats: int = 5) 
             t0 = time.perf_counter()
             out = model(next_tok, past_key_values=past, use_cache=True)
             past = out.past_key_values
-            if str(device).startswith("cuda"):
+            if is_cuda:
                 torch.cuda.synchronize(device)
             samples.append(time.perf_counter() - t0)
 
     samples.sort()
     median = samples[len(samples) // 2]
-    return median * 1000.0
+    return median * 1000.0, activation_mb
 
 
 def _detect_num_layers(config: Any) -> int:
@@ -317,9 +352,10 @@ def probe_cost_coefficients(
     # sensible number.
     step_latency_ms = _DEFAULT_STEP_LATENCY_MS
     step_latency_source = "default"
+    baseline_activation_mb = 0.0
     if is_cuda and not skip_step_latency_probe:
         try:
-            step_latency_ms = _probe_decode_step_latency_ms(engine)
+            step_latency_ms, baseline_activation_mb = _probe_decode_step(engine)
             step_latency_source = "measured"
         except Exception as e:
             log.warning(
@@ -343,6 +379,7 @@ def probe_cost_coefficients(
         hbm_bandwidth_gibps=hbm_gibps,
         step_latency_ms=step_latency_ms,
         step_latency_source=step_latency_source,
+        baseline_activation_mb=baseline_activation_mb,
     )
     log.info("Probed cost coefficients: %s", cc.summary())
     return cc

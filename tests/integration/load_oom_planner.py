@@ -369,11 +369,20 @@ def main() -> int:
              "'oversized' = all 80K-token rejects",
     )
     ap.add_argument("--n-requests", type=int, default=30)
-    ap.add_argument("--concurrency", type=int, default=2)
     ap.add_argument(
-        "--timeout-s", type=float, default=180.0,
-        help="Per-request HTTP timeout (default 180s — long-doc "
-             "completions can take a while)",
+        "--concurrency", type=int, default=1,
+        help="Concurrent in-flight requests (default 1). The engine is "
+             "single-GPU-worker, so higher concurrency mostly piles up "
+             "queue wait — raise it only to test back-pressure / batching, "
+             "and raise --timeout-s to match.",
+    )
+    ap.add_argument(
+        "--timeout-s", type=float, default=600.0,
+        help="Per-request HTTP timeout (default 600s). Long-context "
+             "completions queued behind others on a single GPU worker can "
+             "take minutes wall-clock; 600s avoids spurious client-side "
+             "ReadTimeouts that look like failures but are really the "
+             "server still working.",
     )
     ap.add_argument(
         "--duration-s", type=float, default=0.0,

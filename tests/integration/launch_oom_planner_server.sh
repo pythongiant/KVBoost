@@ -19,6 +19,13 @@ PROFILE="${1:-tight}"
 PORT="${2:-9000}"
 MODEL="${KVBOOST_TEST_MODEL:-Qwen/Qwen2.5-3B-Instruct}"
 
+# NOTE: --release-cache-after-request is deliberately NOT set by default.
+# It runs torch.cuda.empty_cache() + a full chunk-cache reset between
+# every request, which destroys KV reuse and thrashes the allocator —
+# it tanked throughput to ~2.6 tok/s in load testing. Only enable it via
+# the explicit `tight-release` profile when you specifically want to
+# validate behavior on an 8 GB-class GPU that genuinely can't hold a
+# populated cache + activations across requests.
 case "$PROFILE" in
     tight)
         CACHE_BYTES=2e9
@@ -35,8 +42,15 @@ case "$PROFILE" in
         MARGIN=0.15
         EXTRA="--auto-truncate"
         ;;
+    tight-release)
+        # Tight + release-cache. Slow by design — only for validating
+        # the cache-release path on very small GPUs.
+        CACHE_BYTES=2e9
+        MARGIN=0.15
+        EXTRA="--release-cache-after-request"
+        ;;
     *)
-        echo "unknown profile: $PROFILE (use: tight|loose|truncate)" >&2
+        echo "unknown profile: $PROFILE (use: tight|loose|truncate|tight-release)" >&2
         exit 2
         ;;
 esac
@@ -56,7 +70,6 @@ exec python -m kvboost.server \
     --max-cache-bytes "$CACHE_BYTES" \
     --planner-safety-margin "$MARGIN" \
     --kv-cache-bits 8 \
-    --release-cache-after-request \
     --max-batch-size 2 \
     --port "$PORT" \
     $EXTRA

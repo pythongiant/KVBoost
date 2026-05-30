@@ -380,33 +380,63 @@ class OOMPlanner:
         kv_bits: int,
         max_new_tokens: int = 0,
     ) -> float:
-        """Predicted peak transient VRAM during prefill, in MiB.
+        """Predicted peak *transient* VRAM for this request, in MiB.
 
-        Three components:
-          - **KV total**: every prompt token + every generated token
-            gets a KV entry. At ``kv_bits`` precision.
-          - **Activation**: one chunk's worth of hidden states sitting
-            in flight. We size this for fp16 (the compute dtype) even
-            if KV is more compressed — the activations aren't quantized.
-          - **Attention scratch**: the chunk's queries attending to
-            *all* accumulated KV. Peaks at the end of prefill when
-            ``accum_kv ≈ prompt_tokens``. Size is ``K × N × heads × 4
-            bytes × 2`` (scores + softmax buffer).
+        "Transient" = memory allocated on top of what's already resident
+        (model weights + any existing KV). The fitting check compares
+        this against *free* VRAM, which already excludes the resident
+        set — so the two are consistent.
+
+        Four components:
+          - **KV total**: every prompt + generated token gets a KV entry
+            at ``kv_bits`` precision.
+          - **Activation floor**: the per-forward working set across all
+            decoder layers that exists regardless of prompt length —
+            measured by the cost-model probe (``baseline_activation_mb``).
+            Without this term, short-prompt predictions undershoot by
+            the entire model activation working set (the +30000%
+            residuals we observed before this fix). Falls back to a
+            per-layer heuristic when unmeasured.
+          - **Chunk activation**: one chunk's hidden states in flight,
+            fp16. Scales with chunk_size on top of the floor.
+          - **Attention scratch**: the chunk's queries attending to all
+            accumulated KV; peaks at end of prefill. ``K × N × heads ×
+            4 bytes × 2`` (scores + softmax buffer).
         """
         total_tokens = prompt_tokens + max_new_tokens
 
         kv_bytes = total_tokens * self._bytes_per_token_kv(kv_bits)
 
-        # One chunk's activation, fp16 (2 bytes). Conservative: assumes
-        # one layer's intermediate is in flight at peak.
-        activation_bytes = chunk_size * self.hidden_dim * 2
+        # Per-forward activation floor (constant in prompt length).
+        floor_bytes = self._activation_floor_mb() * (1024.0 ** 2)
+
+        # One chunk's hidden states, fp16 (2 bytes) — marginal activation
+        # that scales with chunk size on top of the floor.
+        chunk_activation_bytes = chunk_size * self.hidden_dim * 2
 
         # Attention scores at the worst-case point of prefill (last chunk).
         # 4 bytes for fp32 softmax accumulator, ×2 for scores + temp buffer.
         scratch_bytes = chunk_size * prompt_tokens * self.num_heads * 4 * 2
 
-        peak = kv_bytes + activation_bytes + scratch_bytes
+        peak = kv_bytes + floor_bytes + chunk_activation_bytes + scratch_bytes
         return peak / (1024.0 ** 2)
+
+    def _activation_floor_mb(self) -> float:
+        """Per-forward activation working-set floor in MiB.
+
+        Prefers the measured ``baseline_activation_mb`` from the cost-
+        model probe. When unmeasured (0.0 — non-CUDA, or probe failed),
+        falls back to a crude per-layer heuristic: a few layers' worth
+        of hidden-state buffers. The heuristic is deliberately modest;
+        on CPU the fitting check sees infinite free VRAM anyway, so the
+        floor only matters on a real GPU where the probe succeeds.
+        """
+        if self.cc is not None and getattr(self.cc, "baseline_activation_mb", 0.0) > 0:
+            return float(self.cc.baseline_activation_mb)
+        # Heuristic: residual stream + MLP intermediate (~4× hidden) for
+        # a handful of layers held in flight. fp16 (2 bytes).
+        approx_bytes = 4 * self.hidden_dim * self.num_layers * 2
+        return approx_bytes / (1024.0 ** 2)
 
     def _free_vram_mb(self) -> float:
         """Live snapshot of free VRAM on the engine's device."""
@@ -538,6 +568,11 @@ class OOMPlanner:
         device = getattr(self.engine, "device", None)
         reset_peak_mem_stats(device)
         pre = gpu_mem_snapshot(device)
+        # Stash the resident set so log_post_request can subtract it from
+        # the absolute peak to recover the TRANSIENT actual — the same
+        # quantity estimate_peak_mb predicts. Single-worker engine ⇒ one
+        # in-flight request ⇒ a plain instance attr is safe.
+        self._allocated_before_mb = pre.get("allocated_mb", 0.0)
         log.info("Plan committed: %s | mem-pre: %s", plan, format_snapshot(pre))
 
     def log_post_request(self, plan: RequestPlan, prompt_tokens: int) -> None:
@@ -546,24 +581,37 @@ class OOMPlanner:
 
         ``prompt_tokens`` is needed so the calibration tracker can index
         residuals by request shape (helps separate "small prompts always
-        overshoot" from "long prompts always undershoot")."""
+        overshoot" from "long prompts always undershoot").
+
+        The residual compares predicted-transient against ACTUAL-transient
+        (= absolute peak − resident-before-request), not against the raw
+        ``max_memory_allocated``. The raw peak includes resident model
+        weights, which estimate_peak_mb deliberately excludes; comparing
+        the two directly produced meaningless +200%/+30000% residuals.
+        """
         device = getattr(self.engine, "device", None)
         post = gpu_mem_snapshot(device)
-        actual_peak = post.get("peak_mb", 0)
+        abs_peak = post.get("peak_mb", 0.0)
+        allocated_before = getattr(self, "_allocated_before_mb", 0.0)
+        # Transient = peak high-water-mark minus what was resident at
+        # reset time. Clamp at 0 in case of measurement skew.
+        actual_transient = max(0.0, abs_peak - allocated_before)
         predicted = plan.estimated_peak_mb
-        if actual_peak > 0 and predicted > 0:
-            error_pct = (actual_peak - predicted) / predicted * 100.0
+        if actual_transient > 0 and predicted > 0:
+            error_pct = (actual_transient - predicted) / predicted * 100.0
             log.info(
                 "Request done | mem-post: %s | "
-                "predicted=%.0fMiB actual=%.0fMiB err=%+.1f%%",
-                format_snapshot(post), predicted, actual_peak, error_pct,
+                "predicted=%.0fMiB actual=%.0fMiB (transient, abs_peak=%.0f) "
+                "err=%+.1f%%",
+                format_snapshot(post), predicted, actual_transient,
+                abs_peak, error_pct,
             )
             self.calibration.record(
                 chunk_size=plan.chunk_size,
                 kv_bits=plan.kv_bits,
                 prompt_tokens=prompt_tokens,
                 predicted_mb=predicted,
-                actual_mb=actual_peak,
+                actual_mb=actual_transient,
             )
         else:
             log.info("Request done | mem-post: %s", format_snapshot(post))
