@@ -164,6 +164,7 @@ class InferenceEngine:
         self.cacheblend_recompute = CacheBlendRecompute(
             recompute_ratio=recompute_ratio,
             device="cpu",
+            prefill_chunk_size=self.prefill_chunk_size,
         )
 
         # Speculative decoding (decode-phase orthogonal to recompute_strategy).
@@ -449,8 +450,13 @@ class InferenceEngine:
         """
         old_chunk = self.prefill_chunk_size
         old_bits = self.cache_manager.kv_cache_bits
+        old_cb_chunk = self.cacheblend_recompute.prefill_chunk_size
         if prefill_chunk_size is not None:
             self.prefill_chunk_size = int(prefill_chunk_size)
+            # CacheBlend's Step-1 forward must chunk by the SAME size or
+            # the planner's chunk-based memory model is violated on
+            # cache-hit prompts (the path CacheBlend handles).
+            self.cacheblend_recompute.prefill_chunk_size = int(prefill_chunk_size)
         if kv_cache_bits is not None:
             self.cache_manager.kv_cache_bits = int(kv_cache_bits)
         try:
@@ -458,6 +464,7 @@ class InferenceEngine:
         finally:
             self.prefill_chunk_size = old_chunk
             self.cache_manager.kv_cache_bits = old_bits
+            self.cacheblend_recompute.prefill_chunk_size = old_cb_chunk
 
     def generate_batch(
         self,

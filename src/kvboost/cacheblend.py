@@ -61,10 +61,18 @@ class CacheBlendRecompute:
         recompute_ratio: float = 0.15,
         min_deviation: float = 0.01,
         device: Optional[str] = None,
+        prefill_chunk_size: int = 0,
     ):
         self.recompute_ratio = recompute_ratio
         self.min_deviation = min_deviation
         self.device = device if device is not None else default_device()
+        # Slice the Step-1 full-context forward into chunks of this many
+        # tokens to bound peak attention-scratch memory. 0 = single-shot
+        # (legacy, O(N²) attention scores — OOMs on long cache-hit
+        # prompts). The engine keeps this in sync with its own
+        # ``prefill_chunk_size`` per request so the OOM planner's
+        # chunk-based memory model actually holds for the CacheBlend path.
+        self.prefill_chunk_size = int(prefill_chunk_size)
 
     def apply(
         self,
@@ -116,20 +124,39 @@ class CacheBlendRecompute:
         model_device = next(model.parameters()).device
         cached_tokens = full_token_ids[:cached_length]
 
-        # ── Step 1: cheap forward pass to get full-context KV ──────
-        input_ids = torch.tensor(
-            [cached_tokens], dtype=torch.long, device=model_device
-        )
-        pos_ids = torch.arange(
-            0, cached_length, dtype=torch.long, device=model_device
-        ).unsqueeze(0)
+        # ── Step 1: full-context forward to get "what KV would be" ──────
+        # Chunk the forward in slices of ``prefill_chunk_size`` tokens,
+        # growing past_key_values between slices, so peak attention scratch
+        # is bounded by ``chunk × cached_length`` instead of the O(N²)
+        # ``cached_length²`` a single-shot forward materializes. The result
+        # is bit-identical: causal attention means each token attends to
+        # all prior tokens regardless of where the chunk boundaries fall,
+        # and we only consume ``out.past_key_values`` (logits are dropped
+        # via last_logit_only). 0 = single-shot (legacy).
+        cs = self.prefill_chunk_size
+        chunk_step = cached_length if cs <= 0 else min(cs, cached_length)
 
+        out = None
+        past_kv = None
+        cur = 0
         with torch.no_grad(), last_logit_only(model):
-            out = model(
-                input_ids=input_ids,
-                position_ids=pos_ids,
-                use_cache=True,
-            )
+            while cur < cached_length:
+                end = min(cur + chunk_step, cached_length)
+                slice_ids = cached_tokens[cur:end]
+                input_ids = torch.tensor(
+                    [slice_ids], dtype=torch.long, device=model_device
+                )
+                pos_ids = torch.arange(
+                    cur, end, dtype=torch.long, device=model_device
+                ).unsqueeze(0)
+                out = model(
+                    input_ids=input_ids,
+                    past_key_values=past_kv,
+                    position_ids=pos_ids,
+                    use_cache=True,
+                )
+                past_kv = out.past_key_values
+                cur = end
 
         updated_kv = self._extract_kv(out.past_key_values)
 

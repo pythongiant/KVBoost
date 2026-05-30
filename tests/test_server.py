@@ -123,7 +123,7 @@ def sync_client(engine):
 class TestCompletionRequestSchema:
     def test_default_values(self):
         req = CompletionRequest(model=MODEL_NAME, prompt="hello")
-        assert req.max_tokens == 128
+        assert req.max_tokens == 4096   # default raised for long reasoning outputs
         assert req.temperature == 1.0
         assert req.stream is False
         assert req.prompts == ["hello"]
@@ -147,8 +147,11 @@ class TestCompletionRequestSchema:
     def test_max_tokens_bounds(self):
         with pytest.raises(Exception):
             CompletionRequest(model=MODEL_NAME, prompt="x", max_tokens=0)
+        # Cap is 131072 (Qwen3-YaRN ceiling); just past it must reject.
         with pytest.raises(Exception):
-            CompletionRequest(model=MODEL_NAME, prompt="x", max_tokens=9999)
+            CompletionRequest(model=MODEL_NAME, prompt="x", max_tokens=131073)
+        # 9999 is now WELL within bounds — must NOT raise.
+        CompletionRequest(model=MODEL_NAME, prompt="x", max_tokens=9999)
 
 
 class TestChatCompletionRequestSchema:
