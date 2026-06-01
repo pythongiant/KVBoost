@@ -383,6 +383,56 @@ def build_app(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+class _IncrementalDetokenizer:
+    """O(1)-per-token streaming detokenizer (vLLM/TGI windowed approach).
+
+    The naive ``tokenizer.decode(all_tokens)`` per emitted token is O(n)
+    each step → O(n²) over a generation. On a 2048-token output the last
+    token re-decodes ~2000 ids; this dominated streaming decode latency
+    for long outputs (the server was ~4× slower than the raw model decode,
+    purely on CPU detok).
+
+    Incremental detok decodes only a trailing *window* each step:
+    ``prefix_offset`` trails ``read_offset`` by the last-emitted unit, so
+    each ``decode`` covers a bounded number of tokens regardless of total
+    length. We keep the safe "decode a window and diff" behavior (needed
+    because BPE tokens can merge across boundaries and multi-byte UTF-8
+    chars span tokens) — just over a small window instead of the whole
+    sequence. Output is byte-identical to the full-decode approach.
+
+    A trailing U+FFFD (replacement char) means an incomplete multi-byte
+    sequence; we hold the delta back until the next token completes it,
+    matching the original ``if not delta: continue`` behavior.
+    """
+
+    def __init__(self, tokenizer, *, skip_special_tokens: bool = True):
+        self._tok = tokenizer
+        self._skip = skip_special_tokens
+        self._tokens: list[int] = []
+        self._prefix_offset = 0
+        self._read_offset = 0
+
+    def add_token(self, token_id: int) -> str:
+        """Append a token, return the newly-decoded text delta (may be "")."""
+        self._tokens.append(token_id)
+        prefix_text = self._tok.decode(
+            self._tokens[self._prefix_offset:self._read_offset],
+            skip_special_tokens=self._skip,
+        )
+        new_text = self._tok.decode(
+            self._tokens[self._prefix_offset:],
+            skip_special_tokens=self._skip,
+        )
+        if len(new_text) > len(prefix_text) and not new_text.endswith("�"):
+            delta = new_text[len(prefix_text):]
+            # Advance the window past the now-committed text.
+            self._prefix_offset = self._read_offset
+            self._read_offset = len(self._tokens)
+            return delta
+        # Incomplete multi-byte / unmerged piece — wait for the next token.
+        return ""
+
+
 def _filter_tool_choice(calls, tool_choice):
     """
     Apply OpenAI tool_choice semantics to a parsed list of ToolCall objects.
@@ -596,7 +646,7 @@ async def _stream_chat(
     yield f"data: {role_chunk.model_dump_json()}\n\n"
 
     all_tokens: list[int] = []
-    prev_text: str = ""
+    detok = _IncrementalDetokenizer(tokenizer, skip_special_tokens=True)
     final_result = None
 
     try:
@@ -610,12 +660,10 @@ async def _stream_chat(
         ):
             if kind == "token":
                 all_tokens.append(payload)
-                cur_text = tokenizer.decode(all_tokens, skip_special_tokens=True)
-                delta = cur_text[len(prev_text):]
+                delta = detok.add_token(payload)
                 if not delta:
                     # Multi-byte char not yet complete — wait for next token.
                     continue
-                prev_text = cur_text
 
                 if stream_parser is None:
                     yield _content_chunk(delta)
@@ -697,10 +745,12 @@ async def _stream_chat(
         }],
     )
     generated = final_result.generated_tokens if final_result is not None else len(all_tokens)
+    # Single decode at the end for the log line — O(n) once, not per token.
+    full_text = tokenizer.decode(all_tokens, skip_special_tokens=True)
     io_log.info(
         "CHAT stream out id=%s finish=%s generated_tokens=%d tool_calls=%d text=%r",
         request_id, finish_reason, generated, len(emitted_tool_calls),
-        _truncate(prev_text),
+        _truncate(full_text),
     )
     yield f"data: {stop_chunk.model_dump_json()}\n\n"
     yield "data: [DONE]\n\n"

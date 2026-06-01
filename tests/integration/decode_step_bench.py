@@ -60,7 +60,16 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats(dev)
         ids = torch.randint(0, vocab, (1, ctx), device=dev)
         with torch.no_grad():
-            out = model(ids, use_cache=True)
+            # logits_to_keep=1 → compute the LM head for the final position
+            # only. Without it, a long-context prefill materializes logits
+            # for every position (ctx × vocab × 2 bytes ≈ 7 GiB at 23K×152K)
+            # and OOMs on the head, not attention — exactly what the real
+            # engine avoids with `last_logit_only`.
+            try:
+                out = model(ids, use_cache=True, logits_to_keep=1)
+            except TypeError:
+                # Older transformers: kwarg is num_logits_to_keep.
+                out = model(ids, use_cache=True, num_logits_to_keep=1)
             past = out.past_key_values
             nxt = torch.tensor([[ctx % vocab]], device=dev)
             for _ in range(args.warmup):
