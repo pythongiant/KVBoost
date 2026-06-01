@@ -1,16 +1,23 @@
-"""Realistic coding-agent prompts at controlled context sizes.
+"""Real coding prompts from a HuggingFace dataset. No synthetic content.
 
-Coding assistants (Cursor, Copilot, Aider, Claude Code) stuff large
-repo context into the prompt — many files, then "implement/refactor/fix
-function X". That's a long-prefill, modest-decode shape, and it's where
-KV-cache reuse and OOM behavior actually matter. We synthesize that shape
-so the benchmark is self-contained (no dataset download), with a target
-*approximate* token count per prompt (the server reports the exact count
-via ``usage.prompt_tokens``).
+Builds two prompt sets from a real code corpus:
 
-Optionally, if ``datasets`` + HumanEval are available, ``humaneval_items``
-yields real HumanEval prompts — but the default synthetic path needs no
-network and lets us dial context length precisely for the OOM ramp.
+  * REUSE set — a coding-agent pattern: a shared *repo context* (several
+    real source files / functions concatenated) as the prompt prefix, then
+    a varying real coding task. Replayed sequentially, the shared prefix's
+    KV is reused across requests (kvboost chunk-reuse + CacheBlend; vLLM
+    prefix caching), so TTFT drops after the first request — this is the
+    "faster TTFT" measurement.
+
+  * OOM set — the same real corpus concatenated to increasing target token
+    counts, to probe the memory ceiling (kvboost survives via chunked
+    prefill / per-request kv-bits; vLLM OOMs/crashes past its budget).
+
+Requires ``pip install datasets`` and downloads a real dataset — there is
+no synthetic fallback by design. Default ``openai_humaneval`` (small, no
+auth, real Python). For long-context coding agents, point ``--dataset`` at
+a repo-level set (e.g. ``repobench``) — the adapter pulls code text from
+common field names.
 """
 
 from __future__ import annotations
@@ -18,63 +25,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
-# A chunk of realistic-looking Python (~480 tokens). Repeated/varied to
-# build repo context of a target size.
-_CODE_BLOCK = '''\
-class {cls}Service:
-    """Coordinates {name} operations across the storage and cache tiers.
-
-    Thread-safety: all public methods are safe to call concurrently; the
-    internal _lock guards the write path. Reads are lock-free against an
-    immutable snapshot swapped in under the lock.
-    """
-
-    def __init__(self, store: Store, cache: Cache, *, max_workers: int = 8):
-        self._store = store
-        self._cache = cache
-        self._pool = ThreadPoolExecutor(max_workers=max_workers)
-        self._lock = threading.RLock()
-        self._snapshot: dict[str, Record] = {{}}
-        self._dirty: set[str] = set()
-        self._metrics = Metrics(namespace="{name}")
-
-    def get(self, key: str) -> Optional[Record]:
-        hit = self._cache.get(key)
-        if hit is not None:
-            self._metrics.incr("cache_hit")
-            return hit
-        rec = self._store.load(key)
-        if rec is not None:
-            self._cache.put(key, rec, ttl=self._ttl_for(rec))
-        self._metrics.incr("cache_miss")
-        return rec
-
-    def put(self, key: str, rec: Record) -> None:
-        with self._lock:
-            self._snapshot[key] = rec
-            self._dirty.add(key)
-        self._cache.invalidate(key)
-        self._metrics.incr("write")
-
-    def flush(self) -> int:
-        with self._lock:
-            dirty = list(self._dirty)
-            self._dirty.clear()
-        futures = [self._pool.submit(self._store.save, k, self._snapshot[k]) for k in dirty]
-        return sum(1 for f in as_completed(futures) if f.result() is not None)
-
-    def _ttl_for(self, rec: Record) -> int:
-        return 300 if rec.hot else 30
-'''
-
 
 @dataclass
-class CodingPrompt:
+class Prompt:
     name: str
     system: str
     user: str
     max_tokens: int
-    target_tokens: int  # approximate prompt size we built to
+    target_tokens: int  # approximate; server reports exact prompt_tokens
 
     def to_body(self, model: str, stream: bool = True) -> dict:
         return {
@@ -86,78 +44,127 @@ class CodingPrompt:
             "max_tokens": self.max_tokens,
             "temperature": 0.2,
             "stream": stream,
+            # request usage on the final stream chunk → input/decode throughput
+            "stream_options": {"include_usage": True},
         }
 
 
-def _repo_context(target_tokens: int) -> str:
-    """Build ~target_tokens of varied Python 'repo context'.
+_SYS = ("You are a senior software engineer working in the codebase below. "
+        "Answer using the provided code; write correct, idiomatic code with "
+        "type hints.")
 
-    Rough heuristic: ~4 chars/token. Each block ≈ 480 tokens; vary class
-    names so it isn't trivially compressible / prefix-cacheable.
+# Field names we try, in order, to extract real code text from common
+# coding datasets (HumanEval, MBPP, RepoBench, The Stack, CodeSearchNet, …).
+_TEXT_FIELDS = ("text", "content", "func_code_string", "whole_func_string",
+                "code", "canonical_solution", "prompt", "problem_statement")
+
+
+def _extract_code(row: dict) -> str:
+    parts = []
+    # HumanEval: prompt (signature+docstring) + canonical_solution (body).
+    if "prompt" in row and "canonical_solution" in row:
+        return (row["prompt"] or "") + (row["canonical_solution"] or "")
+    # MBPP: text (NL spec) + code.
+    if "text" in row and "code" in row:
+        return f"# {row['text']}\n{row['code']}"
+    for f in _TEXT_FIELDS:
+        v = row.get(f)
+        if isinstance(v, str) and v.strip():
+            parts.append(v)
+            break
+    return "\n".join(parts)
+
+
+def load_corpus(dataset: str, *, split: str, n_units: int) -> List[str]:
+    """Return up to ``n_units`` real code strings from ``dataset``.
+
+    Raises SystemExit with an install hint if ``datasets`` is missing — there
+    is intentionally no synthetic fallback.
     """
-    approx_block_tokens = 480
-    n_blocks = max(1, target_tokens // approx_block_tokens)
-    names = ["Order", "Payment", "Inventory", "Shipment", "Catalog",
-             "User", "Session", "Pricing", "Ledger", "Audit", "Notify",
-             "Search", "Index", "Queue", "Cache", "Auth"]
-    blocks = []
-    for i in range(n_blocks):
-        nm = names[i % len(names)] + (str(i // len(names)) if i >= len(names) else "")
-        blocks.append(
-            "# ── module: {0}.py ──\n".format(nm.lower())
-            + _CODE_BLOCK.format(cls=nm, name=nm.lower())
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise SystemExit(
+            "ERROR: this benchmark uses a real HuggingFace dataset.\n"
+            "Run: pip install datasets"
         )
-    return "\n\n".join(blocks)
+    try:
+        ds = load_dataset(dataset, split=split)
+    except Exception as e:
+        raise SystemExit(
+            f"ERROR: could not load dataset '{dataset}' (split={split}): {e}\n"
+            "Pick another with --dataset (e.g. openai_humaneval, mbpp) or "
+            "check network / HF auth."
+        )
+    units: List[str] = []
+    for row in ds:
+        code = _extract_code(dict(row))
+        if code and len(code) > 80:   # skip trivially short rows
+            units.append(code.strip())
+        if len(units) >= n_units:
+            break
+    if not units:
+        raise SystemExit(
+            f"ERROR: dataset '{dataset}' yielded no usable code text. "
+            "Try --dataset openai_humaneval."
+        )
+    return units
 
 
-_HEADER = (
-    "import threading\n"
-    "from concurrent.futures import ThreadPoolExecutor, as_completed\n"
-    "from typing import Optional\n\n"
-)
+def _repo_context(units: List[str], n_files: int) -> str:
+    chosen = units[:n_files]
+    return "\n\n".join(
+        f"# ── file {i+1} ──\n{u}" for i, u in enumerate(chosen)
+    )
+
 
 _TASK = (
     "\n\n# ── TASK ──\n"
-    "Given the codebase above, implement a new `ReconciliationService` that "
-    "reconciles records across two `{0}Service` instances: it must (1) detect "
-    "keys present in one but not the other, (2) for keys in both, pick the "
-    "record with the newer `updated_at`, (3) be thread-safe and reuse the "
-    "existing ThreadPoolExecutor pattern, and (4) expose a `reconcile() -> "
-    "ReconcileReport` method. Return only the implementation with type hints."
+    "Add complete, typed docstrings and inline type hints to every function "
+    "and class in `file {0}` above, preserving behavior. Return only the "
+    "rewritten file {0}."
 )
 
 
-def coding_prompt(target_tokens: int, *, max_tokens: int = 512) -> CodingPrompt:
-    """One coding-agent prompt of approximately ``target_tokens`` input."""
-    ctx = _HEADER + _repo_context(target_tokens)
-    user = ctx + _TASK.format("Order")
-    return CodingPrompt(
-        name=f"code-{target_tokens // 1000}k" if target_tokens >= 1000
-             else f"code-{target_tokens}",
-        system="You are a senior Python engineer. Write correct, idiomatic, "
-               "production-quality code with type hints.",
-        user=user,
-        max_tokens=max_tokens,
-        target_tokens=target_tokens,
-    )
+def reuse_prompts(
+    corpus: List[str], *, n: int, n_files: int = 6, max_tokens: int = 256,
+) -> List[Prompt]:
+    """Coding-agent reuse workload: shared real repo-context prefix, varying
+    real task. Sequential replay → prefix KV reused across requests."""
+    ctx = _repo_context(corpus, n_files)
+    target = len(ctx) // 4
+    out = []
+    for i in range(n):
+        file_no = (i % n_files) + 1   # vary which file the task targets
+        out.append(Prompt(
+            name=f"reuse-{i}",
+            system=_SYS,
+            user=ctx + _TASK.format(file_no),
+            max_tokens=max_tokens,
+            target_tokens=target,
+        ))
+    return out
 
 
-def throughput_mix(seed: int = 0, n: int = 24) -> List[CodingPrompt]:
-    """A realistic coding-agent traffic mix: mostly small/medium context
-    (single-file edits), some large (multi-file repo context)."""
-    import random
-    rng = random.Random(seed)
-    pool = (
-        [coding_prompt(800, max_tokens=384)] * 8     # small: one-file edit
-        + [coding_prompt(2000, max_tokens=512)] * 6   # medium
-        + [coding_prompt(6000, max_tokens=512)] * 4   # multi-file
-        + [coding_prompt(12000, max_tokens=512)] * 3  # large repo context
-        + [coding_prompt(20000, max_tokens=512)] * 1  # very large
-    )
-    rng.shuffle(pool)
-    return pool[:n]
-
-
-def oom_ramp(contexts: List[int], *, max_tokens: int = 256) -> List[CodingPrompt]:
-    """One prompt per target context length, ascending — for the OOM ramp."""
-    return [coding_prompt(c, max_tokens=max_tokens) for c in contexts]
+def oom_prompts(
+    corpus: List[str], *, contexts: List[int], max_tokens: int = 128,
+) -> List[Prompt]:
+    """One prompt per target token size, built by concatenating real code
+    until the size is reached. Ascending — for the OOM ramp."""
+    # ~4 chars/token. Repeat the corpus (real code) to fill the target.
+    joined = "\n\n".join(corpus)
+    out = []
+    for tgt in contexts:
+        need_chars = tgt * 4
+        reps = max(1, need_chars // max(len(joined), 1) + 1)
+        body = ("\n\n".join([joined] * reps))[:need_chars]
+        user = (
+            f"# ── repository snapshot ──\n{body}\n\n"
+            "# ── TASK ──\nList the three most important functions in this "
+            "codebase and explain what each does in one sentence."
+        )
+        out.append(Prompt(
+            name=f"oom-{tgt//1000}k" if tgt >= 1000 else f"oom-{tgt}",
+            system=_SYS, user=user, max_tokens=max_tokens, target_tokens=tgt,
+        ))
+    return out

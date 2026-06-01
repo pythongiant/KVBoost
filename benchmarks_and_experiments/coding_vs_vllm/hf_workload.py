@@ -15,9 +15,7 @@ sequentially, later samples re-encounter passages they've seen before:
   * vLLM prefix-caching hits only when the leading passages match exactly.
   * kvboost CacheBlend hits on every recurring passage, anywhere.
 
-Needs ``pip install datasets``. A ``--synthetic`` fallback generates
-passages locally if the dataset can't be fetched, so the script still
-runs offline.
+Needs ``pip install datasets`` — real data only, no synthetic fallback.
 """
 
 from __future__ import annotations
@@ -81,60 +79,43 @@ def _build(passage_pool: List[str], questions: List[str], *,
 def load_rag_samples(
     *, dataset: str = "squad", n: int = 10, passages_per: int = 4,
     pool_size: int = 8, seed: int = 0, max_tokens: int = 128,
-    synthetic: bool = False,
 ) -> List[RagSample]:
-    """Return ``n`` RAG samples with recurring, reordered passages.
+    """Return ``n`` RAG samples with recurring, reordered REAL passages.
 
     ``pool_size`` controls how many distinct passages circulate — smaller
     pool ⇒ more recurrence ⇒ more reuse opportunity. ``passages_per`` is
-    how many passages each prompt concatenates.
+    how many passages each prompt concatenates. Real data only — raises
+    SystemExit with an install hint if ``datasets`` is missing.
     """
-    pool: List[str]
-    questions: List[str]
-
-    if not synthetic:
-        try:
-            from datasets import load_dataset
-            ds = load_dataset(dataset, split="validation")
-            # De-dup contexts to form the passage pool; collect questions.
-            seen, pool, questions = set(), [], []
-            for row in ds:
-                c = row.get("context") or row.get("passage") or ""
-                qn = row.get("question") or ""
-                if c and c not in seen and len(pool) < pool_size:
-                    seen.add(c)
-                    pool.append(c.strip())
-                if qn:
-                    questions.append(qn.strip())
-                if len(pool) >= pool_size and len(questions) >= n:
-                    break
-            if not pool or not questions:
-                raise RuntimeError("dataset yielded no usable context/question")
-            return _build(pool, questions, n=n, passages_per=passages_per,
-                          seed=seed, max_tokens=max_tokens)
-        except Exception as e:  # ImportError, network, schema mismatch …
-            print(f"[hf_workload] dataset '{dataset}' unavailable ({e}); "
-                  "using --synthetic fallback.")
-
-    # Synthetic fallback: self-contained passages so the script runs offline.
-    _missions = ["Apollo", "Voyager", "Hubble", "Kepler", "Webb",
-                 "Cassini", "Juno", "Galileo"]
-    _body = (
-        " program produced extensive findings. It involved multiple "
-        "instruments, a long mission timeline, and a large international "
-        "team. Key results included measurements of radiation, imaging of "
-        "distant bodies, and refinements to orbital models. The data "
-        "informed subsequent missions and theory. "
-    )
-    pool = [
-        f"Passage topic {k}: The {_missions[k % len(_missions)]}" + _body * 6
-        for k in range(pool_size)
-    ]
-    questions = [
-        "Which program is described and what was a key result?",
-        "What instruments were involved?",
-        "How did the data inform later work?",
-        "Summarize the mission timeline.",
-    ]
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise SystemExit(
+            "ERROR: this benchmark uses a real HuggingFace dataset.\n"
+            "Run: pip install datasets"
+        )
+    try:
+        ds = load_dataset(dataset, split="validation")
+    except Exception as e:
+        raise SystemExit(
+            f"ERROR: could not load dataset '{dataset}': {e}\n"
+            "Pick another with --dataset (e.g. squad) or check network/HF auth."
+        )
+    seen, pool, questions = set(), [], []
+    for row in ds:
+        c = row.get("context") or row.get("passage") or ""
+        qn = row.get("question") or ""
+        if c and c not in seen and len(pool) < pool_size:
+            seen.add(c)
+            pool.append(c.strip())
+        if qn:
+            questions.append(qn.strip())
+        if len(pool) >= pool_size and len(questions) >= n:
+            break
+    if not pool or not questions:
+        raise SystemExit(
+            f"ERROR: dataset '{dataset}' yielded no usable context/question. "
+            "Try --dataset squad."
+        )
     return _build(pool, questions, n=n, passages_per=passages_per,
                   seed=seed, max_tokens=max_tokens)

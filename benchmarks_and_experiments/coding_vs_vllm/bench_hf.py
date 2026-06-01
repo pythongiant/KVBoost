@@ -127,8 +127,6 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--timeout-s", type=float, default=600.0)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--synthetic", action="store_true",
-                    help="skip the dataset download, use built-in passages")
     args = ap.parse_args()
 
     targets = []
@@ -143,7 +141,6 @@ def main() -> int:
     samples = hw.load_rag_samples(
         dataset=args.dataset, n=args.n, passages_per=args.passages_per,
         pool_size=args.pool_size, seed=args.seed, max_tokens=args.max_tokens,
-        synthetic=args.synthetic,
     )
     print(f"Loaded {len(samples)} RAG samples "
           f"(pool={args.pool_size} passages, {args.passages_per}/prompt, shuffled).")

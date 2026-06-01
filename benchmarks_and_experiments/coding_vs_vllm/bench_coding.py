@@ -1,41 +1,32 @@
-"""Coding-benchmark: kvboost vs vLLM — TTFT, throughput, and OOM survival.
+"""kvboost vs vLLM on a REAL coding dataset — TTFT, throughput, OOM recovery.
 
-Both servers are OpenAI-compatible, so one streaming client drives both.
-Two measurements:
+Reports the two kvboost features plus full throughput:
 
-  THROUGHPUT  — a realistic coding-agent mix (repo-context prompts). Per
-                backend: TTFT p50/p95, decode tok/s, system tok/s, errors.
+  1. FASTER TTFT (KV reuse)  — a coding-agent reuse workload: a shared real
+     repo-context prefix + varying real tasks, replayed SEQUENTIALLY so the
+     prefix KV is reused across requests. We report TTFT and watch it drop as
+     reuse warms (kvboost chunk-reuse + CacheBlend vs vLLM prefix caching).
 
-  OOM         — ramp prompt context length upward and record, per backend,
-                the OUTCOME at each size:
-                  COMPLETED         — streamed to finish (record TTFT/tok)
-                  REJECTED_GRACEFUL — clean 4xx (vLLM "max context length"
-                                      400, or kvboost planner 413): the
-                                      server said no without crashing
-                  OOM_FAIL          — 5xx with a CUDA/OOM message
-                  CONN_DROP         — connection died mid-request (the usual
-                                      symptom of a server-side OOM crash)
-                  TIMEOUT           — exceeded --timeout-s
-                The headline: the largest context each backend COMPLETED,
-                and HOW each one fails past that. The kvboost story is
-                "chunked prefill + per-request kv-bits complete prompts that
-                exceed a fixed KV budget, or 413 cleanly — never crash,"
-                vs vLLM crashing/OOMing past its configured ceiling.
+  2. OOM RECOVERY            — ramp real-code context length and record, per
+     backend, whether each request COMPLETED / was REJECTED gracefully (4xx) /
+     hard-failed (OOM 5xx / connection-drop crash / timeout). kvboost adapts
+     (chunked prefill, per-request kv-bits, clean 413); vLLM OOMs past budget.
 
-Honest framing: vLLM's continuous batching usually wins raw throughput.
-This benchmark is about (a) measuring that gap fairly and (b) showing the
-OOM-survival difference. The script reports raw numbers; it does not
-editorialize.
+  THROUGHPUT (both axes)     — for every completed request:
+     * INPUT/prefill tok/s  = prompt_tokens / TTFT   (context ingestion rate;
+       this is where KV reuse pays off — reused chunks aren't re-prefilled)
+     * DECODE tok/s         = (out_tokens-1) / (last_tok - first_tok)
+     * SYSTEM tok/s         = total output tokens / wall
+
+No synthetic data: prompts are built from a real HF dataset (default
+openai_humaneval). Needs ``pip install datasets``.
 
 Usage
 -----
-    # start each server (see README), then:
     python bench_coding.py \\
         --kvboost-url http://localhost:9000 --kvboost-model Qwen/Qwen2.5-3B-Instruct \\
         --vllm-url    http://localhost:8001 --vllm-model    Qwen/Qwen2.5-3B-Instruct \\
-        --mode both
-
-Give only one of --kvboost-url / --vllm-url to bench a single backend.
+        --dataset openai_humaneval --mode both
 """
 
 from __future__ import annotations
@@ -46,7 +37,7 @@ import json
 import statistics
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -71,12 +62,12 @@ _OOM_MARKERS = ("out of memory", "cuda oom", "outofmemory", "cuda error",
 @dataclass
 class Outcome:
     backend: str
-    label: str            # the shape label (code-12k …)
+    label: str
     target_tokens: int
-    status: str           # COMPLETED / REJECTED_GRACEFUL / OOM_FAIL / ...
+    status: str
     http_code: int = 0
     prompt_tokens: int = 0
-    cached_tokens: int = 0   # from usage.prompt_tokens_details.cached_tokens (vLLM)
+    cached_tokens: int = 0
     out_tokens: int = 0
     ttft_ms: float = 0.0
     wall_ms: float = 0.0
@@ -88,6 +79,15 @@ class Outcome:
     def decode_tok_s(self) -> float:
         if self.out_tokens > 1 and self.last_tok_time > self.first_tok_time:
             return (self.out_tokens - 1) / (self.last_tok_time - self.first_tok_time)
+        return 0.0
+
+    @property
+    def input_tok_s(self) -> float:
+        """Prefill/context-ingestion rate: prompt tokens per second of prefill.
+        TTFT ≈ prefill time (first token emitted right after prefill). Reuse
+        makes this soar because reused chunks aren't re-prefilled."""
+        if self.prompt_tokens > 0 and self.ttft_ms > 0:
+            return self.prompt_tokens / (self.ttft_ms / 1000.0)
         return 0.0
 
 
@@ -108,12 +108,8 @@ def _classify_http(code: int, body_text: str) -> Tuple[str, str]:
 
 
 async def run_prompt(
-    client: httpx.AsyncClient,
-    base_url: str,
-    model: str,
-    backend: str,
-    prompt: "cw.CodingPrompt",
-    timeout_s: float,
+    client: httpx.AsyncClient, base_url: str, model: str, backend: str,
+    prompt, timeout_s: float,
 ) -> Outcome:
     o = Outcome(backend=backend, label=prompt.name,
                 target_tokens=prompt.target_tokens, status=SERVER_ERR)
@@ -140,33 +136,32 @@ async def run_prompt(
                 except json.JSONDecodeError:
                     continue
                 if "error" in data:
-                    err = json.dumps(data["error"])
+                    err = data["error"]
                     o.status, o.detail = _classify_http(
-                        data["error"].get("code", 500) or 500, err)
+                        err.get("code", 500) or 500, json.dumps(err))
                     o.wall_ms = (time.perf_counter() - t0) * 1000
                     return o
-                ch = (data.get("choices") or [{}])[0]
-                delta = (ch.get("delta") or {}).get("content")
-                # capture usage if the server appends it
                 usage = data.get("usage")
                 if usage:
                     o.prompt_tokens = usage.get("prompt_tokens", o.prompt_tokens)
                     details = usage.get("prompt_tokens_details") or {}
                     o.cached_tokens = details.get("cached_tokens", o.cached_tokens)
-                if delta:
-                    now = time.perf_counter()
-                    if o.out_tokens == 0:
-                        o.first_tok_time = now
-                        o.ttft_ms = (now - t0) * 1000
-                    o.out_tokens += 1
-                    o.last_tok_time = now
+                ch = (data.get("choices") or [{}])
+                if ch:
+                    delta = (ch[0].get("delta") or {}).get("content")
+                    if delta:
+                        now = time.perf_counter()
+                        if o.out_tokens == 0:
+                            o.first_tok_time = now
+                            o.ttft_ms = (now - t0) * 1000
+                        o.out_tokens += 1
+                        o.last_tok_time = now
             o.wall_ms = (time.perf_counter() - t0) * 1000
             o.status = COMPLETED
             return o
     except httpx.TimeoutException as e:
         o.status, o.detail = TIMEOUT, repr(e)[:160]
     except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError) as e:
-        # Connection dropped mid-flight — the classic server-OOM-crash symptom.
         o.status, o.detail = CONN_DROP, repr(e)[:160]
     except Exception as e:
         o.status, o.detail = SERVER_ERR, repr(e)[:160]
@@ -174,110 +169,99 @@ async def run_prompt(
     return o
 
 
-# ── Throughput mode ──────────────────────────────────────────────────────────
+# ── Reuse / TTFT + throughput mode (sequential) ────────────────────────────────
 
 
-async def bench_throughput(
-    base_url: str, model: str, backend: str, *,
-    concurrency: int, n: int, timeout_s: float, seed: int,
+async def bench_reuse(
+    base_url: str, model: str, backend: str, prompts, timeout_s: float,
 ) -> List[Outcome]:
-    prompts = cw.throughput_mix(seed=seed, n=n)
-    q: asyncio.Queue = asyncio.Queue()
-    for p in prompts:
-        q.put_nowait(p)
-    for _ in range(concurrency):
-        q.put_nowait(None)
-    results: List[Outcome] = []
-
-    async def worker(client):
-        while True:
-            p = await q.get()
-            if p is None:
-                return
-            r = await run_prompt(client, base_url, model, backend, p, timeout_s)
-            results.append(r)
-            tag = "ok " if r.status == COMPLETED else r.status
-            print(f"  [{backend}] {tag:<10} {r.label:<10} "
-                  f"ttft={r.ttft_ms:7.0f}ms out={r.out_tokens:4d} "
-                  f"dec={r.decode_tok_s:5.1f}t/s {r.wall_ms/1000:5.1f}s",
-                  flush=True)
-
-    async with httpx.AsyncClient() as client:
-        await asyncio.gather(*[worker(client) for _ in range(concurrency)])
-    return results
-
-
-# ── OOM ramp mode ──────────────────────────────────────────────────────────────
-
-
-async def bench_oom_ramp(
-    base_url: str, model: str, backend: str, *,
-    contexts: List[int], timeout_s: float,
-) -> List[Outcome]:
-    """Sequential ramp (one at a time) so an OOM crash on one prompt doesn't
-    corrupt the timing of others. Records the outcome at each context size."""
-    prompts = cw.oom_ramp(contexts)
+    """Sequential replay so request N reuses request <N's cached prefix KV."""
     results: List[Outcome] = []
     async with httpx.AsyncClient() as client:
         for p in prompts:
             r = await run_prompt(client, base_url, model, backend, p, timeout_s)
             results.append(r)
-            mark = {
-                COMPLETED: "✓ completed", REJECTED: "▲ rejected(graceful)",
-                OOM_FAIL: "✗ OOM", CONN_DROP: "✗ conn-drop(crash?)",
-                TIMEOUT: "✗ timeout", SERVER_ERR: "✗ error",
-            }.get(r.status, r.status)
+            tag = "ok " if r.status == COMPLETED else r.status
+            print(f"  [{backend}] {tag:<10} {r.label:<8} "
+                  f"prompt={r.prompt_tokens or '?':>6} ttft={r.ttft_ms:7.0f}ms "
+                  f"in={r.input_tok_s:7.0f}t/s dec={r.decode_tok_s:5.1f}t/s "
+                  f"out={r.out_tokens}", flush=True)
+    return results
+
+
+# ── OOM ramp (sequential, recovery-aware) ──────────────────────────────────────
+
+
+async def bench_oom(
+    base_url: str, model: str, backend: str, prompts, timeout_s: float,
+) -> List[Outcome]:
+    results: List[Outcome] = []
+    async with httpx.AsyncClient() as client:
+        for p in prompts:
+            r = await run_prompt(client, base_url, model, backend, p, timeout_s)
+            results.append(r)
+            mark = {COMPLETED: "✓ completed", REJECTED: "▲ rejected(graceful)",
+                    OOM_FAIL: "✗ OOM", CONN_DROP: "✗ conn-drop(crash?)",
+                    TIMEOUT: "✗ timeout", SERVER_ERR: "✗ error"}.get(r.status, r.status)
             print(f"  [{backend}] ~{p.target_tokens:>6} tok  {mark:<22} "
                   f"prompt={r.prompt_tokens or '?':>6} ttft={r.ttft_ms:7.0f}ms "
                   f"{('+'+r.detail) if r.detail else ''}", flush=True)
-            # Give the server a beat to recover / GC between heavy prompts.
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(1.0)   # let the server GC between heavy prompts
     return results
 
 
 # ── Reporting ──────────────────────────────────────────────────────────────────
 
 
-def _pcts(vals: List[float]) -> Dict[str, float]:
+def _agg(vals: List[float], q: float) -> float:
     if not vals:
-        return {}
+        return 0.0
     s = sorted(vals)
-    return {"p50": s[len(s) // 2], "p95": s[max(0, int(0.95 * len(s)) - 1)]}
+    return s[max(0, int(q * len(s)) - 1)]
 
 
-def report_throughput(by_backend: Dict[str, List[Outcome]], wall_by_backend: Dict[str, float]) -> None:
-    print("\n" + "=" * 78)
-    print("THROUGHPUT — coding-agent mix")
-    print("=" * 78)
-    hdr = (f"{'backend':<10} {'ok':>3} {'err':>4} {'ttftP50':>8} {'ttftP95':>8} "
-           f"{'decP50':>7} {'sysTok/s':>9} {'totTok':>7} {'wall_s':>7}")
+def report_reuse(by_backend: Dict[str, List[Outcome]]) -> None:
+    print("\n" + "=" * 84)
+    print("FASTER TTFT + THROUGHPUT — coding-agent reuse (sequential, shared repo context)")
+    print("=" * 84)
+    hdr = (f"{'backend':<10} {'ok':>3} {'ttft1st':>8} {'ttftP50':>8} {'ttftLast':>9} "
+           f"{'inTok/s':>8} {'decTok/s':>9} {'sysTok/s':>9}")
     print(hdr)
     print("-" * len(hdr))
-    for backend, outs in by_backend.items():
+    for b, outs in by_backend.items():
         ok = [o for o in outs if o.status == COMPLETED]
-        err = [o for o in outs if o.status != COMPLETED]
-        ttft = _pcts([o.ttft_ms for o in ok if o.ttft_ms])
-        dec = _pcts([o.decode_tok_s for o in ok if o.decode_tok_s])
-        tot = sum(o.out_tokens for o in ok)
-        wall = wall_by_backend.get(backend, 0.0)
-        sys_tps = tot / wall if wall > 0 else 0.0
-        print(f"{backend:<10} {len(ok):>3} {len(err):>4} "
-              f"{ttft.get('p50', 0):>8.0f} {ttft.get('p95', 0):>8.0f} "
-              f"{dec.get('p50', 0):>7.1f} {sys_tps:>9.1f} {tot:>7} {wall:>7.1f}")
+        ttfts = [o.ttft_ms for o in ok if o.ttft_ms]
+        intps = [o.input_tok_s for o in ok if o.input_tok_s]
+        dectps = [o.decode_tok_s for o in ok if o.decode_tok_s]
+        tot_out = sum(o.out_tokens for o in ok)
+        wall = sum(o.wall_ms for o in ok) / 1000.0
+        sys_tps = tot_out / wall if wall > 0 else 0.0
+        first = ttfts[0] if ttfts else 0.0
+        last = ttfts[-1] if ttfts else 0.0
+        print(f"{b:<10} {len(ok):>3} {first:>8.0f} {_agg(ttfts,0.5):>8.0f} "
+              f"{last:>9.0f} {statistics.mean(intps) if intps else 0:>8.0f} "
+              f"{statistics.mean(dectps) if dectps else 0:>9.1f} {sys_tps:>9.1f}")
+    print()
+    print("TTFT trace per request (ms) — watch reuse warm up after the 1st:")
+    for b, outs in by_backend.items():
+        trace = " ".join(f"{o.ttft_ms:6.0f}" if o.status == COMPLETED else "   err"
+                         for o in outs)
+        print(f"  {b:<10}{trace}")
+    print("\nRead: ttftLast ≪ ttft1st = reuse working; higher inTok/s = faster "
+          "context ingestion. vLLM usually leads decTok/s (continuous batching) "
+          "— the kvboost story here is TTFT + input throughput on reused context.")
 
 
 def report_oom(by_backend: Dict[str, List[Outcome]]) -> None:
-    print("\n" + "=" * 78)
-    print("OOM SURVIVAL — context ramp")
-    print("=" * 78)
+    print("\n" + "=" * 84)
+    print("OOM RECOVERY — real-code context ramp")
+    print("=" * 84)
     backends = list(by_backend.keys())
-    # union of context sizes
     sizes = sorted({o.target_tokens for outs in by_backend.values() for o in outs})
     short = {COMPLETED: "✓ ok", REJECTED: "▲ reject", OOM_FAIL: "✗ OOM",
              CONN_DROP: "✗ crash", TIMEOUT: "✗ t/o", SERVER_ERR: "✗ err"}
     hdr = f"{'ctx~tok':>8} " + " ".join(f"{b:>18}" for b in backends)
-    print(hdr)
-    print("-" * len(hdr))
+    print(hdr); print("-" * len(hdr))
     for sz in sizes:
         cells = []
         for b in backends:
@@ -294,44 +278,45 @@ def report_oom(by_backend: Dict[str, List[Outcome]]) -> None:
         outs = by_backend[b]
         completed = [o.target_tokens for o in outs if o.status == COMPLETED]
         crashed = [o.target_tokens for o in outs if o.status in (OOM_FAIL, CONN_DROP)]
-        max_ok = max(completed) if completed else 0
-        first_crash = min(crashed) if crashed else None
-        print(f"  {b}: largest COMPLETED ≈{max_ok} tok; "
-              + (f"first hard-fail (OOM/crash) ≈{first_crash} tok"
-                 if first_crash else "no hard OOM/crash observed"))
+        print(f"  {b}: largest COMPLETED ≈{max(completed) if completed else 0} tok; "
+              + (f"first hard-fail (OOM/crash) ≈{min(crashed)} tok"
+                 if crashed else "no hard OOM/crash observed"))
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
 def _wait_healthy(url: str, timeout_s: float = 10.0) -> bool:
-    import time as _t
-    deadline = _t.time() + timeout_s
-    while _t.time() < deadline:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
         for path in ("/health", "/v1/models"):
             try:
                 if httpx.get(f"{url}{path}", timeout=3.0).status_code < 500:
                     return True
             except Exception:
                 pass
-        _t.sleep(0.5)
+        time.sleep(0.5)
     return False
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="kvboost vs vLLM coding benchmark")
+    ap = argparse.ArgumentParser(description="kvboost vs vLLM — real coding benchmark")
     ap.add_argument("--kvboost-url", default=None)
     ap.add_argument("--vllm-url", default=None)
     ap.add_argument("--kvboost-model", default="Qwen/Qwen2.5-3B-Instruct")
     ap.add_argument("--vllm-model", default="Qwen/Qwen2.5-3B-Instruct")
-    ap.add_argument("--mode", choices=["throughput", "oom", "both"], default="both")
-    ap.add_argument("--concurrency", type=int, default=4)
-    ap.add_argument("--n", type=int, default=24, help="throughput request count")
+    ap.add_argument("--dataset", default="openai_humaneval")
+    ap.add_argument("--dataset-split", default="test")
+    ap.add_argument("--mode", choices=["ttft", "oom", "both"], default="both")
+    ap.add_argument("--n", type=int, default=10, help="reuse-workload request count")
+    ap.add_argument("--n-files", type=int, default=6,
+                    help="real files in the shared repo-context prefix")
     ap.add_argument("--contexts", type=int, nargs="+",
                     default=[2000, 8000, 16000, 32000, 64000, 96000],
-                    help="OOM-ramp context sizes (approx tokens)")
+                    help="OOM-ramp target context sizes (approx tokens)")
+    ap.add_argument("--corpus-size", type=int, default=40,
+                    help="real code units to pull from the dataset")
     ap.add_argument("--timeout-s", type=float, default=600.0)
-    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     targets = []
@@ -343,34 +328,40 @@ def main() -> int:
         print("ERROR: give at least one of --kvboost-url / --vllm-url", file=sys.stderr)
         return 2
 
+    # Load the real corpus ONCE; both backends see identical prompts.
+    corpus = cw.load_corpus(args.dataset, split=args.dataset_split,
+                            n_units=args.corpus_size)
+    print(f"Loaded {len(corpus)} real code units from '{args.dataset}'.")
+
     for name, url, _ in targets:
         if not _wait_healthy(url):
             print(f"ERROR: {name} at {url} not healthy", file=sys.stderr)
             return 1
 
-    tput: Dict[str, List[Outcome]] = {}
-    tput_wall: Dict[str, float] = {}
-    oom: Dict[str, List[Outcome]] = {}
+    reuse_res: Dict[str, List[Outcome]] = {}
+    oom_res: Dict[str, List[Outcome]] = {}
 
-    if args.mode in ("throughput", "both"):
-        print("Running THROUGHPUT mix ...")
+    if args.mode in ("ttft", "both"):
+        prompts = cw.reuse_prompts(corpus, n=args.n, n_files=args.n_files)
+        print(f"\nReuse workload: {len(prompts)} requests, shared {args.n_files}-file "
+              f"repo prefix (~{prompts[0].target_tokens} tok), sequential.")
         for name, url, model in targets:
-            t0 = time.perf_counter()
-            tput[name] = asyncio.run(bench_throughput(
-                url, model, name, concurrency=args.concurrency,
-                n=args.n, timeout_s=args.timeout_s, seed=args.seed))
-            tput_wall[name] = time.perf_counter() - t0
+            print(f"── {name} ──")
+            reuse_res[name] = asyncio.run(
+                bench_reuse(url, model, name, prompts, args.timeout_s))
 
     if args.mode in ("oom", "both"):
-        print("\nRunning OOM context ramp ...")
+        prompts = cw.oom_prompts(corpus, contexts=args.contexts)
+        print(f"\nOOM ramp: contexts {args.contexts} (real code concatenated).")
         for name, url, model in targets:
-            oom[name] = asyncio.run(bench_oom_ramp(
-                url, model, name, contexts=args.contexts, timeout_s=args.timeout_s))
+            print(f"── {name} ──")
+            oom_res[name] = asyncio.run(
+                bench_oom(url, model, name, prompts, args.timeout_s))
 
-    if tput:
-        report_throughput(tput, tput_wall)
-    if oom:
-        report_oom(oom)
+    if reuse_res:
+        report_reuse(reuse_res)
+    if oom_res:
+        report_oom(oom_res)
     return 0
 
 

@@ -752,5 +752,25 @@ async def _stream_chat(
         request_id, finish_reason, generated, len(emitted_tool_calls),
         _truncate(full_text),
     )
+
+    # OpenAI-compatible usage chunk: when the client sets
+    # stream_options.include_usage, emit a final chunk with empty choices and
+    # a populated usage block. Lets clients measure input/prefill throughput
+    # (prompt_tokens) and decode throughput uniformly — vLLM does the same.
+    stream_opts = getattr(req, "stream_options", None) or {}
+    if isinstance(stream_opts, dict) and stream_opts.get("include_usage"):
+        prompt_tokens = len(worker._tokenize(prompt))
+        usage_chunk = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "model": model_name,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": generated,
+                "total_tokens": prompt_tokens + generated,
+            },
+        }
+        yield f"data: {json.dumps(usage_chunk)}\n\n"
     yield f"data: {stop_chunk.model_dump_json()}\n\n"
     yield "data: [DONE]\n\n"

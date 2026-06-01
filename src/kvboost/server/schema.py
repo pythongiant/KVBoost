@@ -156,6 +156,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
     n: int = Field(default=1, ge=1, le=16)
     stream: bool = False
+    stream_options: Optional[Dict[str, Any]] = None  # OpenAI: {"include_usage": bool}
     stop: Optional[Union[str, List[str]]] = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
