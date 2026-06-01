@@ -98,7 +98,12 @@ def parse_args():
                    help="KV cache memory budget in bytes (default: 2 GB)")
     p.add_argument("--chunk-size", type=int, default=128)
     p.add_argument("--recompute-strategy", default="cacheblend",
-                   choices=["selective", "cacheblend", "none"])
+                   choices=["selective", "cacheblend", "cacheblend_sparse", "none"],
+                   help="KV seam-repair strategy on chunk reuse. "
+                        "'cacheblend_sparse' is the faithful CacheBlend — "
+                        "recomputes only high-deviation tokens layer-by-layer "
+                        "(paper's 2.2-3.3× TTFT vs full recompute), falls back "
+                        "to 'cacheblend' on unsupported architectures.")
     p.add_argument("--kv-cache-bits", type=int, default=16, choices=[4, 8, 16],
                    help="KV quantization bits (16=off, 8=int8, 4=int4)")
     p.add_argument("--sink-tokens", type=int, default=0)

@@ -59,7 +59,10 @@ class GenerationMode(str, enum.Enum):
 
 class RecomputeStrategy(str, enum.Enum):
     SELECTIVE = "selective"    # fix last R tokens at each seam (original)
-    CACHEBLEND = "cacheblend"  # fix top-k% most deviated tokens (smarter)
+    CACHEBLEND = "cacheblend"  # full forward + patch top-k% (correct, slow TTFT)
+    CACHEBLEND_SPARSE = "cacheblend_sparse"  # faithful: recompute only HKVD
+                               # tokens layer-by-layer (paper's 2.2-3.3× TTFT).
+                               # Falls back to CACHEBLEND on unsupported archs.
     NONE = "none"              # no recompute — fastest, slight quality risk
 
 
@@ -165,6 +168,10 @@ class InferenceEngine:
             recompute_ratio=recompute_ratio,
             device="cpu",
             prefill_chunk_size=self.prefill_chunk_size,
+        )
+        from .cacheblend_sparse import SparseCacheBlend
+        self._sparse_cacheblend = SparseCacheBlend(
+            recompute_ratio=recompute_ratio,
         )
 
         # Speculative decoding (decode-phase orthogonal to recompute_strategy).
@@ -876,6 +883,8 @@ class InferenceEngine:
                 assembled = self.selective_recompute.apply(assembled, self.model)
             elif self.recompute_strategy == RecomputeStrategy.CACHEBLEND:
                 assembled = self.cacheblend_recompute.apply(assembled, self.model)
+            elif self.recompute_strategy == RecomputeStrategy.CACHEBLEND_SPARSE:
+                assembled = self._apply_sparse_cacheblend(assembled)
             # NONE: skip recompute entirely
 
         return self._decode_with_kv(
@@ -889,6 +898,45 @@ class InferenceEngine:
             cacheable_prefix_len=cacheable_prefix_len,
             on_token=on_token,
         )
+
+    def _apply_sparse_cacheblend(self, assembled):
+        """Faithful CacheBlend: recompute only HKVD tokens layer-by-layer.
+
+        Falls back to the full-forward CacheBlend when the model architecture
+        isn't supported by the sparse path, or if it raises (the sparse path
+        reaches into HF decoder internals, which shift across versions — a
+        fallback keeps correctness even if internals change). Either way the
+        committed token sequence is what drives chunk-cache correctness, so a
+        fallback is a perf regression at worst, never a correctness bug.
+        """
+        if assembled.cached_past_kv is None or assembled.cached_length == 0:
+            return assembled
+        from .cacheblend_sparse import supports_sparse_recompute
+        if not supports_sparse_recompute(self.model):
+            log.debug("sparse CacheBlend unsupported for this arch — full forward")
+            return self.cacheblend_recompute.apply(assembled, self.model)
+        try:
+            cached_tokens = assembled.full_token_ids[:assembled.cached_length]
+            new_kv = self._sparse_cacheblend.recompute(
+                self.model, cached_tokens, assembled.cached_past_kv,
+            )
+            from .models import AssembledPrompt
+            return AssembledPrompt(
+                full_token_ids=assembled.full_token_ids,
+                cached_past_kv=new_kv,
+                cached_length=assembled.cached_length,
+                live_token_ids=assembled.live_token_ids,
+                live_position_ids=assembled.live_position_ids,
+                chunk_boundaries=assembled.chunk_boundaries,
+                cache_hit_ratio=assembled.cache_hit_ratio,
+                has_approximate=assembled.has_approximate,
+            )
+        except Exception as exc:
+            log.warning(
+                "sparse CacheBlend failed (%s); falling back to full-forward "
+                "CacheBlend", exc,
+            )
+            return self.cacheblend_recompute.apply(assembled, self.model)
 
     # ------------------------------------------------------------------
     # Shared decode loop
