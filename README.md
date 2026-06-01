@@ -14,6 +14,8 @@
 <p align="center">
   <a href="https://pypi.org/project/kvboost/"><img src="https://img.shields.io/pypi/v/kvboost?color=blue&label=PyPI" alt="PyPI"></a>
   <a href="https://pypi.org/project/kvboost/"><img src="https://img.shields.io/pypi/pyversions/kvboost" alt="Python"></a>
+  <a href="https://pypi.org/project/kvboost/"><img src="https://img.shields.io/pypi/dm/kvboost?color=blue&label=downloads" alt="PyPI downloads"></a>
+  <a href="https://pepy.tech/project/kvboost"><img src="https://static.pepy.tech/badge/kvboost" alt="Total downloads"></a>
   <a href="https://kvboost.readthedocs.io/en/latest/"><img src="https://img.shields.io/readthedocs/kvboost" alt="Docs"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
   <a href="https://github.com/pythongiant/kvboost"><img src="https://img.shields.io/badge/platform-CUDA%20%7C%20MPS%20%7C%20CPU-orange" alt="Platform"></a>

@@ -212,15 +212,65 @@ def _patch_module(module: torch.nn.Module) -> bool:
     return True
 
 
+def _modern_attention_dispatch() -> bool:
+    """True when transformers routes attention through ALL_ATTENTION_FUNCTIONS
+    (≥ ~4.48 / all 5.x), i.e. ``integrations/sdpa_attention.py`` calling
+    ``torch.nn.functional.scaled_dot_product_attention`` **fully-qualified**.
+
+    On that path the per-module monkeypatch (which shadows the name in the
+    *model module's* globals) can never intercept the call — it's a no-op
+    wrapper that still costs a dict get/set on every forward. We detect it
+    so ``install_flash_attention`` can skip the dead patching.
+    """
+    try:
+        import transformers.integrations.sdpa_attention  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def install_flash_attention(model: torch.nn.Module) -> int:
     """
     Walk all sub-modules of *model* and patch attention modules to use the
-    best available flash attention implementation.
+    kvboost custom CUDA flash kernel, when (and only when) the monkeypatch
+    can actually intercept the SDPA call and improve on stock behavior.
 
     Returns the number of modules patched.
+
+    The patch is skipped — and stock attention left untouched — when:
+      * ``_TIER`` is ``vanilla`` or ``torch_flash``. In both cases the
+        patched path just re-calls ``F.scaled_dot_product_attention`` with
+        the same backends torch already auto-selects, so the wrapper adds
+        per-forward overhead for zero benefit. Rely on the model's native
+        ``attn_implementation`` (default ``"sdpa"`` → torch flash /
+        mem-efficient) instead.
+      * Transformers uses the modern ALL_ATTENTION_FUNCTIONS dispatch
+        (≥ 4.48 / 5.x). There the model calls SDPA fully-qualified from
+        ``integrations/sdpa_attention.py``, which the module-global shadow
+        never sees — the patch would be dead weight on the hot decode loop
+        (~layers × generated_tokens forwards per request).
+
+    Net: we only monkeypatch when there's a custom CUDA kernel that stock
+    SDPA can't provide AND the install can actually reach the call site.
     """
-    if _TIER == "vanilla":
-        log.debug("flash_attn: no accelerated tier available, skipping patch")
+    if _TIER != "kvboost_cuda":
+        log.info(
+            "flash_attn: tier=%s provides nothing over stock SDPA; "
+            "skipping patch. Attention uses the model's native "
+            "attn_implementation (default 'sdpa' = torch flash/"
+            "mem-efficient).", _TIER,
+        )
+        return 0
+
+    if _modern_attention_dispatch():
+        log.warning(
+            "flash_attn: custom CUDA kernel available but transformers "
+            "uses ALL_ATTENTION_FUNCTIONS dispatch (≥4.48/5.x) — the "
+            "module-global monkeypatch cannot intercept the fully-"
+            "qualified SDPA call and would only add overhead. Skipping. "
+            "To use the kvboost kernel, load with a custom "
+            "attn_implementation registered in ALL_ATTENTION_FUNCTIONS."
+        )
         return 0
 
     patched = 0

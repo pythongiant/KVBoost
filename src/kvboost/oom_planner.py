@@ -387,21 +387,26 @@ class OOMPlanner:
         this against *free* VRAM, which already excludes the resident
         set — so the two are consistent.
 
-        Four components:
-          - **KV total**: every prompt + generated token gets a KV entry
-            at ``kv_bits`` precision.
+        Structure: ``peak = kv_total + max(floor, chunk_act + scratch)``.
+          - **KV total** (additive): every prompt + generated token gets a
+            KV entry at ``kv_bits`` precision. Persists for the whole
+            request and is live at the same time as the attention scratch,
+            so it adds on top.
           - **Activation floor**: the per-forward working set across all
             decoder layers that exists regardless of prompt length —
             measured by the cost-model probe (``baseline_activation_mb``).
-            Without this term, short-prompt predictions undershoot by
-            the entire model activation working set (the +30000%
-            residuals we observed before this fix). Falls back to a
-            per-layer heuristic when unmeasured.
-          - **Chunk activation**: one chunk's hidden states in flight,
-            fp16. Scales with chunk_size on top of the floor.
-          - **Attention scratch**: the chunk's queries attending to all
-            accumulated KV; peaks at end of prefill. ``K × N × heads ×
-            4 bytes × 2`` (scores + softmax buffer).
+            Falls back to a per-layer heuristic when unmeasured.
+          - **Chunk activation + attention scratch**: scale with the
+            *effective* chunk (= ``min(chunk_size, prompt_tokens)`` — a
+            single prefill forward never has more queries than the prompt
+            length; using raw chunk_size here over-counted short prompts
+            by chunk/prompt, the dominant source of the -55% residual).
+
+        We take ``max(floor, chunk_act + scratch)`` rather than summing:
+        the floor is the minimal-forward working set, which already
+        contains a small chunk's activation. For a large chunk the scaled
+        terms dominate; for a tiny prompt the floor dominates. Summing
+        double-counted the small-chunk activation.
         """
         total_tokens = prompt_tokens + max_new_tokens
 
@@ -410,15 +415,24 @@ class OOMPlanner:
         # Per-forward activation floor (constant in prompt length).
         floor_bytes = self._activation_floor_mb() * (1024.0 ** 2)
 
-        # One chunk's hidden states, fp16 (2 bytes) — marginal activation
-        # that scales with chunk size on top of the floor.
-        chunk_activation_bytes = chunk_size * self.hidden_dim * 2
+        # A single prefill forward processes at most ``prompt_tokens``
+        # queries — never more than the prompt, regardless of chunk_size.
+        effective_chunk = min(chunk_size, max(prompt_tokens, 1))
 
-        # Attention scores at the worst-case point of prefill (last chunk).
-        # 4 bytes for fp32 softmax accumulator, ×2 for scores + temp buffer.
-        scratch_bytes = chunk_size * prompt_tokens * self.num_heads * 4 * 2
+        # One chunk's hidden states, fp16 (2 bytes).
+        chunk_activation_bytes = effective_chunk * self.hidden_dim * 2
 
-        peak = kv_bytes + floor_bytes + chunk_activation_bytes + scratch_bytes
+        # Attention scores at the worst-case prefill step: effective_chunk
+        # queries × all accumulated keys. 4 bytes (fp32 softmax accumulator
+        # in the SDPA math backend) × 2 (scores + softmax temp). This is
+        # the term that OOMs without chunking — bounding effective_chunk is
+        # exactly what the CacheBlend chunking fix enforces at runtime.
+        scratch_bytes = effective_chunk * prompt_tokens * self.num_heads * 4 * 2
+
+        attention_transient = max(
+            floor_bytes, chunk_activation_bytes + scratch_bytes
+        )
+        peak = kv_bytes + attention_transient
         return peak / (1024.0 ** 2)
 
     def _activation_floor_mb(self) -> float:
