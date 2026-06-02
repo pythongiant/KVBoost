@@ -364,7 +364,10 @@ class InferenceEngine:
             )
         else:
             load_kwargs = dict(torch_dtype=torch.float16, low_cpu_mem_usage=True)
-            impl = attn_implementation
+            # 'flashinfer' must be registered with HF before load (and falls
+            # back to sdpa if the package is absent).
+            from .kernels import resolve_attn_impl
+            impl = resolve_attn_impl(attn_implementation)
             if impl in ("auto", "flash_attention_2"):
                 try:
                     model = AutoModelForCausalLM.from_pretrained(

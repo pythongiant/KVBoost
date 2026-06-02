@@ -44,6 +44,11 @@ echo
 #   --dtype float16          matched to kvboost.
 # Continuous batching is vLLM's default and stays on — it's why vLLM usually
 # leads raw decode throughput; the benchmark reports that honestly.
+#
+# FAIR int4-vs-int4: to match kvboost's Marlin run, point MODEL at the SAME AWQ
+# checkpoint — vLLM auto-detects the quantization_config and uses awq_marlin on
+# Ampere, no extra flag:
+#     MODEL=Qwen/Qwen2.5-3B-Instruct-AWQ ./start_vllm.sh
 exec vllm serve "$MODEL" \
     --dtype float16 \
     --enable-prefix-caching \

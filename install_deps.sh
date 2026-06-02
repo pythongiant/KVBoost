@@ -6,18 +6,29 @@
 # 1. Creates (or reuses) a Python virtualenv at ./env
 # 2. Installs torch matching your system CUDA toolkit
 # 3. Installs kvboost in editable mode with all dev/streaming/server extras
-# 4. Builds autoawq-kernels from source against your local torch (the
-#    PyPI wheels rarely match recent torch + CUDA combos)
-# 5. Optionally builds the bundled kvboost flash-attn CUDA extension
-# 6. Writes ./env_vars.sh with the runtime env (LD_LIBRARY_PATH, CPATH,
+# 4. Builds autoawq-kernels from source (AWQ/Marlin int4 GEMM kernels)
+# 5. Installs the proven inference kernels kvboost routes to at runtime:
+#    FlashAttention-2 (prefill attention) + FlashInfer (paged decode attention)
+# 6. Optionally builds the legacy bundled kvboost flash-attn CUDA extension
+# 7. Writes ./env_vars.sh with the runtime env (LD_LIBRARY_PATH, CPATH,
 #    CUDA_HOME, TORCH_CUDA_ARCH_LIST) for you to source before working
-# 7. Runs a smoke test
+# 8. Runs a smoke test
+#
+# Proven CUDA kernels (real, expert-tuned; Ampere sm_80+, e.g. RTX 3060):
+#   - FlashAttention-2  faster, lower-memory prefill (better TTFT). HF routes
+#                       to it via attn_implementation=flash_attention_2.
+#   - FlashInfer        optimized decode-attention CUDA kernels.
+#   - AWQ/Marlin int4   ~4x less weight bandwidth -> higher decode tok/s (built
+#                       in step 4; activate by pointing --model at an AWQ/GPTQ
+#                       Int4 checkpoint).
 #
 # Usage
 # -----
-#   ./install_deps.sh                      # full install with autoawq build
+#   ./install_deps.sh                      # full install: autoawq + FA2 + FlashInfer
 #   ./install_deps.sh --skip-autoawq       # skip autoawq-kernels source build
-#   ./install_deps.sh --skip-flash-attn    # skip kvboost's flash-attn extension
+#   ./install_deps.sh --skip-fa2           # skip FlashAttention-2 (Dao) build
+#   ./install_deps.sh --skip-flashinfer    # skip FlashInfer install
+#   ./install_deps.sh --skip-flash-attn    # skip the legacy bundled flash-attn ext
 #   ./install_deps.sh --cpu                # CPU-only torch (skips all kernel builds)
 #
 # Re-runnable: skips work that's already done. Safe to invoke after every git pull.
@@ -32,13 +43,17 @@ ENV_VARS_FILE="${REPO_ROOT}/env_vars.sh"
 
 # ── Flags ────────────────────────────────────────────────────────────────────
 BUILD_AUTOAWQ=1
+BUILD_FA2=1
+BUILD_FLASHINFER=1
 BUILD_FLASH_ATTN=1
 CPU_ONLY=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-autoawq) BUILD_AUTOAWQ=0; shift ;;
+        --skip-fa2) BUILD_FA2=0; shift ;;
+        --skip-flashinfer) BUILD_FLASHINFER=0; shift ;;
         --skip-flash-attn) BUILD_FLASH_ATTN=0; shift ;;
-        --cpu) CPU_ONLY=1; BUILD_AUTOAWQ=0; BUILD_FLASH_ATTN=0; shift ;;
+        --cpu) CPU_ONLY=1; BUILD_AUTOAWQ=0; BUILD_FA2=0; BUILD_FLASHINFER=0; BUILD_FLASH_ATTN=0; shift ;;
         -h|--help)
             grep -E '^# ' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -188,9 +203,75 @@ if (( BUILD_AUTOAWQ == 1 )); then
     fi
 fi
 
-# ── 6. Build kvboost flash-attn CUDA extension (optional, sm_80+) ────────────
+# ── 6. Install proven inference kernels: FlashAttention-2 + FlashInfer ───────
+# The real, expert-tuned CUDA kernels kvboost routes to at runtime, built
+# against the torch we just pinned. Each is gated on GPU + nvcc + Ampere
+# (sm_80+); every failure is NON-FATAL — kvboost falls back to torch SDPA, so
+# the server still runs, just without that kernel's speedup.
+if (( CPU_ONLY == 0 )) && command -v nvcc >/dev/null; then
+    KERNEL_CC="${COMPUTE_CAP%%.*}"
+    export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+    export TORCH_CUDA_ARCH_LIST="${TORCH_ARCH}"
+    export MAX_JOBS="${MAX_JOBS:-4}"   # cap parallel-compile RAM (FA2 build is memory-hungry)
+
+    # FlashAttention-2 (Dao-AILab). HF uses it via attn_implementation=
+    # flash_attention_2. Needs sm_80+; builds from source (~10-30 min). einops
+    # is its only extra runtime dep. --no-build-isolation reuses our pinned
+    # torch so pip can't silently swap in a different CUDA build.
+    if (( BUILD_FA2 == 1 )); then
+        if (( KERNEL_CC < 8 )); then
+            log "FlashAttention-2: skipping (compute cap ${COMPUTE_CAP} < 8.0; unsupported)"
+        elif python -c "import flash_attn" 2>/dev/null; then
+            log "FlashAttention-2: already installed"
+        else
+            log "Building FlashAttention-2 from source (can take 10-30 min; MAX_JOBS=${MAX_JOBS})"
+            pip install ninja packaging >/dev/null
+            if pip install flash-attn --no-build-isolation 2>&1 | tee /tmp/flash_attn_build.log | tail -5; then
+                python -c "import flash_attn" 2>/dev/null \
+                    && log "  flash_attn imported OK" \
+                    || log "  flash_attn built but unimportable (non-fatal; SDPA fallback). See /tmp/flash_attn_build.log"
+            else
+                log "  flash-attn build failed (non-fatal; SDPA fallback). See /tmp/flash_attn_build.log"
+            fi
+        fi
+    else
+        log "FlashAttention-2: skipped (--skip-fa2)"
+    fi
+
+    # FlashInfer — optimized decode-attention CUDA kernels. The PyPI package
+    # JIT-compiles kernels on first use (needs nvcc, present here). If PyPI
+    # misbehaves, the per-torch wheel index is the documented fallback:
+    #   pip install flashinfer-python \
+    #       -i https://flashinfer.ai/whl/${TORCH_CUDA_TAG}/torch<major.minor>/
+    if (( BUILD_FLASHINFER == 1 )); then
+        if (( KERNEL_CC < 8 )); then
+            log "FlashInfer: skipping (compute cap ${COMPUTE_CAP} < 8.0; unsupported)"
+        elif python -c "import flashinfer" 2>/dev/null; then
+            log "FlashInfer: already installed"
+        else
+            log "Installing FlashInfer (flashinfer-python; JIT-compiles kernels on first use)"
+            if pip install flashinfer-python 2>&1 | tail -5; then
+                python -c "import flashinfer" 2>/dev/null \
+                    && log "  flashinfer imported OK" \
+                    || log "  flashinfer installed but unimportable (non-fatal; SDPA fallback)"
+            else
+                log "  flashinfer install failed (non-fatal; SDPA fallback)"
+            fi
+        fi
+    else
+        log "FlashInfer: skipped (--skip-flashinfer)"
+    fi
+else
+    if (( CPU_ONLY == 1 )); then
+        log "Proven kernels (FA2/FlashInfer): skipped (CPU-only)"
+    else
+        log "Proven kernels (FA2/FlashInfer): skipped (no nvcc)"
+    fi
+fi
+
+# ── 7. Build kvboost flash-attn CUDA extension (legacy, optional, sm_80+) ────
 if (( BUILD_FLASH_ATTN == 1 )); then
-    log "Building kvboost flash-attn extension"
+    log "Building kvboost flash-attn extension (legacy bundled ext)"
     if (( CPU_ONLY == 1 )); then
         log "  skipping (CPU-only)"
     elif ! command -v nvcc >/dev/null; then
@@ -210,7 +291,7 @@ if (( BUILD_FLASH_ATTN == 1 )); then
     fi
 fi
 
-# ── 7. Write env_vars.sh for runtime ─────────────────────────────────────────
+# ── 8. Write env_vars.sh for runtime ─────────────────────────────────────────
 log "Writing ${ENV_VARS_FILE}"
 TORCH_LIB="$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"
 NVIDIA_INCLUDES="$(find "${VENV_DIR}/lib/python${PY_VER}/site-packages/nvidia" \
@@ -234,7 +315,7 @@ export TORCH_CUDA_ARCH_LIST="${TORCH_ARCH:-7.5;8.0;8.6;8.9;9.0}"
 alias kvboost-shell='python -c "import kvboost; print(kvboost.__version__)" && python'
 EOF
 
-# ── 8. Smoke test ────────────────────────────────────────────────────────────
+# ── 9. Smoke test ────────────────────────────────────────────────────────────
 log "Smoke-testing the install"
 # shellcheck disable=SC1090
 source "${ENV_VARS_FILE}"
@@ -276,6 +357,15 @@ try:
         print(f"  WARN awq_ext not resolved (falls back to torch dequant; expect ~50x slower)")
 except Exception as exc:
     print(f"  WARN awq probe failed: {exc}")
+
+# Probe the proven inference kernels (non-fatal — torch SDPA fallback if absent)
+for _mod, _note in (("flash_attn", "FlashAttention-2 / prefill attention"),
+                    ("flashinfer", "FlashInfer / decode attention")):
+    try:
+        __import__(_mod)
+        print(f"  OK   {_mod} ({_note})")
+    except Exception:
+        print(f"  WARN {_mod} not importable ({_note}); torch SDPA fallback")
 
 sys.exit(0 if ok else 1)
 PYTEST

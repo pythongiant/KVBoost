@@ -73,12 +73,15 @@ def parse_args():
     p.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"],
                    help="Model weight dtype (default: float16)")
     p.add_argument("--attn-impl", default="auto",
-                   choices=["auto", "flash_attention_2", "sdpa", "eager"],
+                   choices=["auto", "flash_attention_2", "flashinfer", "sdpa", "eager"],
                    help="Attention backend. 'auto' (default) uses "
                         "flash_attention_2 if installed (faster/lower-memory "
                         "prefill -> better TTFT; Ampere+ e.g. RTX 3060) and "
                         "falls back to sdpa otherwise. 'flash_attention_2' "
-                        "requires it (errors if missing). 'sdpa'/'eager' force.")
+                        "requires it (errors if missing). 'flashinfer' routes "
+                        "DECODE attention through FlashInfer's CUDA kernel "
+                        "(SDPA prefill + fallback; helps long-context decode). "
+                        "'sdpa'/'eager' force.")
     p.add_argument("--compile", action="store_true", default=False,
                    help="torch.compile(mode='reduce-overhead') on the model: "
                         "CUDA graphs + pointwise fusion to erase per-token "
@@ -460,9 +463,13 @@ def load_engine(args):
             from_pretrained_kwargs["dtype"] = dtype
         # Attention backend. 'auto' tries FA2 (better TTFT on Ampere+, e.g.
         # RTX 3060) then falls back to sdpa; an explicit choice is honored.
-        _want_fa2 = args.attn_impl in ("auto", "flash_attention_2")
+        # 'flashinfer' is registered with HF here (falls back to sdpa if the
+        # package is absent) before it can be used as an impl key.
+        from ..kernels import resolve_attn_impl
+        _impl = resolve_attn_impl(args.attn_impl)
+        _want_fa2 = _impl in ("auto", "flash_attention_2")
         from_pretrained_kwargs["attn_implementation"] = (
-            "flash_attention_2" if _want_fa2 else args.attn_impl
+            "flash_attention_2" if _want_fa2 else _impl
         )
         try:
             model = AutoModelForCausalLM.from_pretrained(

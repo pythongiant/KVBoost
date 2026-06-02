@@ -81,10 +81,18 @@ exec python -m kvboost.server \
 # lever; auto mode-select per request). Needs the ~1 GB draft model + VRAM:
 #     SPEC=1 ./start_kvboost.sh
 #
-# WEIGHT QUANTIZATION (biggest raw decode lever; also NOT fair vs fp16 vLLM):
-# point --model at an AWQ/GPTQ Int4 checkpoint — transformers loads it with
-# Marlin int4 GEMM on Ampere automatically (~4× less weight bandwidth):
+# WEIGHT QUANTIZATION — Marlin int4 (the biggest raw decode lever): point
+# --model at an AWQ/GPTQ Int4 checkpoint — transformers loads it with the
+# AWQ/Marlin int4 GEMM CUDA kernels on Ampere automatically (~4× less weight
+# bandwidth → up to ~4× decode ceiling):
 #     MODEL=Qwen/Qwen2.5-3B-Instruct-AWQ ./start_kvboost.sh
+# FAIR int4-vs-int4: run vLLM on the SAME AWQ checkpoint (it also uses Marlin):
+#     MODEL=Qwen/Qwen2.5-3B-Instruct-AWQ ./start_vllm.sh
+#
+# FLASHINFER decode-attention (real CUDA decode-attention kernel; helps most at
+# long context where KV reads dominate): --attn-impl flashinfer. Routes only the
+# decode step through FlashInfer, SDPA for prefill + fallback, with a one-time
+# numerical self-check. Needs `pip install flashinfer-python` (install_deps.sh).
 #
 # torch.compile (--compile): CUDA graphs + fusion → faster DECODE, but
 # recompiles per new PREFILL length so it can HURT this varying-prompt TTFT
