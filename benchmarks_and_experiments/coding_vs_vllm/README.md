@@ -33,51 +33,55 @@ Default dataset `openai_humaneval` (small, no auth, real Python). For
 long-context coding agents, point `--dataset` at a repo-level set
 (e.g. `repobench`); the adapter pulls code text from common field names.
 
-## One GPU → one backend at a time
+## One GPU → run each backend separately, then compare
 
 vLLM's `--gpu-memory-utilization` pre-allocates most of the VRAM, so **both
-servers cannot be resident at once** on a single GPU. The script handles this:
-when you pass each backend's launch command, it **starts kvboost, benchmarks
-it, kills it, waits for the VRAM to actually free, then starts vLLM** — only
-one model is ever on the GPU.
+servers can't be resident at once**. So you bench them in **separate runs** —
+start one server, benchmark it (save with `--out`), stop it, start the other,
+benchmark it — then combine the two saved files into the side-by-side report
+with `--compare` (no server needed for that step).
 
-### Recommended: let the script manage server lifecycle
-
-Pass the full launch command for each backend (quote it). The script does the
-launch → bench → teardown → wait-for-VRAM-free → next sequence:
-
+**Step 1 — kvboost.** Start its server:
 ```bash
-python benchmarks_and_experiments/coding_vs_vllm/bench_coding.py \
-  --dataset openai_humaneval --mode both --n 10 \
-  --contexts 2000 8000 16000 32000 64000 96000 \
-  --gpu-free-mb 2000 \
-  --kvboost-cmd "python -m kvboost.server --model Qwen/Qwen2.5-3B-Instruct \
-      --dtype float16 --recompute-strategy cacheblend_sparse --kv-cache-bits 8 \
-      --max-cache-bytes 4e9 --max-batch-size 1 --port 9000" \
-  --vllm-cmd    "vllm serve Qwen/Qwen2.5-3B-Instruct --dtype float16 \
-      --enable-prefix-caching --gpu-memory-utilization 0.85 \
-      --max-model-len 32768 --port 8001"
+python -m kvboost.server --model Qwen/Qwen2.5-3B-Instruct --dtype float16 \
+    --recompute-strategy cacheblend_sparse --kv-cache-bits 8 \
+    --max-cache-bytes 4e9 --max-batch-size 1 --port 9000
+```
+Then in another shell:
+```bash
+python bench_coding.py --backend kvboost --url http://localhost:9000 \
+    --model Qwen/Qwen2.5-3B-Instruct \
+    --dataset openai_humaneval --mode both --n 10 \
+    --contexts 2000 8000 16000 32000 64000 96000 \
+    --out kvboost.json
+```
+Stop the kvboost server when it finishes (frees the GPU).
+
+**Step 2 — vLLM.** Start its server:
+```bash
+vllm serve Qwen/Qwen2.5-3B-Instruct --dtype float16 \
+    --enable-prefix-caching --gpu-memory-utilization 0.85 \
+    --max-model-len 32768 --port 8001
+```
+Then run the **same** workload flags (so prompts match) against it:
+```bash
+python bench_coding.py --backend vllm --url http://localhost:8001 \
+    --model Qwen/Qwen2.5-3B-Instruct \
+    --dataset openai_humaneval --mode both --n 10 \
+    --contexts 2000 8000 16000 32000 64000 96000 \
+    --out vllm.json
 ```
 
-- Server stdout/stderr go to `./bench_server_logs/<backend>_server.log`.
-- `--gpu-free-mb` is the VRAM-used threshold (MiB) treated as "freed" between
-  backends — set it a bit above your idle/driver baseline (2000 is safe on a
-  dedicated card; raise if other processes share the GPU).
-- `--ready-timeout` (default 600s) is how long to wait for a server to load.
-
-### Alternative: start one server yourself, run once per backend
-
-If you'd rather manage servers manually (also one-at-a-time), omit the
-`--*-cmd` flags and use `--only`. Start kvboost, run:
+**Step 3 — compare** (no GPU/server needed):
 ```bash
-python bench_coding.py --only kvboost --out kvboost.json --mode both
+python bench_coding.py --compare kvboost.json vllm.json
 ```
-stop kvboost, start vLLM, run:
-```bash
-python bench_coding.py --only vllm --out vllm.json --mode both
-```
-Each run with `--only` benchmarks just that backend (the other is never
-loaded). `--out` saves raw outcomes so you can diff the two JSONs.
+
+Each single run also prints its own (single-backend) report immediately, so
+you get kvboost's numbers before vLLM is even started. Keep
+`--dataset / --n / --n-files / --contexts / --corpus-size` identical across
+the two runs — the prompts are deterministic from the dataset, so matching
+those flags guarantees both backends saw the exact same inputs.
 
 `--mode ttft` or `--mode oom` to run a single axis.
 
