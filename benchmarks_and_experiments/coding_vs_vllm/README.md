@@ -41,13 +41,13 @@ start one server, benchmark it (save with `--out`), stop it, start the other,
 benchmark it — then combine the two saved files into the side-by-side report
 with `--compare` (no server needed for that step).
 
-**Step 1 — kvboost.** Start its server:
+**Step 1 — kvboost.** Start its server (best setup — see `start_kvboost.sh`):
 ```bash
-python -m kvboost.server --model Qwen/Qwen2.5-3B-Instruct --dtype float16 \
-    --recompute-strategy cacheblend_sparse --kv-cache-bits 8 \
-    --max-cache-bytes 4e9 --max-batch-size 1 --port 9000
+./start_kvboost.sh            # MODEL=... PORT=... MAX_CACHE_BYTES=... to override
 ```
-Then in another shell:
+That runs kvboost with `cacheblend_sparse` (faithful selective recompute),
+int8 KV, and the OOM planner — the features the benchmark measures. Then in
+another shell:
 ```bash
 python bench_coding.py --backend kvboost --url http://localhost:9000 \
     --model Qwen/Qwen2.5-3B-Instruct \
