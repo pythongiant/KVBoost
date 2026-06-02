@@ -72,6 +72,20 @@ def parse_args():
     p.add_argument("--device", default=None, help="Device: cuda | mps | cpu (auto-detected if omitted)")
     p.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"],
                    help="Model weight dtype (default: float16)")
+    p.add_argument("--attn-impl", default="auto",
+                   choices=["auto", "flash_attention_2", "sdpa", "eager"],
+                   help="Attention backend. 'auto' (default) uses "
+                        "flash_attention_2 if installed (faster/lower-memory "
+                        "prefill -> better TTFT; Ampere+ e.g. RTX 3060) and "
+                        "falls back to sdpa otherwise. 'flash_attention_2' "
+                        "requires it (errors if missing). 'sdpa'/'eager' force.")
+    p.add_argument("--compile", action="store_true", default=False,
+                   help="torch.compile(mode='reduce-overhead') on the model: "
+                        "CUDA graphs + pointwise fusion to erase per-token "
+                        "launch overhead (closes most of the eager-decode gap "
+                        "to the bandwidth ceiling). EXPERIMENTAL — compiles "
+                        "lazily on first request; drop the flag if a run "
+                        "errors. First request pays a one-time compile cost.")
     p.add_argument("--backend", default="default", choices=["default", "cpu-paged"],
                    help="Inference backend (default: standard KVBoost)")
     p.add_argument("--quantization", default="none",
@@ -410,6 +424,10 @@ def load_engine(args):
                 device=device,
                 speculative_config=speculative_cfg,
                 tree_speculative_config=tree_speculative_cfg,
+                # attn_impl is ignored on the streaming path (StreamingCausalLM
+                # owns attention); compile flows through to __init__.
+                attn_implementation=args.attn_impl,
+                compile_model=args.compile,
             )
             log.info("Model loaded.")
             return engine
@@ -440,10 +458,27 @@ def load_engine(args):
             from_pretrained_kwargs["quantization_config"] = quant_config
         else:
             from_pretrained_kwargs["dtype"] = dtype
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            **from_pretrained_kwargs,
+        # Attention backend. 'auto' tries FA2 (better TTFT on Ampere+, e.g.
+        # RTX 3060) then falls back to sdpa; an explicit choice is honored.
+        _want_fa2 = args.attn_impl in ("auto", "flash_attention_2")
+        from_pretrained_kwargs["attn_implementation"] = (
+            "flash_attention_2" if _want_fa2 else args.attn_impl
         )
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model, **from_pretrained_kwargs,
+            )
+            log.info("Attention backend: %s",
+                     from_pretrained_kwargs["attn_implementation"])
+        except Exception as e:
+            if args.attn_impl != "auto":
+                raise  # explicit backend requested — don't mask the failure
+            log.info("flash_attention_2 unavailable (%s); using sdpa", e)
+            from_pretrained_kwargs["attn_implementation"] = "sdpa"
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model, **from_pretrained_kwargs,
+            )
+            log.info("Attention backend: sdpa")
         engine = InferenceEngine(
             model=model,
             tokenizer=tokenizer,
@@ -457,6 +492,7 @@ def load_engine(args):
             device=device,
             speculative_config=_build_speculative_config(args),
             tree_speculative_config=_build_tree_speculative_config(args),
+            compile_model=args.compile,
         )
 
     log.info("Model loaded.")

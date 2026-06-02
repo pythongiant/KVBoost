@@ -57,11 +57,10 @@ python bench_coding.py --backend kvboost --url http://localhost:9000 \
 ```
 Stop the kvboost server when it finishes (frees the GPU).
 
-**Step 2 — vLLM.** Start its server:
+**Step 2 — vLLM.** Stop kvboost first (frees the GPU), then start vLLM (usual
+setup — see `start_vllm.sh`):
 ```bash
-vllm serve Qwen/Qwen2.5-3B-Instruct --dtype float16 \
-    --enable-prefix-caching --gpu-memory-utilization 0.85 \
-    --max-model-len 32768 --port 8001
+./start_vllm.sh               # MODEL=... PORT=... GPU_MEM_UTIL=... MAX_MODEL_LEN=...
 ```
 Then run the **same** workload flags (so prompts match) against it:
 ```bash

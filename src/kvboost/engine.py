@@ -112,6 +112,13 @@ class InferenceEngine:
         # Cost coefficients (probed at server startup) for cost-aware
         # tree shape + mode selection. None = degraded mode (defaults).
         cost_coefficients: Any = None,
+        # torch.compile(mode="reduce-overhead") — captures CUDA graphs +
+        # fuses pointwise ops (RMSNorm/RoPE/SwiGLU/residual) → removes the
+        # per-token kernel-launch overhead that caps eager decode. Opt-in
+        # and EXPERIMENTAL: compilation is lazy (first forward), so a bad
+        # interaction surfaces at runtime, not here — drop the flag if a
+        # run errors. Off by default so it can never regress the eager path.
+        compile_model: bool = False,
     ):
         if device is None:
             device = default_device()
@@ -282,6 +289,21 @@ class InferenceEngine:
         from .flash_attn_ext import install_flash_attention
         self._flash_attn_patched = install_flash_attention(self.model)
 
+        # torch.compile LAST, after any model patching. reduce-overhead mode
+        # uses CUDA graphs + Triton fusion to erase per-token launch overhead
+        # (the gap between eager decode and the bandwidth ceiling). Lazy: the
+        # actual compile happens on the first forward, so we can't catch a
+        # failure here — wrap-time errors are caught; runtime graph-breaks just
+        # degrade to partial speedup. Drop --compile if a run errors outright.
+        self._compiled = False
+        if compile_model:
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                self._compiled = True
+                log.info("torch.compile(reduce-overhead) enabled (experimental)")
+            except Exception as e:
+                log.warning("torch.compile failed (%s); running eager", e)
+
     # ------------------------------------------------------------------
     # Factory
     # ------------------------------------------------------------------
@@ -293,6 +315,7 @@ class InferenceEngine:
         strict: bool = True,
         streaming_config: Optional["StreamingConfig"] = None,
         awq_path: Optional[str] = None,
+        attn_implementation: str = "auto",
         **kwargs,
     ) -> "InferenceEngine":
         """
@@ -309,7 +332,21 @@ class InferenceEngine:
                     the config. The rest of KVBoost (chunk-reuse, FlashAttn)
                     is untouched.
             awq_path: Optional path hint forwarded to the streaming loader.
-            **kwargs: Passed to InferenceEngine.__init__().
+            attn_implementation: Attention backend for the resident path.
+                    ``"auto"`` (default) tries ``flash_attention_2`` (FA2 —
+                    Ampere+ wheel; faster, lower-memory prefill → better TTFT)
+                    and silently falls back to ``"sdpa"`` if FA2 isn't
+                    installed/supported. Pass ``"flash_attention_2"`` to
+                    require it (raises if unavailable), or ``"sdpa"`` /
+                    ``"eager"`` to force a backend. Ignored on the streaming
+                    path. To load a **quantized** checkpoint (AWQ/GPTQ →
+                    Marlin int4 GEMM on Ampere, ~4× less weight bandwidth →
+                    higher decode tok/s), just pass a quantized ``model_name``;
+                    transformers reads its quantization_config and picks the
+                    kernel automatically — the engine already detects and
+                    leaves quantized/offloaded weights in place.
+            **kwargs: Passed to InferenceEngine.__init__() (e.g.
+                    ``compile_model=True`` for torch.compile reduce-overhead).
         """
         log.info("Loading model %s ...", model_name)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -326,11 +363,31 @@ class InferenceEngine:
                 dtype=torch.float16,
             )
         else:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                low_cpu_mem_usage=True,
-            )
+            load_kwargs = dict(torch_dtype=torch.float16, low_cpu_mem_usage=True)
+            impl = attn_implementation
+            if impl in ("auto", "flash_attention_2"):
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        attn_implementation="flash_attention_2",
+                        **load_kwargs,
+                    )
+                    log.info("Attention backend: flash_attention_2")
+                except Exception as e:
+                    if impl == "flash_attention_2":
+                        raise  # caller explicitly required FA2 — don't mask it
+                    log.info(
+                        "flash_attention_2 unavailable (%s); using sdpa", e
+                    )
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_name, attn_implementation="sdpa", **load_kwargs
+                    )
+                    log.info("Attention backend: sdpa")
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name, attn_implementation=impl, **load_kwargs
+                )
+                log.info("Attention backend: %s", impl)
             model.eval()
 
         check_model_compatibility(model, strict=strict)
@@ -1110,16 +1167,25 @@ class InferenceEngine:
 
         # ----- autoregressive decode ------------------------------------
         cur_pos = cached_len + len(live_ids)
+        # Pre-allocate the (1,1) decode input buffers ONCE and write in place
+        # each step, instead of allocating two fresh device tensors per token.
+        # Removes a per-token alloc + H2D churn, and — critically — gives
+        # torch.compile / CUDA-graph capture stable input tensors to graph
+        # against (a graph needs fixed input storage; a new tensor per step
+        # forces a recapture/recompile). Correctness is identical: the model
+        # reads these tensors, it never retains them across steps.
+        input_buf = torch.empty((1, 1), dtype=torch.long, device=self.device)
+        pos_buf = torch.empty((1, 1), dtype=torch.long, device=self.device)
         while not goto_done and len(generated) < max_new_tokens:
             if generated[-1] == self.tokenizer.eos_token_id:
                 break
-            cur_ids = torch.tensor([[generated[-1]]], dtype=torch.long, device=self.device)
-            pos_ids = torch.tensor([[cur_pos]], dtype=torch.long, device=self.device)
+            input_buf[0, 0] = generated[-1]
+            pos_buf[0, 0] = cur_pos
             with torch.no_grad(), last_logit_only(self.model):
                 out = self.model(
-                    input_ids=cur_ids,
+                    input_ids=input_buf,
                     past_key_values=self._as_cache(past_kv),
-                    position_ids=pos_ids,
+                    position_ids=pos_buf,
                     use_cache=True,
                 )
             past_kv = self._normalize_past_kv(out.past_key_values)
