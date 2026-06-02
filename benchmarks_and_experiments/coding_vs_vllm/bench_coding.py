@@ -34,7 +34,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import shlex
+import signal
 import statistics
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -283,28 +287,145 @@ def report_oom(by_backend: Dict[str, List[Outcome]]) -> None:
                  if crashed else "no hard OOM/crash observed"))
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Server lifecycle (one backend on the GPU at a time) ───────────────────────
 
 
-def _wait_healthy(url: str, timeout_s: float = 10.0) -> bool:
+def _gpu_mem_used_mb() -> Optional[float]:
+    """Total used VRAM on GPU 0 via nvidia-smi, or None if unavailable."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used",
+             "--format=csv,noheader,nounits", "-i", "0"],
+            stderr=subprocess.DEVNULL, timeout=5,
+        )
+        return float(out.decode().splitlines()[0].strip())
+    except Exception:
+        return None
+
+
+def _wait_healthy(url: str, timeout_s: float, proc=None) -> bool:
+    """Poll /health|/v1/models until the server answers, the process dies,
+    or we time out. Long default — model load can take minutes."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False  # server process exited before becoming healthy
         for path in ("/health", "/v1/models"):
             try:
                 if httpx.get(f"{url}{path}", timeout=3.0).status_code < 500:
                     return True
             except Exception:
                 pass
-        time.sleep(0.5)
+        time.sleep(1.0)
     return False
 
 
+def launch_server(cmd: str, url: str, name: str, *,
+                  ready_timeout: float, log_dir: str) -> "subprocess.Popen":
+    """Spawn a server in its own process group, wait until healthy.
+
+    Stdout/stderr → a log file so it doesn't pollute the benchmark output.
+    On failure to become healthy, the process is killed and we raise.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"{name}_server.log")
+    logf = open(log_path, "w")
+    print(f"[{name}] launching: {cmd}")
+    print(f"[{name}] server log → {log_path}")
+    proc = subprocess.Popen(
+        shlex.split(cmd), stdout=logf, stderr=subprocess.STDOUT,
+        start_new_session=True,  # own process group → clean group kill later
+    )
+    t0 = time.time()
+    if not _wait_healthy(url, ready_timeout, proc=proc):
+        _kill_process_group(proc)
+        raise RuntimeError(
+            f"{name} did not become healthy within {ready_timeout:.0f}s "
+            f"(or exited). Check {log_path}."
+        )
+    print(f"[{name}] healthy after {time.time()-t0:.0f}s")
+    return proc
+
+
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        proc.terminate()
+    try:
+        proc.wait(timeout=20)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+
+
+def teardown_server(proc: "subprocess.Popen", name: str, *,
+                    gpu_free_below_mb: float, free_timeout: float = 120.0) -> None:
+    """Kill the server and WAIT for its VRAM to be released before the next
+    backend launches — otherwise the second server can OOM on stale memory."""
+    print(f"[{name}] shutting down ...")
+    _kill_process_group(proc)
+    baseline = _gpu_mem_used_mb()
+    if baseline is None:
+        # No nvidia-smi — can't verify; give the allocator a fixed grace period.
+        time.sleep(15.0)
+        print(f"[{name}] (no nvidia-smi; waited 15s for VRAM release)")
+        return
+    deadline = time.time() + free_timeout
+    while time.time() < deadline:
+        used = _gpu_mem_used_mb()
+        if used is not None and used <= gpu_free_below_mb:
+            print(f"[{name}] VRAM released (used={used:.0f} MiB ≤ "
+                  f"{gpu_free_below_mb:.0f} MiB threshold)")
+            return
+        time.sleep(2.0)
+    print(f"[{name}] WARNING: VRAM still {_gpu_mem_used_mb()} MiB after "
+          f"{free_timeout:.0f}s; launching next backend anyway")
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+
+def _run_backend(name, url, model, args, reuse_prompts, oom_prompts,
+                 reuse_res, oom_res) -> None:
+    """Run all configured measurements for ONE backend (its server is up)."""
+    if reuse_prompts is not None:
+        print(f"── {name}: TTFT/throughput reuse workload ──")
+        reuse_res[name] = asyncio.run(
+            bench_reuse(url, model, name, reuse_prompts, args.timeout_s))
+    if oom_prompts is not None:
+        print(f"── {name}: OOM ramp ──")
+        oom_res[name] = asyncio.run(
+            bench_oom(url, model, name, oom_prompts, args.timeout_s))
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="kvboost vs vLLM — real coding benchmark")
-    ap.add_argument("--kvboost-url", default=None)
-    ap.add_argument("--vllm-url", default=None)
+    ap = argparse.ArgumentParser(
+        description="kvboost vs vLLM — real coding benchmark (one backend on "
+                    "the GPU at a time)")
+    ap.add_argument("--kvboost-url", default="http://localhost:9000")
+    ap.add_argument("--vllm-url", default="http://localhost:8001")
     ap.add_argument("--kvboost-model", default="Qwen/Qwen2.5-3B-Instruct")
     ap.add_argument("--vllm-model", default="Qwen/Qwen2.5-3B-Instruct")
+    # Launch commands: when given, the script starts the server, benchmarks it,
+    # then tears it down and waits for VRAM to free BEFORE the next backend —
+    # so only one model is ever resident on the GPU. Omit to bench a server
+    # you started yourself (then run the script once per backend).
+    ap.add_argument("--kvboost-cmd", default=None,
+                    help="full server launch command for kvboost (quoted). When "
+                         "set, the script manages its lifecycle.")
+    ap.add_argument("--vllm-cmd", default=None,
+                    help="full server launch command for vLLM (quoted).")
+    ap.add_argument("--only", choices=["kvboost", "vllm"], default=None,
+                    help="bench just one backend this run (the other isn't loaded)")
     ap.add_argument("--dataset", default="openai_humaneval")
     ap.add_argument("--dataset-split", default="test")
     ap.add_argument("--mode", choices=["ttft", "oom", "both"], default="both")
@@ -317,51 +438,73 @@ def main() -> int:
     ap.add_argument("--corpus-size", type=int, default=40,
                     help="real code units to pull from the dataset")
     ap.add_argument("--timeout-s", type=float, default=600.0)
+    ap.add_argument("--ready-timeout", type=float, default=600.0,
+                    help="max seconds to wait for a launched server to load")
+    ap.add_argument("--gpu-free-mb", type=float, default=2000.0,
+                    help="VRAM-used threshold (MiB) considered 'freed' between "
+                         "backends; tune to your weights+baseline")
+    ap.add_argument("--server-log-dir", default="./bench_server_logs")
+    ap.add_argument("--out", default=None, help="write raw outcomes JSON here")
     args = ap.parse_args()
 
-    targets = []
-    if args.kvboost_url:
-        targets.append(("kvboost", args.kvboost_url, args.kvboost_model))
-    if args.vllm_url:
-        targets.append(("vllm", args.vllm_url, args.vllm_model))
-    if not targets:
-        print("ERROR: give at least one of --kvboost-url / --vllm-url", file=sys.stderr)
-        return 2
+    # Backends to run, in order. (name, url, model, launch_cmd)
+    all_backends = [
+        ("kvboost", args.kvboost_url, args.kvboost_model, args.kvboost_cmd),
+        ("vllm", args.vllm_url, args.vllm_model, args.vllm_cmd),
+    ]
+    if args.only:
+        all_backends = [b for b in all_backends if b[0] == args.only]
 
-    # Load the real corpus ONCE; both backends see identical prompts.
+    # Load the real corpus + build prompts ONCE — both backends see identical
+    # inputs (deterministic from the dataset).
     corpus = cw.load_corpus(args.dataset, split=args.dataset_split,
                             n_units=args.corpus_size)
-    print(f"Loaded {len(corpus)} real code units from '{args.dataset}'.")
-
-    for name, url, _ in targets:
-        if not _wait_healthy(url):
-            print(f"ERROR: {name} at {url} not healthy", file=sys.stderr)
-            return 1
+    print(f"Loaded {len(corpus)} real code units from '{args.dataset}'.\n")
+    reuse_prompts = (cw.reuse_prompts(corpus, n=args.n, n_files=args.n_files)
+                     if args.mode in ("ttft", "both") else None)
+    oom_prompts = (cw.oom_prompts(corpus, contexts=args.contexts)
+                   if args.mode in ("oom", "both") else None)
 
     reuse_res: Dict[str, List[Outcome]] = {}
     oom_res: Dict[str, List[Outcome]] = {}
 
-    if args.mode in ("ttft", "both"):
-        prompts = cw.reuse_prompts(corpus, n=args.n, n_files=args.n_files)
-        print(f"\nReuse workload: {len(prompts)} requests, shared {args.n_files}-file "
-              f"repo prefix (~{prompts[0].target_tokens} tok), sequential.")
-        for name, url, model in targets:
-            print(f"── {name} ──")
-            reuse_res[name] = asyncio.run(
-                bench_reuse(url, model, name, prompts, args.timeout_s))
-
-    if args.mode in ("oom", "both"):
-        prompts = cw.oom_prompts(corpus, contexts=args.contexts)
-        print(f"\nOOM ramp: contexts {args.contexts} (real code concatenated).")
-        for name, url, model in targets:
-            print(f"── {name} ──")
-            oom_res[name] = asyncio.run(
-                bench_oom(url, model, name, prompts, args.timeout_s))
+    # ── Run each backend strictly one at a time ──
+    for name, url, model, cmd in all_backends:
+        print("\n" + "#" * 78)
+        print(f"# BACKEND: {name}  ({'managed' if cmd else 'external'} server @ {url})")
+        print("#" * 78)
+        proc = None
+        try:
+            if cmd:
+                proc = launch_server(cmd, url, name,
+                                     ready_timeout=args.ready_timeout,
+                                     log_dir=args.server_log_dir)
+            else:
+                if not _wait_healthy(url, timeout_s=15.0):
+                    print(f"[{name}] not healthy at {url} and no --{name}-cmd "
+                          f"given — skipping. (Start it, or pass --{name}-cmd.)")
+                    continue
+            _run_backend(name, url, model, args, reuse_prompts, oom_prompts,
+                         reuse_res, oom_res)
+        except Exception as e:
+            print(f"[{name}] run failed: {e}")
+        finally:
+            if proc is not None:
+                teardown_server(proc, name, gpu_free_below_mb=args.gpu_free_mb)
 
     if reuse_res:
         report_reuse(reuse_res)
     if oom_res:
         report_oom(oom_res)
+
+    if args.out:
+        payload = {
+            "reuse": {b: [o.__dict__ for o in outs] for b, outs in reuse_res.items()},
+            "oom": {b: [o.__dict__ for o in outs] for b, outs in oom_res.items()},
+        }
+        with open(args.out, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"\nRaw outcomes → {args.out}")
     return 0
 
 

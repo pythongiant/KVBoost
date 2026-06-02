@@ -33,34 +33,53 @@ Default dataset `openai_humaneval` (small, no auth, real Python). For
 long-context coding agents, point `--dataset` at a repo-level set
 (e.g. `repobench`); the adapter pulls code text from common field names.
 
-## Launch the servers (same model, same GPU)
+## One GPU → one backend at a time
 
-```bash
-# kvboost — CacheBlend (or the faithful sparse variant) + OOM planner (default on)
-python -m kvboost.server --model Qwen/Qwen2.5-3B-Instruct \
-    --recompute-strategy cacheblend_sparse --kv-cache-bits 8 --port 9000
+vLLM's `--gpu-memory-utilization` pre-allocates most of the VRAM, so **both
+servers cannot be resident at once** on a single GPU. The script handles this:
+when you pass each backend's launch command, it **starts kvboost, benchmarks
+it, kills it, waits for the VRAM to actually free, then starts vLLM** — only
+one model is ever on the GPU.
 
-# vLLM — prefix caching ON; set a real memory ceiling so OOM is reachable
-vllm serve Qwen/Qwen2.5-3B-Instruct \
-    --enable-prefix-caching --gpu-memory-utilization 0.85 \
-    --max-model-len 131072 --port 8001
-# (a high --max-model-len admits long prompts so they OOM at runtime rather
-#  than being rejected with a 400; lower it to see graceful rejects instead.)
-```
+### Recommended: let the script manage server lifecycle
 
-## Run
+Pass the full launch command for each backend (quote it). The script does the
+launch → bench → teardown → wait-for-VRAM-free → next sequence:
 
 ```bash
 python benchmarks_and_experiments/coding_vs_vllm/bench_coding.py \
-    --kvboost-url http://localhost:9000 --kvboost-model Qwen/Qwen2.5-3B-Instruct \
-    --vllm-url    http://localhost:8001 --vllm-model    Qwen/Qwen2.5-3B-Instruct \
-    --dataset openai_humaneval \
-    --mode both --n 10 \
-    --contexts 2000 8000 16000 32000 64000 96000
+  --dataset openai_humaneval --mode both --n 10 \
+  --contexts 2000 8000 16000 32000 64000 96000 \
+  --gpu-free-mb 2000 \
+  --kvboost-cmd "python -m kvboost.server --model Qwen/Qwen2.5-3B-Instruct \
+      --dtype float16 --recompute-strategy cacheblend_sparse --kv-cache-bits 8 \
+      --max-cache-bytes 4e9 --max-batch-size 1 --port 9000" \
+  --vllm-cmd    "vllm serve Qwen/Qwen2.5-3B-Instruct --dtype float16 \
+      --enable-prefix-caching --gpu-memory-utilization 0.85 \
+      --max-model-len 32768 --port 8001"
 ```
 
-`--mode ttft` or `--mode oom` to run one axis. One `--*-url` to bench a
-single backend.
+- Server stdout/stderr go to `./bench_server_logs/<backend>_server.log`.
+- `--gpu-free-mb` is the VRAM-used threshold (MiB) treated as "freed" between
+  backends — set it a bit above your idle/driver baseline (2000 is safe on a
+  dedicated card; raise if other processes share the GPU).
+- `--ready-timeout` (default 600s) is how long to wait for a server to load.
+
+### Alternative: start one server yourself, run once per backend
+
+If you'd rather manage servers manually (also one-at-a-time), omit the
+`--*-cmd` flags and use `--only`. Start kvboost, run:
+```bash
+python bench_coding.py --only kvboost --out kvboost.json --mode both
+```
+stop kvboost, start vLLM, run:
+```bash
+python bench_coding.py --only vllm --out vllm.json --mode both
+```
+Each run with `--only` benchmarks just that backend (the other is never
+loaded). `--out` saves raw outcomes so you can diff the two JSONs.
+
+`--mode ttft` or `--mode oom` to run a single axis.
 
 ## Output (illustrative — yours depend on GPU/model)
 
