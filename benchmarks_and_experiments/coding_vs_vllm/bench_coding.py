@@ -370,7 +370,12 @@ def main() -> int:
     # Workload (must match across the two runs you want to compare):
     ap.add_argument("--dataset", default="openai_humaneval")
     ap.add_argument("--dataset-split", default="test")
-    ap.add_argument("--mode", choices=["ttft", "oom", "both"], default="both")
+    ap.add_argument("--mode", choices=["ttft", "oom", "both", "multiturn"],
+                    default="both",
+                    help="ttft=fixed-prefix reuse (favors prefix caching); "
+                         "multiturn=reshuffled-context coding-agent sessions "
+                         "(exposes CacheBlend's edge); oom=context ramp; "
+                         "both=ttft+oom.")
     ap.add_argument("--n", type=int, default=10, help="reuse-workload request count")
     ap.add_argument("--n-files", type=int, default=6,
                     help="real files in the shared repo-context prefix")
@@ -379,6 +384,15 @@ def main() -> int:
                     help="OOM-ramp target context sizes (approx tokens)")
     ap.add_argument("--corpus-size", type=int, default=40,
                     help="real code units to pull from the dataset")
+    # --mode multiturn knobs (reshuffled coding-agent sessions)
+    ap.add_argument("--mt-sessions", type=int, default=3,
+                    help="multiturn: independent conversations")
+    ap.add_argument("--mt-turns", type=int, default=4,
+                    help="multiturn: turns per conversation")
+    ap.add_argument("--mt-files-per-turn", type=int, default=3,
+                    help="multiturn: reshuffled files injected each turn")
+    ap.add_argument("--mt-pool", type=int, default=8,
+                    help="multiturn: shared file pool the turns draw from")
     ap.add_argument("--timeout-s", type=float, default=600.0)
     args = ap.parse_args()
 
@@ -411,6 +425,17 @@ def main() -> int:
         prompts = cw.reuse_prompts(corpus, n=args.n, n_files=args.n_files)
         print(f"Reuse workload: {len(prompts)} requests, shared {args.n_files}-file "
               f"prefix (~{prompts[0].target_tokens} tok), sequential.")
+        reuse_res[args.backend] = asyncio.run(
+            bench_reuse(args.url, args.model, args.backend, prompts, args.timeout_s))
+
+    if args.mode == "multiturn":
+        prompts = cw.reuse_multiturn_prompts(
+            corpus, sessions=args.mt_sessions, turns=args.mt_turns,
+            files_per_turn=args.mt_files_per_turn, pool_files=args.mt_pool)
+        print(f"Multi-turn reuse: {args.mt_sessions} sessions × {args.mt_turns} "
+              f"turns, {args.mt_files_per_turn} RESHUFFLED files/turn from a "
+              f"{args.mt_pool}-file pool ({len(prompts)} requests). Out-of-order "
+              f"recurrence → CacheBlend reuses, prefix caching misses.")
         reuse_res[args.backend] = asyncio.run(
             bench_reuse(args.url, args.model, args.backend, prompts, args.timeout_s))
 

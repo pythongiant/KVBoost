@@ -84,6 +84,33 @@ those flags guarantees both backends saw the exact same inputs.
 
 `--mode ttft` or `--mode oom` to run a single axis.
 
+### `--mode multiturn` — where CacheBlend should *win*
+
+`--mode ttft` reuses a fixed leading prefix, which is vLLM prefix caching's best
+case (zero recompute) and CacheBlend's worst (it recomputes a prefix that's
+already correct). To show CacheBlend's actual edge, `--mode multiturn` replays
+reshuffled coding-agent sessions: a shared file pool, but each turn injects a
+**different subset in a different order**, so the same files recur **out of
+prefix order**. Prefix caching misses past the system prompt; CacheBlend reuses
+each recurring file chunk wherever it lands.
+
+```bash
+# kvboost MUST use content-aligned chunking so a repositioned file still chunks
+# identically (else fixed 128-tok cuts misalign and the content-hash misses):
+python -m kvboost.server --model ... --recompute-strategy cacheblend_sparse \
+    --chunk-boundary-window 32 --port 9000
+python bench_coding.py --backend kvboost --url http://localhost:9000 \
+    --model ... --mode multiturn --out kvboost_mt.json
+# vLLM (prefix caching) on the same workload:
+python bench_coding.py --backend vllm --url http://localhost:8001 \
+    --model ... --mode multiturn --out vllm_mt.json
+python bench_coding.py --compare kvboost_mt.json vllm_mt.json
+```
+
+Knobs: `--mt-sessions`, `--mt-turns`, `--mt-files-per-turn`, `--mt-pool`.
+Without `--chunk-boundary-window > 0` kvboost can't reuse a moved file, so the
+gap collapses — that flag is the point of this run.
+
 ## Output (illustrative — yours depend on GPU/model)
 
 ```

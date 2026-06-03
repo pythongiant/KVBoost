@@ -122,6 +122,14 @@ def parse_args():
     p.add_argument("--max-cache-bytes", type=float, default=2e9,
                    help="KV cache memory budget in bytes (default: 2 GB)")
     p.add_argument("--chunk-size", type=int, default=128)
+    p.add_argument("--chunk-boundary-window", type=int, default=0,
+                   help="Content-aligned chunking: split chunks at content "
+                        "boundaries (newlines etc.) within +/- this many tokens "
+                        "of the fixed size, instead of pure fixed-size cuts. "
+                        "0=off. Set >0 so a block of content (e.g. a file) that "
+                        "RECURS AT A DIFFERENT POSITION still chunks identically "
+                        "→ content-hash matches → CacheBlend reuse. Needed for "
+                        "the reshuffled multi-turn / RAG reuse workloads.")
     p.add_argument("--recompute-strategy", default="cacheblend",
                    choices=["selective", "cacheblend", "cacheblend_sparse", "none"],
                    help="KV seam-repair strategy on chunk reuse. "
@@ -427,6 +435,7 @@ def load_engine(args):
                 streaming_config=streaming_config,
                 max_cache_bytes=int(args.max_cache_bytes),
                 chunk_size=args.chunk_size,
+                chunk_boundary_window=args.chunk_boundary_window,
                 recompute_strategy=args.recompute_strategy,
                 kv_cache_bits=args.kv_cache_bits,
                 sink_tokens=args.sink_tokens,
@@ -500,6 +509,7 @@ def load_engine(args):
             tokenizer=tokenizer,
             max_cache_bytes=int(args.max_cache_bytes),
             chunk_size=args.chunk_size,
+            chunk_boundary_window=args.chunk_boundary_window,
             recompute_strategy=args.recompute_strategy,
             kv_cache_bits=args.kv_cache_bits,
             sink_tokens=args.sink_tokens,

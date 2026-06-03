@@ -146,6 +146,87 @@ def reuse_prompts(
     return out
 
 
+@dataclass
+class MultiTurnPrompt:
+    """A full multi-turn message list to send (stateless chat API re-sends the
+    whole conversation each turn)."""
+    name: str
+    messages: List[dict]
+    max_tokens: int
+
+    @property
+    def target_tokens(self) -> int:
+        return sum(len(m.get("content", "")) for m in self.messages) // 4
+
+    def to_body(self, model: str, stream: bool = True) -> dict:
+        return {
+            "model": model,
+            "messages": self.messages,
+            "max_tokens": self.max_tokens,
+            "temperature": 0.2,
+            "stream": stream,
+            "stream_options": {"include_usage": True},
+        }
+
+
+def reuse_multiturn_prompts(
+    corpus: List[str], *, sessions: int = 3, turns: int = 4,
+    files_per_turn: int = 3, pool_files: int = 8, max_tokens: int = 256,
+    seed: int = 0,
+) -> List[MultiTurnPrompt]:
+    """Multi-turn coding-agent sessions with a RESHUFFLED file context per turn.
+
+    This is the workload that exposes **CacheBlend's** edge over prefix caching
+    (unlike ``reuse_prompts``, which is a fixed leading prefix that favors prefix
+    caching). A shared pool of real files recurs across turns/sessions but at
+    DIFFERENT positions each time, so:
+      * vLLM prefix caching misses past the shared system prompt (the prefix
+        diverges as soon as the file order changes), re-prefilling each turn's
+        files every time;
+      * kvboost CacheBlend reuses each recurring file chunk wherever it lands,
+        recomputing only the cross-attention seams.
+
+    Each emitted prompt is the conversation so far — ``[system, u1, a1, …, u_t]``
+    — matching how a stateless chat API re-sends history. User turns embed a
+    reshuffled subset of the pool + a task; assistant history turns are short
+    canned acks so replay is fully deterministic (identical prompts for every
+    backend → fair comparison). Replayed sequentially so later turns re-encounter
+    earlier files.
+
+    Tip: for kvboost to actually reuse a file that moved position, the chunker
+    should be content-aligned (server ``--chunk-boundary-window`` > 0); with
+    pure fixed-size chunks a repositioned file may split across chunk boundaries
+    differently and miss.
+    """
+    import random
+
+    pool = corpus[:pool_files]
+    if not pool:
+        raise SystemExit("ERROR: empty corpus for the multi-turn workload.")
+    rng = random.Random(seed)
+    prompts: List[MultiTurnPrompt] = []
+    for s in range(sessions):
+        messages: List[dict] = [{"role": "system", "content": _SYS}]
+        for t in range(turns):
+            k = min(files_per_turn, len(pool))
+            subset = rng.sample(pool, k)   # different files...
+            rng.shuffle(subset)            # ...in a different order each turn
+            ctx = "\n\n".join(
+                f"# ── file {i+1} ──\n{f}" for i, f in enumerate(subset)
+            )
+            messages = messages + [
+                {"role": "user", "content": ctx + _TASK.format((t % k) + 1)}
+            ]
+            prompts.append(MultiTurnPrompt(
+                name=f"s{s}t{t}", messages=list(messages), max_tokens=max_tokens,
+            ))
+            messages = messages + [
+                {"role": "assistant",
+                 "content": f"Done — updated file {(t % k) + 1} as requested."}
+            ]
+    return prompts
+
+
 def oom_prompts(
     corpus: List[str], *, contexts: List[int], max_tokens: int = 128,
 ) -> List[Prompt]:

@@ -110,5 +110,15 @@ exec python -m kvboost.server \
 # per new PREFILL length so it can HURT this varying-prompt TTFT benchmark.
 # Ignored if --cuda-graph-decode is set. Prefer --cuda-graph-decode.
 #
+# MULTI-TURN CacheBlend run (where CacheBlend should BEAT vLLM prefix caching):
+# the bench --mode multiturn workload reshuffles the in-context files each turn,
+# so the same files recur OUT OF ORDER — prefix caching misses, CacheBlend
+# reuses. For kvboost to actually match a repositioned file, add content-aligned
+# chunking so a moved file still chunks identically (else fixed 128-tok cuts
+# misalign and miss):
+#     ./start_kvboost.sh   # add: --chunk-boundary-window 32
+#   then: python bench_coding.py --backend kvboost --url http://localhost:9000 \
+#             --model "$MODEL" --mode multiturn --out kvboost_mt.json
+#
 # Oversized-prompt policy for the OOM ramp — complete-by-truncation vs 413:
 #     --auto-truncate
