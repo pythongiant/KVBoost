@@ -68,6 +68,7 @@ exec python -m kvboost.server \
     --cuda-graph-decode \
     --attn-impl auto \
     --recompute-strategy cacheblend_sparse \
+    --chunk-boundary-window 32\
     --kv-cache-bits 8 \
     --max-cache-bytes "$MAX_CACHE_BYTES" \
     --planner-safety-margin "$SAFETY_MARGIN" \
