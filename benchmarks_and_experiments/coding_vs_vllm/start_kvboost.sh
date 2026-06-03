@@ -94,9 +94,19 @@ exec python -m kvboost.server \
 # decode step through FlashInfer, SDPA for prefill + fallback, with a one-time
 # numerical self-check. Needs `pip install flashinfer-python` (install_deps.sh).
 #
-# torch.compile (--compile): CUDA graphs + fusion → faster DECODE, but
-# recompiles per new PREFILL length so it can HURT this varying-prompt TTFT
-# benchmark + adds a first-request compile cost. Decode-bound serving only.
+# CUDA-GRAPH DECODE (--cuda-graph-decode): THE fix for the dominant decode cost
+# on a 3060 — the per-token launch overhead (~36 of the ~56 ms/token). Captures
+# the single-token decode step against a static KV cache and replays it; reuse-
+# based prefill is preserved. Self-checked vs eager (multi-step greedy) with
+# eager fallback, so a bad capture degrades to correct-but-slow, never wrong.
+# Expected: decode ~17 -> ~40+ tok/s. Validate on the box (compare output to a
+# run without the flag). STACKS with Marlin int4 (MODEL=...-AWQ) → ~17 -> ~90+:
+#     --cuda-graph-decode
+#     MODEL=Qwen/Qwen2.5-3B-Instruct-AWQ ... --cuda-graph-decode   # both levers
+#
+# torch.compile (--compile): alternative CUDA-graph path via torch; recompiles
+# per new PREFILL length so it can HURT this varying-prompt TTFT benchmark.
+# Ignored if --cuda-graph-decode is set. Prefer --cuda-graph-decode.
 #
 # Oversized-prompt policy for the OOM ramp — complete-by-truncation vs 413:
 #     --auto-truncate

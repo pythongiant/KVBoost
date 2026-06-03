@@ -88,7 +88,15 @@ def parse_args():
                         "launch overhead (closes most of the eager-decode gap "
                         "to the bandwidth ceiling). EXPERIMENTAL — compiles "
                         "lazily on first request; drop the flag if a run "
-                        "errors. First request pays a one-time compile cost.")
+                        "errors. First request pays a one-time compile cost. "
+                        "Ignored if --cuda-graph-decode is set.")
+    p.add_argument("--cuda-graph-decode", action="store_true", default=False,
+                   help="Capture the single-token DECODE step into a CUDA graph "
+                        "(over a static KV cache) and replay it — removes the "
+                        "eager loop's per-token launch overhead, the dominant "
+                        "decode cost on bandwidth-bound GPUs (e.g. RTX 3060). "
+                        "Reuse-based prefill is preserved; self-checked vs eager "
+                        "with eager fallback. Stacks with Marlin int4 weights.")
     p.add_argument("--backend", default="default", choices=["default", "cpu-paged"],
                    help="Inference backend (default: standard KVBoost)")
     p.add_argument("--quantization", default="none",
@@ -431,6 +439,7 @@ def load_engine(args):
                 # owns attention); compile flows through to __init__.
                 attn_implementation=args.attn_impl,
                 compile_model=args.compile,
+                cuda_graph_decode=args.cuda_graph_decode,
             )
             log.info("Model loaded.")
             return engine
@@ -500,6 +509,7 @@ def load_engine(args):
             speculative_config=_build_speculative_config(args),
             tree_speculative_config=_build_tree_speculative_config(args),
             compile_model=args.compile,
+            cuda_graph_decode=args.cuda_graph_decode,
         )
 
     log.info("Model loaded.")

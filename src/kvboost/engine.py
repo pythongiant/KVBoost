@@ -119,6 +119,12 @@ class InferenceEngine:
         # interaction surfaces at runtime, not here — drop the flag if a
         # run errors. Off by default so it can never regress the eager path.
         compile_model: bool = False,
+        # CUDA-graph decode: capture the single-token decode step against a
+        # static KV cache and replay it, removing the per-token launch overhead
+        # that caps eager decode on bandwidth-bound GPUs. Preserves reuse-based
+        # prefill. Self-checked + eager fallback. Alternative to compile_model
+        # (if both set, this wins for decode).
+        cuda_graph_decode: bool = False,
     ):
         if device is None:
             device = default_device()
@@ -289,20 +295,47 @@ class InferenceEngine:
         from .flash_attn_ext import install_flash_attention
         self._flash_attn_patched = install_flash_attention(self.model)
 
+        # CUDA-graph decode (before compile — captures the uncompiled model).
+        self._cgd = None
+        if cuda_graph_decode:
+            try:
+                from .cuda_graph_decode import CUDAGraphDecoder
+                cdt = torch.float16
+                for p in self.model.parameters():
+                    if p.is_floating_point():
+                        cdt = p.dtype
+                        break
+                cgd = CUDAGraphDecoder(
+                    self.model, device=self.device, dtype=cdt,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+                if cgd.applicable():
+                    self._cgd = cgd
+                    log.info("CUDA-graph decode enabled.")
+                else:
+                    log.info("CUDA-graph decode requested but not applicable "
+                             "(needs CUDA + StaticCache); using eager decode.")
+            except Exception as e:
+                log.warning("CUDA-graph decode init failed (%s); eager decode.", e)
+
         # torch.compile LAST, after any model patching. reduce-overhead mode
         # uses CUDA graphs + Triton fusion to erase per-token launch overhead
         # (the gap between eager decode and the bandwidth ceiling). Lazy: the
         # actual compile happens on the first forward, so we can't catch a
         # failure here — wrap-time errors are caught; runtime graph-breaks just
         # degrade to partial speedup. Drop --compile if a run errors outright.
+        # Skip when CUDA-graph decode is active — they're alternative decode
+        # overhead fixes and compiling under the captured model is redundant.
         self._compiled = False
-        if compile_model:
+        if compile_model and self._cgd is None:
             try:
                 self.model = torch.compile(self.model, mode="reduce-overhead")
                 self._compiled = True
                 log.info("torch.compile(reduce-overhead) enabled (experimental)")
             except Exception as e:
                 log.warning("torch.compile failed (%s); running eager", e)
+        elif compile_model and self._cgd is not None:
+            log.info("--compile ignored: CUDA-graph decode is active.")
 
     # ------------------------------------------------------------------
     # Factory
@@ -1167,6 +1200,26 @@ class InferenceEngine:
             goto_done = True
         else:
             goto_done = False
+
+        # ----- CUDA-graph decode (if enabled + applicable) --------------
+        # Replays a captured single-token step against a static KV cache,
+        # removing the eager loop's per-token launch overhead. Returns None to
+        # signal a fall-through to the eager loop (self-check bailed / error
+        # before any token was emitted) so correctness is never at risk.
+        if (not goto_done and self._cgd is not None and self._cgd.applicable()
+                and len(generated) < max_new_tokens):
+            cg_tokens = self._cgd.decode(
+                past_kv=past_kv,
+                start_pos=cached_len + len(live_ids),
+                seed_token=generated[-1],
+                max_new_tokens=max_new_tokens - len(generated),
+                sample_fn=lambda lg: self._sample(lg, temperature, do_sample),
+                as_cache=self._as_cache,
+                on_token=on_token,
+            )
+            if cg_tokens is not None:
+                generated.extend(cg_tokens)
+                goto_done = True
 
         # ----- autoregressive decode ------------------------------------
         cur_pos = cached_len + len(live_ids)
