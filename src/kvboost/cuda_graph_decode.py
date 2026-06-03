@@ -251,6 +251,57 @@ class CUDAGraphDecoder:
                       "%s) — DISABLING, eager fallback.", got, ref)
         return ok
 
+    def _measure_speedup(self, cc: _Captured, past_kv, L: int, seed: int,
+                         steps: int = 12) -> None:
+        """Time the compiled step vs an eager step on the SAME static cache and
+        log the ratio. Makes the 'compiles but graph-breaks → no real speedup'
+        outcome LOUD: torch.compile won't error or fail the self-check in that
+        case, so without this probe a useless graph looks like a working one.
+        Best-effort; never affects decode."""
+        if not (self._use_compiled and torch.cuda.is_available()):
+            return
+        try:
+            import time
+
+            compiled = self._compiled()
+            if compiled is None:
+                return
+
+            def _run(fn) -> float:
+                self._populate(cc.cache, past_kv, L)
+                cc.input_ids[0, 0] = seed
+                cc.pos_ids[0, 0] = L
+                cc.cache_pos[0] = L
+                for _ in range(3):           # warm
+                    fn()
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                for _ in range(steps):
+                    fn()
+                torch.cuda.synchronize()
+                return (time.perf_counter() - t0) / steps * 1000.0
+
+            kw = dict(input_ids=cc.input_ids, position_ids=cc.pos_ids,
+                      cache_position=cc.cache_pos, past_key_values=cc.cache,
+                      use_cache=True)
+            ms_compiled = _run(lambda: compiled(**kw))
+            ms_eager = _run(lambda: self.model(**kw))
+            ratio = ms_eager / max(ms_compiled, 1e-6)
+            if ratio >= 1.15:
+                log.info("CUDA-graph decode speedup: %.1f→%.1f ms/step "
+                         "(%.2f× vs eager).", ms_eager, ms_compiled, ratio)
+            else:
+                log.warning(
+                    "CUDA-graph decode gives NO meaningful speedup "
+                    "(compiled %.1f ms vs eager %.1f ms/step, %.2f×). "
+                    "torch.compile is graph-breaking over transformers' "
+                    "StaticCache bookkeeping/mask, so the launch overhead "
+                    "survives. The reliable decode lever here is weight quant "
+                    "(Marlin int4): run with MODEL=...-AWQ.",
+                    ms_compiled, ms_eager, ratio)
+        except Exception as e:
+            log.debug("CUDA-graph speedup probe skipped (%s).", e)
+
     # ------------------------------------------------------------------
     def decode(self, *, past_kv, start_pos: int, seed_token: int,
                max_new_tokens: int, sample_fn: Callable[[torch.Tensor], int],
@@ -277,6 +328,9 @@ class CUDAGraphDecoder:
                 if not self._self_check(cc, past_kv, L, seed_token, as_cache):
                     self._disabled = True
                     return None
+                # Self-check only proves CORRECTNESS. Also measure SPEED so a
+                # graph-breaking compile (correct but no faster) is surfaced.
+                self._measure_speedup(cc, past_kv, L, seed_token)
 
             self._populate(cc.cache, past_kv, L)
             out: List[int] = []
