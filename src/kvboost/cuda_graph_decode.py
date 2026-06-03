@@ -8,23 +8,33 @@ cache. This module does the same for kvboost:
   1. After kvboost's (reuse-based) prefill produces the prompt KV, copy it into
      a HuggingFace ``StaticCache`` (pre-allocated, fixed-address buffers) via the
      cache's own ``update`` API — so reuse/TTFT is preserved, decode just runs
-     on a graph-capturable cache.
-  2. Capture the single-token decode forward once with ``torch.cuda.CUDAGraph``
-     (warmed up in a side stream first), then ``replay()`` it per token —
-     sampling happens eagerly outside the captured region.
-  3. Graphs are keyed by a bucketed cache length so repeated similar-length
-     requests reuse one capture.
+     on a graph-capturable, static-shape cache.
+  2. Capture the single-token decode forward into CUDA graphs via
+     ``torch.compile(mode="reduce-overhead")``, replayed per token; sampling is
+     eager and outside the graph.
+
+Why torch.compile rather than a hand-rolled ``torch.cuda.CUDAGraph``: an HF
+model forward contains host-side ops (causal-mask construction, cache
+bookkeeping, occasional ``.item()``/``.any()`` syncs) that are ILLEGAL inside a
+manual capture region — raw capture fails with "operation failed due to a
+previous error during capture". ``torch.compile`` traces the forward, graph-
+breaks around those host ops, and applies cudagraph trees to the capturable
+compute. It is still real CUDA graphs; it just does the surgery raw capture
+can't. The model is compiled with decode-shaped (1,1) inputs ONLY (prefill uses
+the uncompiled model), so it compiles once and never recompiles per prefill
+length.
 
 Safety (graph capture is validated on the GPU box, not in CI):
   * Capability-gated (CUDA + StaticCache); ``applicable()`` is False otherwise.
   * Shape-gated to batch==1, non-speculative.
-  * One-time NUMERICAL self-check on first use: the graph's first decode logits
-    are compared against an eager reference (original model, fresh DynamicCache);
-    on mismatch the path is PERMANENTLY disabled (logged at ERROR) and the
-    caller falls back to the eager loop — before any token is emitted.
-  * The static-cache *forward* itself (KV copy + cache_position + masking) is
-    CPU-testable and covered by tests/test_cuda_graph_decode.py; only the graph
-    capture/replay is GPU-only.
+  * One-time multi-step GREEDY self-check on first use: the compiled-graph
+    tokens are compared against an eager reference (original model, fresh
+    DynamicCache); on mismatch the path is PERMANENTLY disabled and the caller
+    falls back to the eager loop — before any token is emitted.
+  * Per-call exception fallback (e.g. compile/capture errors → eager).
+  * The static-cache *forward* (KV copy + cache_position + masking) is
+    CPU-testable and covered by tests/test_cuda_graph_decode.py via the eager
+    static-cache mode; only the compiled cudagraph step is GPU-only.
 
 Stacks with weight quant (Marlin int4): int4 weights cut the bandwidth floor,
 graphs cut the launch overhead — together they target both decode costs.
@@ -54,31 +64,32 @@ def _iter_kv(past_kv):
 
 @dataclass
 class _Captured:
-    """A captured (or eager) decode step bound to one StaticCache + buffers."""
+    """A StaticCache + static input buffers for one bucketed cache length."""
     cache: Any
     input_ids: torch.Tensor       # (1, 1) static
     pos_ids: torch.Tensor         # (1, 1) static
     cache_pos: torch.Tensor       # (1,)   static
-    graph: Optional[Any]          # torch.cuda.CUDAGraph, or None for eager mode
-    logits: Optional[torch.Tensor]  # static (1, 1, V) for graph mode
 
 
 class CUDAGraphDecoder:
     def __init__(self, model, *, device, dtype, eos_token_id,
-                 bucket: int = 256, warmup: int = 3,
-                 force_eager: bool = False):
+                 bucket: int = 256, force_eager: bool = False):
         self.model = model
         self.device = torch.device(device)
         self.dtype = dtype
         self.eos = eos_token_id
         self.bucket = max(1, int(bucket))
-        self.warmup = max(1, int(warmup))
-        self.force_eager = force_eager      # tests only: eager static-cache, no graph
+        self.force_eager = force_eager      # tests: eager static-cache, no compile
         self._config = getattr(model, "config", None)
-        self._graphs: dict[int, _Captured] = {}
+        self._caches: dict[int, _Captured] = {}
+        self._decode_fn = None              # torch.compile(model) wrapper, lazy
         self._disabled = False
         self._self_checked = False
         self._ok = self._probe()
+        # Compile only on a real CUDA device (cudagraphs need it); force_eager
+        # runs the static-cache forward eagerly (CPU-testable).
+        self._use_compiled = self._ok and not self.force_eager and \
+            torch.cuda.is_available() and self.device.type == "cuda"
 
     # ------------------------------------------------------------------
     def _probe(self) -> bool:
@@ -98,11 +109,10 @@ class CUDAGraphDecoder:
     # ------------------------------------------------------------------
     def _dims(self):
         c = self._config
-        n_layers = int(c.num_hidden_layers)
         n_heads = int(getattr(c, "num_attention_heads"))
         n_kv = int(getattr(c, "num_key_value_heads", n_heads))
         head_dim = int(getattr(c, "head_dim", 0) or (c.hidden_size // n_heads))
-        return n_kv, head_dim, n_layers
+        return n_kv, head_dim
 
     def _max_pos(self) -> int:
         return int(getattr(self._config, "max_position_embeddings", 1 << 30))
@@ -111,56 +121,54 @@ class CUDAGraphDecoder:
         b = self.bucket
         return min(((n + b - 1) // b) * b, self._max_pos())
 
-    def _fwd(self, cap: _Captured):
-        return self.model(
-            input_ids=cap.input_ids,
-            position_ids=cap.pos_ids,
-            cache_position=cap.cache_pos,
-            past_key_values=cap.cache,
-            use_cache=True,
-        )
+    def _compiled(self):
+        """Lazily build the reduce-overhead compiled model (decode-only use)."""
+        if not self._use_compiled:
+            return None
+        if self._decode_fn is None:
+            try:
+                self._decode_fn = torch.compile(
+                    self.model, mode="reduce-overhead", fullgraph=False,
+                )
+            except Exception as e:
+                log.warning("torch.compile for CUDA-graph decode failed (%s); "
+                            "eager static-cache.", e)
+                self._use_compiled = False
+                self._decode_fn = None
+        return self._decode_fn
 
     def _build(self, bucket_len: int) -> _Captured:
-        """Build a StaticCache + static buffers, and (on CUDA) capture the
-        decode step into a CUDA graph after a side-stream warmup."""
         from transformers import StaticCache
 
-        n_kv, head_dim, _ = self._dims()
+        n_kv, head_dim = self._dims()
         cache = StaticCache(config=self._config, max_cache_len=bucket_len)
         cache.early_initialization(1, n_kv, head_dim, self.dtype, self.device)
 
         inp = torch.zeros((1, 1), dtype=torch.long, device=self.device)
         pos = torch.zeros((1, 1), dtype=torch.long, device=self.device)
         cpos = torch.zeros((1,), dtype=torch.long, device=self.device)
-        cap = _Captured(cache=cache, input_ids=inp, pos_ids=pos,
-                        cache_pos=cpos, graph=None, logits=None)
 
-        if self.force_eager or not torch.cuda.is_available():
-            return cap  # eager static-cache mode (no capture)
-
-        # Warm up in a side stream so cuBLAS/cuDNN workspaces + any lazy
-        # allocations happen OUTSIDE the captured region.
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s), torch.no_grad():
-            for _ in range(self.warmup):
-                cache.reset()
-                _ = self._fwd(cap)
-        torch.cuda.current_stream().wait_stream(s)
-        cache.reset()
-
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g), torch.no_grad():
-            out = self._fwd(cap)
-        cap.graph = g
-        cap.logits = out.logits
-        return cap
+        # Pin static addresses so reduce-overhead's cudagraphs don't re-record
+        # when our buffers / cache tensors are reused across steps. Best-effort.
+        if self._use_compiled:
+            try:
+                import torch._dynamo as _dyn
+                for b in (inp, pos, cpos):
+                    _dyn.mark_static_address(b)
+                for lyr in getattr(cache, "layers", []):
+                    if hasattr(lyr, "keys"):
+                        _dyn.mark_static_address(lyr.keys)
+                    if hasattr(lyr, "values"):
+                        _dyn.mark_static_address(lyr.values)
+            except Exception:
+                pass
+        return _Captured(cache=cache, input_ids=inp, pos_ids=pos, cache_pos=cpos)
 
     def _get(self, bucket_len: int) -> _Captured:
-        cap = self._graphs.get(bucket_len)
+        cap = self._caches.get(bucket_len)
         if cap is None:
             cap = self._build(bucket_len)
-            self._graphs[bucket_len] = cap
+            self._caches[bucket_len] = cap
         return cap
 
     def _populate(self, cache, past_kv, L: int) -> None:
@@ -173,23 +181,30 @@ class CUDAGraphDecoder:
             v = v[:, :, :L, :].to(self.device, self.dtype)
             cache.update(k, v, i, cache_kwargs={"cache_position": cpos})
 
+    def _forward(self, cap: _Captured):
+        fn = self._compiled() if self._use_compiled else None
+        target = fn if fn is not None else self.model
+        return target(
+            input_ids=cap.input_ids,
+            position_ids=cap.pos_ids,
+            cache_position=cap.cache_pos,
+            past_key_values=cap.cache,
+            use_cache=True,
+        )
+
     def _step_logits(self, cap: _Captured, tok: int, cur: int) -> torch.Tensor:
         cap.input_ids[0, 0] = tok
         cap.pos_ids[0, 0] = cur
         cap.cache_pos[0] = cur
-        if cap.graph is not None:
-            cap.graph.replay()
-            return cap.logits[:, -1, :]
-        out = self._fwd(cap)            # eager static-cache step (CPU-testable)
+        out = self._forward(cap)
         return out.logits[:, -1, :]
 
     def _self_check(self, cap: _Captured, past_kv, L: int, seed: int,
                     as_cache, k: int = 4) -> bool:
-        """Compare the first ``k`` GREEDY tokens from the graph against an eager
-        reference (original model, fresh DynamicCache). Multi-step so a capture
-        bug that freezes the mask/position (passes step 0, diverges later) is
-        caught. Mutates cap.cache (caller re-populates before the real loop)."""
-        # eager reference (greedy)
+        """Compare the first ``k`` GREEDY tokens from the compiled-graph path
+        against an eager reference (original model, fresh DynamicCache). Catches
+        capture/compile bugs (incl. a frozen mask) before any token is emitted.
+        Mutates cap.cache (caller re-populates before the real loop)."""
         ref: List[int] = []
         with torch.no_grad():
             dyn = as_cache(past_kv)
@@ -205,7 +220,6 @@ class CUDAGraphDecoder:
                 cur += 1
                 if tok == self.eos:
                     break
-        # graph (greedy)
         self._populate(cap.cache, past_kv, L)
         got: List[int] = []
         tok, cur = seed, L
@@ -234,7 +248,7 @@ class CUDAGraphDecoder:
         """Generate up to ``max_new_tokens`` continuation tokens, feeding
         ``seed_token`` at ``start_pos`` first. Returns the new tokens (the seed
         is already held by the caller), or ``None`` to signal the caller should
-        fall back to the eager loop (self-check failed / unsupported)."""
+        fall back to the eager loop (self-check failed / unsupported / error)."""
         if max_new_tokens <= 0 or seed_token == self.eos:
             return []
         try:
@@ -244,9 +258,9 @@ class CUDAGraphDecoder:
                 return None  # prompt longer than we can bucket — eager handles it
             cap = self._get(bucket_len)
 
-            # One-time multi-step self-check (graph mode only). Runs BEFORE any
+            # One-time multi-step self-check (compiled path only), BEFORE any
             # token is emitted, so a failure cleanly falls back to eager.
-            if cap.graph is not None and not self._self_checked:
+            if self._use_compiled and not self._self_checked:
                 self._self_checked = True
                 if not self._self_check(cap, past_kv, L, seed_token, as_cache):
                     self._disabled = True
