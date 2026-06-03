@@ -67,7 +67,7 @@ def test_static_cache_decode_matches_eager(L, n):
 
     dec = CUDAGraphDecoder(
         model, device="cpu", dtype=torch.float32, eos_token_id=-1,
-        bucket=64, force_eager=True,
+        max_cache_len=64, force_eager=True,
     )
     assert dec.applicable()
     got = dec.decode(
@@ -99,7 +99,7 @@ def test_stops_on_eos():
 
     dec = CUDAGraphDecoder(
         model, device="cpu", dtype=torch.float32, eos_token_id=first,
-        bucket=64, force_eager=True,
+        max_cache_len=64, force_eager=True,
     )
     out = dec.decode(past_kv=kv_snap, start_pos=8, seed_token=seed,
                      max_new_tokens=20, sample_fn=_greedy, as_cache=lambda x: x)

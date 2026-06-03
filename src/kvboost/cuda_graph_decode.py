@@ -73,15 +73,25 @@ class _Captured:
 
 class CUDAGraphDecoder:
     def __init__(self, model, *, device, dtype, eos_token_id,
-                 bucket: int = 256, force_eager: bool = False):
+                 max_cache_len: int = 8192, force_eager: bool = False):
         self.model = model
         self.device = torch.device(device)
         self.dtype = dtype
         self.eos = eos_token_id
-        self.bucket = max(1, int(bucket))
         self.force_eager = force_eager      # tests: eager static-cache, no compile
         self._config = getattr(model, "config", None)
-        self._caches: dict[int, _Captured] = {}
+        # ONE fixed cache size for all requests. A per-request size would make
+        # torch.compile recompile for every distinct prompt length (multi-turn
+        # prompts grow each turn) and quickly hit dynamo's recompile_limit ->
+        # fall back to eager. A single size compiles once -> the cudagraph
+        # sticks. The oversized-but-fixed cache reads ~the whole buffer per step
+        # (mask handles validity), which is ~5% of weight bandwidth — cheap next
+        # to eliminating the launch overhead. Prompts longer than this fall back
+        # to the eager loop.
+        self._cap = min(int(max_cache_len),
+                        int(getattr(self._config, "max_position_embeddings", 1 << 30))
+                        if self._config is not None else int(max_cache_len))
+        self._cache: Optional[_Captured] = None   # built once, for self._cap
         self._decode_fn = None              # torch.compile(model) wrapper, lazy
         self._disabled = False
         self._self_checked = False
@@ -114,19 +124,23 @@ class CUDAGraphDecoder:
         head_dim = int(getattr(c, "head_dim", 0) or (c.hidden_size // n_heads))
         return n_kv, head_dim
 
-    def _max_pos(self) -> int:
-        return int(getattr(self._config, "max_position_embeddings", 1 << 30))
-
-    def _round_up(self, n: int) -> int:
-        b = self.bucket
-        return min(((n + b - 1) // b) * b, self._max_pos())
-
     def _compiled(self):
         """Lazily build the reduce-overhead compiled model (decode-only use)."""
         if not self._use_compiled:
             return None
         if self._decode_fn is None:
             try:
+                # Headroom over the default recompile_limit (8) — with a single
+                # fixed cache size we expect ~1 compile, but the self-check +
+                # first real step can trip a couple; don't let dynamo bail.
+                try:
+                    import torch._dynamo as _dyn
+                    if getattr(_dyn.config, "recompile_limit", 8) < 32:
+                        _dyn.config.recompile_limit = 32
+                    if getattr(_dyn.config, "cache_size_limit", 8) < 32:
+                        _dyn.config.cache_size_limit = 32
+                except Exception:
+                    pass
                 self._decode_fn = torch.compile(
                     self.model, mode="reduce-overhead", fullgraph=False,
                 )
@@ -137,11 +151,11 @@ class CUDAGraphDecoder:
                 self._decode_fn = None
         return self._decode_fn
 
-    def _build(self, bucket_len: int) -> _Captured:
+    def _build(self) -> _Captured:
         from transformers import StaticCache
 
         n_kv, head_dim = self._dims()
-        cache = StaticCache(config=self._config, max_cache_len=bucket_len)
+        cache = StaticCache(config=self._config, max_cache_len=self._cap)
         cache.early_initialization(1, n_kv, head_dim, self.dtype, self.device)
 
         inp = torch.zeros((1, 1), dtype=torch.long, device=self.device)
@@ -164,12 +178,10 @@ class CUDAGraphDecoder:
                 pass
         return _Captured(cache=cache, input_ids=inp, pos_ids=pos, cache_pos=cpos)
 
-    def _get(self, bucket_len: int) -> _Captured:
-        cap = self._caches.get(bucket_len)
-        if cap is None:
-            cap = self._build(bucket_len)
-            self._caches[bucket_len] = cap
-        return cap
+    def _get_cache(self) -> _Captured:
+        if self._cache is None:
+            self._cache = self._build()
+        return self._cache
 
     def _populate(self, cache, past_kv, L: int) -> None:
         """Copy the prefill KV (length L) into the static cache via its update
@@ -253,25 +265,25 @@ class CUDAGraphDecoder:
             return []
         try:
             L = start_pos
-            bucket_len = self._round_up(L + max_new_tokens)
-            if L + 1 > bucket_len:
-                return None  # prompt longer than we can bucket — eager handles it
-            cap = self._get(bucket_len)
+            # Single fixed cache size; over-cap prompts use the eager loop.
+            if L + max_new_tokens > self._cap:
+                return None
+            cc = self._get_cache()
 
             # One-time multi-step self-check (compiled path only), BEFORE any
             # token is emitted, so a failure cleanly falls back to eager.
             if self._use_compiled and not self._self_checked:
                 self._self_checked = True
-                if not self._self_check(cap, past_kv, L, seed_token, as_cache):
+                if not self._self_check(cc, past_kv, L, seed_token, as_cache):
                     self._disabled = True
                     return None
 
-            self._populate(cap.cache, past_kv, L)
+            self._populate(cc.cache, past_kv, L)
             out: List[int] = []
             cur = L
             tok = seed_token
             for _ in range(max_new_tokens):
-                logits = self._step_logits(cap, tok, cur)
+                logits = self._step_logits(cc, tok, cur)
                 nxt = sample_fn(logits)
                 out.append(nxt)
                 if on_token is not None:
