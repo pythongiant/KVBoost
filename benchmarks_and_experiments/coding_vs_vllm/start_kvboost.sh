@@ -65,6 +65,7 @@ echo
 exec python -m kvboost.server \
     --model "$MODEL" \
     --dtype float16 \
+    --cuda-graph-decode
     --attn-impl auto \
     --recompute-strategy cacheblend_sparse \
     --kv-cache-bits 8 \
@@ -74,6 +75,7 @@ exec python -m kvboost.server \
     "${SPEC_ARGS[@]}" \
     --host 0.0.0.0 \
     --port "$PORT"
+    
 
 # ── Optional add-ons (set env / uncomment to enable) ─────────────────────────
 # SPECULATIVE DECODING (NOT fair vs a no-spec vLLM — opt-in only): SPEC=1
