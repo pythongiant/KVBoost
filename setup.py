@@ -21,7 +21,12 @@ try:
     import torch
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-    if torch.cuda.is_available() or os.environ.get("FORCE_CUDA", "0") == "1":
+    skip_ext = os.environ.get("KVBOOST_SKIP_CUDA_EXT", "0") == "1"
+    want_cuda = torch.cuda.is_available() or os.environ.get("FORCE_CUDA", "0") == "1"
+
+    if skip_ext:
+        print("[kvboost] KVBOOST_SKIP_CUDA_EXT=1 — skipping CUDA extension build.", file=sys.stderr)
+    elif want_cuda:
         ext_modules = [
             CUDAExtension(
                 name="kvboost._flash_attn_cuda",
