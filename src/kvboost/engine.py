@@ -1508,7 +1508,13 @@ class InferenceEngine:
             logits = logits / temperature
         if do_sample:
             probs = torch.softmax(logits, dim=-1)
-            return torch.multinomial(probs, 1).item()
+            # Sample on CPU. CUDA-graph capture leaves the CUDA RNG generator in
+            # a "capturable" state, after which an eager torch.multinomial on
+            # GPU raises "Offset increment outside graph capture". Sampling the
+            # (1, vocab) probs on CPU sidesteps CUDA RNG entirely — a ~µs D2H
+            # copy per token, negligible next to the decode step, and harmless
+            # when graphs are off (we already sync via .item()).
+            return torch.multinomial(probs.float().cpu(), 1).item()
         return logits.argmax(dim=-1).item()
 
     def cache_stats(self) -> Dict:
