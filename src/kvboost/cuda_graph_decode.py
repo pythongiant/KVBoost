@@ -6,9 +6,9 @@ on math or memory. vLLM closes that gap with CUDA graphs over a *static* KV
 cache. This module does the same for kvboost:
 
   1. After kvboost's (reuse-based) prefill produces the prompt KV, copy it into
-     a HuggingFace ``StaticCache`` (pre-allocated, fixed-address buffers) via the
-     cache's own ``update`` API — so reuse/TTFT is preserved, decode just runs
-     on a graph-capturable, static-shape cache.
+     a HuggingFace ``StaticCache`` (pre-allocated, fixed-address buffers) via
+     direct tensor writes — so reuse/TTFT is preserved, decode just runs on a
+     graph-capturable, static-shape cache.
   2. Capture the single-token decode forward into CUDA graphs via
      ``torch.compile(mode="reduce-overhead")``, replayed per token; sampling is
      eager and outside the graph.
@@ -50,16 +50,21 @@ import torch
 log = logging.getLogger("kvboost.cuda_graph_decode")
 
 
-def _iter_kv(past_kv):
-    """Yield (key, value) per layer for DynamicCache (5.x ``layers`` or older
-    ``key_cache``) or a tuple-of-tuples legacy cache."""
+def _iter_kv(past_kv) -> List[tuple]:
+    """Return ``[(key_tensor, value_tensor), ...]`` for any supported cache
+    format. Never returns the StaticCache — only called on the *input* KV
+    (DynamicCache or tuple-of-tuples) that we copy *into* the StaticCache."""
     if past_kv is None:
         return []
-    if hasattr(past_kv, "layers"):                 # transformers 5.x DynamicCache
-        return [(l.keys, l.values) for l in past_kv.layers]
-    if hasattr(past_kv, "key_cache"):              # older DynamicCache
+    # transformers 5.x: both DynamicCache and StaticCache have `.layers`.
+    # DynamicLayer / StaticLayer both expose `.keys` / `.values`.
+    if hasattr(past_kv, "layers"):
+        return [(layer.keys, layer.values) for layer in past_kv.layers]
+    # Older DynamicCache (4.x): flat key_cache / value_cache lists.
+    if hasattr(past_kv, "key_cache"):
         return list(zip(past_kv.key_cache, past_kv.value_cache))
-    return [(k, v) for (k, v) in past_kv]          # tuple-of-tuples
+    # Legacy tuple-of-tuples: ((k0, v0), (k1, v1), ...)
+    return list(past_kv)
 
 
 @dataclass
@@ -119,9 +124,11 @@ class CUDAGraphDecoder:
     # ------------------------------------------------------------------
     def _dims(self):
         c = self._config
-        n_heads = int(getattr(c, "num_attention_heads"))
+        n_heads = int(getattr(c, "num_attention_heads", 0) or 1)
         n_kv = int(getattr(c, "num_key_value_heads", n_heads))
-        head_dim = int(getattr(c, "head_dim", 0) or (c.hidden_size // n_heads))
+        head_dim = int(getattr(c, "head_dim", 0) or (
+            c.hidden_size // n_heads if hasattr(c, "hidden_size") else 64
+        ))
         return n_kv, head_dim
 
     def _compiled(self):
@@ -170,9 +177,9 @@ class CUDAGraphDecoder:
                 for b in (inp, pos, cpos):
                     _dyn.mark_static_address(b)
                 for lyr in getattr(cache, "layers", []):
-                    if hasattr(lyr, "keys"):
+                    if hasattr(lyr, "keys") and lyr.is_initialized:
                         _dyn.mark_static_address(lyr.keys)
-                    if hasattr(lyr, "values"):
+                    if hasattr(lyr, "values") and lyr.is_initialized:
                         _dyn.mark_static_address(lyr.values)
             except Exception:
                 pass
@@ -184,15 +191,24 @@ class CUDAGraphDecoder:
         return self._cache
 
     def _populate(self, cache, past_kv, L: int) -> None:
-        """Copy the prefill KV (length L) into the static cache via its update
-        API, which also sets the length counter to L."""
+        """Copy the prefill KV (first L positions) into the static cache.
+
+        Resets the cache first (zeroes tensors + cumulative_length counters),
+        then writes each layer's KV directly into the static buffers.
+        StaticLayer.update auto-increments cumulative_length by the number of
+        positions written — so after this call cumulative_length == L for every
+        layer, which is what the decode loop's position tracking assumes.
+        """
         cache.reset()
-        cpos = torch.arange(L, device=self.device)
         for i, (k, v) in enumerate(_iter_kv(past_kv)):
             k = k[:, :, :L, :].to(self.device, self.dtype)
             v = v[:, :, :L, :].to(self.device, self.dtype)
-            cache.update(k, v, i, cache_kwargs={"cache_position": cpos})
+            # StaticLayer.update ignores any kwargs; it tracks position via its
+            # internal cumulative_length tensor. After reset() it starts at 0
+            # and advances by the number of positions we write (= L here).
+            cache.update(k, v, i)
 
+    @torch.no_grad()
     def _forward(self, cap: _Captured):
         fn = self._compiled() if self._use_compiled else None
         target = fn if fn is not None else self.model
@@ -204,34 +220,60 @@ class CUDAGraphDecoder:
             use_cache=True,
         )
 
+    @torch.no_grad()
     def _step_logits(self, cap: _Captured, tok: int, cur: int) -> torch.Tensor:
+        """Run one decode step: feed token ``tok`` at position ``cur``,
+        return logits ``(1, vocab)`` for the next position.
+
+        Sets the three static input buffers in-place (avoids a new tensor
+        allocation per step — required for CUDA-graph stable addresses).
+        """
         cap.input_ids[0, 0] = tok
         cap.pos_ids[0, 0] = cur
         cap.cache_pos[0] = cur
         out = self._forward(cap)
         return out.logits[:, -1, :]
 
+    @torch.no_grad()
     def _self_check(self, cap: _Captured, past_kv, L: int, seed: int,
-                    as_cache, k: int = 4) -> bool:
+                    k: int = 4) -> bool:
         """Compare the first ``k`` GREEDY tokens from the compiled-graph path
         against an eager reference (original model, fresh DynamicCache). Catches
         capture/compile bugs (incl. a frozen mask) before any token is emitted.
-        Mutates cap.cache (caller re-populates before the real loop)."""
+
+        IMPORTANT: builds a *copy* of past_kv for the reference decode so the
+        original is not mutated in-place (DynamicCache is extended by the model
+        on every step; sharing it would corrupt the caller's view of the prefill
+        KV and shift the layer sequence lengths seen by subsequent _populate
+        calls).
+        """
+        from transformers import DynamicCache
+
+        # ── Reference: eager model + fresh DynamicCache copy ─────────────
         ref: List[int] = []
-        with torch.no_grad():
-            dyn = as_cache(past_kv)
-            tok, cur = seed, L
-            for _ in range(k):
-                o = self.model(
-                    input_ids=torch.tensor([[tok]], device=self.device),
-                    position_ids=torch.tensor([[cur]], device=self.device),
-                    past_key_values=dyn, use_cache=True,
-                )
-                tok = int(o.logits[:, -1, :].argmax(-1).item())
-                ref.append(tok)
-                cur += 1
-                if tok == self.eos:
-                    break
+        ref_kv = DynamicCache()
+        for i, (lk, lv) in enumerate(_iter_kv(past_kv)):
+            ref_kv.update(
+                lk[:, :, :L, :].clone().to(self.device),
+                lv[:, :, :L, :].clone().to(self.device),
+                i,
+            )
+
+        tok, cur = seed, L
+        for _ in range(k):
+            o = self.model(
+                input_ids=torch.tensor([[tok]], device=self.device),
+                position_ids=torch.tensor([[cur]], device=self.device),
+                past_key_values=ref_kv,
+                use_cache=True,
+            )
+            tok = int(o.logits[:, -1, :].argmax(-1).item())
+            ref.append(tok)
+            cur += 1
+            if tok == self.eos:
+                break
+
+        # ── Compiled / eager-static path ─────────────────────────────────
         self._populate(cap.cache, past_kv, L)
         got: List[int] = []
         tok, cur = seed, L
@@ -242,6 +284,7 @@ class CUDAGraphDecoder:
             cur += 1
             if tok == self.eos:
                 break
+
         ok = got == ref
         if ok:
             log.info("CUDA-graph decode self-check passed (%d greedy tokens "
@@ -251,6 +294,7 @@ class CUDAGraphDecoder:
                       "%s) — DISABLING, eager fallback.", got, ref)
         return ok
 
+    @torch.no_grad()
     def _measure_speedup(self, cc: _Captured, past_kv, L: int, seed: int,
                          steps: int = 12) -> None:
         """Time the compiled step vs an eager step on the SAME static cache and
@@ -267,25 +311,35 @@ class CUDAGraphDecoder:
             if compiled is None:
                 return
 
+            kw = dict(input_ids=cc.input_ids, position_ids=cc.pos_ids,
+                      cache_position=cc.cache_pos, past_key_values=cc.cache,
+                      use_cache=True)
+
             def _run(fn) -> float:
+                # Reset cache to a clean state for every timing run so that
+                # cumulative_length starts at L (not L + previous-step-count).
+                # Without this, each fn() writes at an ever-increasing position
+                # and the warmup / timed runs operate on different cache states.
                 self._populate(cc.cache, past_kv, L)
                 cc.input_ids[0, 0] = seed
                 cc.pos_ids[0, 0] = L
                 cc.cache_pos[0] = L
                 for _ in range(3):           # warm
-                    fn()
+                    fn(**kw)
+                    # Reset between warmup steps so each writes at position L
+                    self._populate(cc.cache, past_kv, L)
+                    cc.cache_pos[0] = L
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 for _ in range(steps):
-                    fn()
+                    fn(**kw)
+                    self._populate(cc.cache, past_kv, L)
+                    cc.cache_pos[0] = L
                 torch.cuda.synchronize()
                 return (time.perf_counter() - t0) / steps * 1000.0
 
-            kw = dict(input_ids=cc.input_ids, position_ids=cc.pos_ids,
-                      cache_position=cc.cache_pos, past_key_values=cc.cache,
-                      use_cache=True)
-            ms_compiled = _run(lambda: compiled(**kw))
-            ms_eager = _run(lambda: self.model(**kw))
+            ms_compiled = _run(compiled)
+            ms_eager = _run(self.model)
             ratio = ms_eager / max(ms_compiled, 1e-6)
             if ratio >= 1.15:
                 log.info("CUDA-graph decode speedup: %.1f→%.1f ms/step "
@@ -325,7 +379,7 @@ class CUDAGraphDecoder:
             # token is emitted, so a failure cleanly falls back to eager.
             if self._use_compiled and not self._self_checked:
                 self._self_checked = True
-                if not self._self_check(cc, past_kv, L, seed_token, as_cache):
+                if not self._self_check(cc, past_kv, L, seed_token):
                     self._disabled = True
                     return None
                 # Self-check only proves CORRECTNESS. Also measure SPEED so a
