@@ -33,7 +33,7 @@ set -euo pipefail
 
 # int4 (Marlin) by default — the single biggest decode lever on Ampere (~4× less
 # weight bandwidth). Override MODEL=Qwen/Qwen2.5-3B-Instruct for plain fp16.
-MODEL="${MODEL:-Qwen/Qwen2.5-3B-Instruct}"
+MODEL="${MODEL:-Qwen/Qwen2.5-3B-Instruct-AWQ}"
 PORT="${PORT:-9000}"
 # KV-cache budget for cross-request chunk reuse. The int4 model is only ~2 GB
 # (vs ~6 GB fp16) so on a 12 GB 3060 there's far more room for cache → bigger
