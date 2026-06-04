@@ -203,6 +203,51 @@ if [[ "${MODE}" == "cpu" ]]; then
     log "Installing CPU-only torch"
     python -m pip install --upgrade --index-url https://download.pytorch.org/whl/cpu "${TORCH_SPEC:-torch}"
 else
+    # Auto-pick a flash-attn-compatible torch. Installing the NEWEST torch
+    # usually means NO flash-attn wheel exists for it yet → slow source build /
+    # failure (exactly the torch-2.9-vs-flash-attn problem). Instead, query
+    # flash-attn's published wheels and pin torch to the newest MINOR that ships
+    # a prebuilt wheel for THIS box (CUDA major / python tag / arch). Skipped if
+    # the user pinned TORCH_SPEC or passed --skip-flash-attn.
+    if [[ -z "${TORCH_SPEC:-}" && "${SKIP_FLASH_ATTN}" == "0" ]]; then
+        log "Resolving newest torch with a prebuilt flash-attn wheel for this box..."
+        FA_TORCH_MINOR="$(CU_MAJOR="${NVCC_MM%%.*}" python - <<'PY' 2>/dev/null || true
+import json, os, re, sys, platform, urllib.request
+cu_major = os.environ.get("CU_MAJOR") or "12"          # default to CUDA 12 (no nvcc)
+py   = f"cp{sys.version_info.major}{sys.version_info.minor}"
+mach = platform.machine()
+# Matches FA2 wheels like flash_attn-2.7.4.post1+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+# (deliberately NOT the FA4 flash_attn_4-...-py3-none-any.whl, which is Hopper/Blackwell).
+pat = re.compile(
+    r"flash_attn-[0-9][0-9.post]*\+cu(\d+)torch(\d+\.\d+)(?:\.\d+)?"
+    r"cxx11abi(?:TRUE|FALSE)-(cp\d+)-\w+-linux_(\w+)\.whl$")
+minors = set()
+for page in (1, 2, 3):
+    u = ("https://api.github.com/repos/Dao-AILab/flash-attention/"
+         f"releases?per_page=100&page={page}")
+    req = urllib.request.Request(u, headers={"User-Agent": "kvboost-installer"})
+    try:
+        rels = json.load(urllib.request.urlopen(req, timeout=30))
+    except Exception:
+        break
+    if not rels:
+        break
+    for rel in rels:
+        for a in rel.get("assets", []):
+            m = pat.match(a.get("name", ""))
+            if m and m.group(1).startswith(cu_major) and m.group(3) == py and m.group(4) == mach:
+                minors.add(m.group(2))
+if minors:
+    print(max(minors, key=lambda s: tuple(int(x) for x in s.split("."))))
+PY
+)"
+        if [[ -n "${FA_TORCH_MINOR}" ]]; then
+            TORCH_SPEC="torch==${FA_TORCH_MINOR}.*"
+            log "Pinning ${TORCH_SPEC} (newest torch with a prebuilt flash-attn wheel for this box)."
+        else
+            warn "No prebuilt flash-attn wheel found for any torch on this box; installing newest torch (flash-attn may source-build or be skipped)."
+        fi
+    fi
     installed=0
     for tag in $(torch_cuda_candidates); do
         log "Trying CUDA torch wheel: ${tag} (${TORCH_SPEC:-torch})"
@@ -258,11 +303,14 @@ if (( CAN_BUILD_EXT == 1 )); then
     export TORCH_CUDA_ARCH_LIST="${ARCH}"
     log "Build env: CUDA_HOME=${CUDA_HOME} TORCH_CUDA_ARCH_LIST=${ARCH} MAX_JOBS=${MAX_JOBS}"
 
-    # Bundled kvboost._flash_attn_cuda kernel (custom, Ampere+). Best-effort:
-    # the repo monkey-patches SDPA if it's absent.
-    run_best_effort "bundled CUDA kernel (kvboost._flash_attn_cuda)" \
-        env FORCE_CUDA=1 \
-        python -m pip install -e . --no-deps --force-reinstall --no-build-isolation || true
+    # NOTE: the bundled kvboost._flash_attn_cuda kernel is intentionally NOT
+    # built. It's dead on transformers >=5 (the runtime uses torch SDPA, which
+    # already dispatches a FlashAttention-2-class kernel on Ampere+), and its
+    # head_dim=128 path needs 64 KB of STATIC shared memory — uncompilable on
+    # sm_86 (48 KB cap), so it only ever produced a 200-line ptxas error here.
+    # flash-attn (installed below) is the real, working prefill backend.
+    # (CUDA_HOME / TORCH_CUDA_ARCH_LIST above are still exported for the
+    # flash-attn source-build fallback.)
 fi
 
 if [[ "${MODE}" == "cuda" ]]; then
