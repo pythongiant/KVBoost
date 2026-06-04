@@ -33,7 +33,7 @@ set -euo pipefail
 
 # int4 (Marlin) by default — the single biggest decode lever on Ampere (~4× less
 # weight bandwidth). Override MODEL=Qwen/Qwen2.5-3B-Instruct for plain fp16.
-MODEL="${MODEL:-Qwen/Qwen2.5-3B-Instruct-AWQ}"
+MODEL="${MODEL:-Qwen/Qwen2.5-3B-Instruct}"
 PORT="${PORT:-9000}"
 # KV-cache budget for cross-request chunk reuse. The int4 model is only ~2 GB
 # (vs ~6 GB fp16) so on a 12 GB 3060 there's far more room for cache → bigger
@@ -45,13 +45,16 @@ RECOMPUTE="${RECOMPUTE:-none}"
 STREAMING_MODE="${STREAMING_MODE:-full_resident}"   # all weights on GPU, no DMA
 QUANT_KERNEL="${QUANT_KERNEL:-auto}"                 # auto = probe Marlin first
 
-# Tree speculative decoding is ON by default here (it's a speed setup). Needs
-# the ~1 GB fp16 draft model + VRAM. Disable with SPEC=0 for a no-spec run.
+# Tree speculative decoding is ON by default here (it's a speed setup). The
+# draft MUST be an AWQ checkpoint: kvboost's DraftModel always loads it through
+# StreamingCausalLM (which bypasses transformers' AWQ quantizer), so a plain
+# fp16 draft fails with "No AWQ quantization config found". Qwen2.5-1.5B-AWQ
+# (~1 GB) is the draft the repo's other benchmarks use. Disable with SPEC=0.
 SPEC_ARGS=()
 if [[ "${SPEC:-1}" == "1" ]]; then
-    SPEC_ARGS=(--speculative-draft-model "${DRAFT:-Qwen/Qwen2.5-0.5B-Instruct}" \
+    SPEC_ARGS=(--speculative-draft-model "${DRAFT:-Qwen/Qwen2.5-1.5B-Instruct-AWQ}" \
                --speculative-tree)
-    SPEC_DESC="tree (draft ${DRAFT:-Qwen/Qwen2.5-0.5B-Instruct})"
+    SPEC_DESC="tree (draft ${DRAFT:-Qwen/Qwen2.5-1.5B-Instruct-AWQ})"
 else
     SPEC_DESC="off (SPEC=0)"
 fi
