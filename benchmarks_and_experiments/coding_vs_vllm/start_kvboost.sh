@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
 # Launch kvboost in its FASTEST setup on the RTX 3060 — speed over fairness.
-# This stacks every working throughput/latency lever for the coding benchmark:
-#   * Marlin int4 weight quant  (AWQ model)      — biggest decode-bandwidth lever
-#   * Tree speculative decoding (draft model)    — multi-token/step decode lever
-#   * INT8 SageAttention prefill (Triton 'sage') — faster TTFT, self-checks → SDPA
-#   * recompute=none                             — zero-cost shared-prefix reuse
-#   * int8 KV storage + OOM planner              — more reuse capacity, no crashes
+# Stacks every working throughput/latency lever for the coding benchmark:
+#   * Marlin int4 weight quant (AWQ model)    — biggest decode-bandwidth lever (~4×)
+#   * Tree speculative decoding (draft model) — multi-token/step decode lever
+#   * recompute=none                          — zero-cost shared-prefix reuse (TTFT)
+#   * int8 KV storage + OOM planner           — more reuse capacity, no crashes
 #
-# NOTE this is NOT a fair vs-vLLM config (int4 + spec). For an apples-to-apples
-# run, point vLLM at the SAME AWQ checkpoint (it also uses Marlin) — see below.
+# AWQ LOADING (important on this box): the plain *resident* AWQ load goes through
+# transformers' AWQ quantizer, which pulls in a `gptqmodel` that's mismatched
+# with the installed transformers ("module 'transformers.utils.hub' has no
+# attribute 'create_repo'") and crashes on import. kvboost's OWN AWQ loader
+# sidesteps it: `--awq-streaming --streaming-mode full_resident` keeps all int4
+# weights ON the GPU (no DMA) and uses the Marlin int4 GEMM, never touching
+# transformers' AWQ path. So for an AWQ/GPTQ MODEL this script auto-uses that
+# loader. Tradeoff: the streaming path owns attention, so --attn-impl (incl. our
+# Triton 'sage' kernel) is IGNORED there → SDPA prefill. int4 ≫ sage, so this is
+# still the fastest config that actually launches. An fp16 MODEL uses the
+# resident path + sage instead. (To regain sage WITH int4, repair the env — see
+# the foot of this file — and force RESIDENT=1.)
 #
 # Run this, then in another shell:
 #   python bench_coding.py --backend kvboost --url http://localhost:9000 \
@@ -17,7 +26,8 @@
 #
 # Override via env:
 #   MODEL=... PORT=... MAX_CACHE_BYTES=... SPEC=0 (disable spec) DRAFT=...
-#   ATTN=flashinfer (decode-attn instead of sage) RECOMPUTE=cacheblend_sparse
+#   ATTN=flashinfer  RECOMPUTE=cacheblend_sparse  STREAMING_MODE=...  QUANT_KERNEL=marlin
+#   RESIDENT=1 (force the transformers resident load even for an AWQ model)
 
 set -euo pipefail
 
@@ -32,6 +42,8 @@ MAX_CACHE_BYTES="${MAX_CACHE_BYTES:-5e9}"
 SAFETY_MARGIN="${SAFETY_MARGIN:-0.15}"
 ATTN="${ATTN:-sage}"
 RECOMPUTE="${RECOMPUTE:-none}"
+STREAMING_MODE="${STREAMING_MODE:-full_resident}"   # all weights on GPU, no DMA
+QUANT_KERNEL="${QUANT_KERNEL:-auto}"                 # auto = probe Marlin first
 
 # Tree speculative decoding is ON by default here (it's a speed setup). Needs
 # the ~1 GB fp16 draft model + VRAM. Disable with SPEC=0 for a no-spec run.
@@ -44,10 +56,30 @@ else
     SPEC_DESC="off (SPEC=0)"
 fi
 
+# Choose the load path. AWQ/GPTQ → kvboost's streaming loader (bypasses the
+# broken transformers AWQ quantizer); fp16 → resident path + sage.
+case "$MODEL" in
+    *AWQ*|*awq*|*GPTQ*|*gptq*|*Int4*|*int4*|*INT4*)
+        if [[ "${RESIDENT:-0}" == "1" ]]; then
+            LOAD_ARGS=(--attn-impl "$ATTN")
+            ATTN_DESC="$ATTN (resident AWQ — needs a repaired gptqmodel/transformers env)"
+        else
+            LOAD_ARGS=(--awq-streaming --streaming-mode "$STREAMING_MODE" \
+                       --streaming-quant-kernel "$QUANT_KERNEL")
+            ATTN_DESC="SDPA (AWQ streaming owns attention; --attn-impl ignored)"
+        fi
+        ;;
+    *)
+        LOAD_ARGS=(--attn-impl "$ATTN")
+        ATTN_DESC="$ATTN (INT8 SageAttention prefill; self-check → SDPA)"
+        ;;
+esac
+
 echo "kvboost (FASTEST setup — RTX 3060, speed over fairness)"
 echo "  model:            $MODEL  (int4 Marlin GEMM if AWQ/GPTQ)"
 echo "  port:             $PORT"
-echo "  attention:        $ATTN  (INT8 SageAttention prefill; self-check → SDPA)"
+echo "  load path:        ${LOAD_ARGS[*]}"
+echo "  attention:        $ATTN_DESC"
 echo "  recompute:        $RECOMPUTE  (zero-cost shared-prefix reuse = fastest TTFT)"
 echo "  kv-cache-bits:    8                  (int8 KV → 2× reuse capacity)"
 echo "  max-cache-bytes:  $MAX_CACHE_BYTES"
@@ -57,24 +89,17 @@ echo
 
 # Why each flag (impact order on a 3060):
 #   MODEL=...-AWQ  (the #1 raw lever)
-#       int4 weight quant → transformers loads the AWQ/Marlin int4 GEMM CUDA
-#       kernels on Ampere automatically (~4× less weight bandwidth → up to ~4×
-#       the decode ceiling). The 3 GB→~2 GB model also frees VRAM for KV cache.
+#       int4 weight quant → Marlin int4 GEMM on Ampere (~4× less weight bandwidth
+#       → up to ~4× the decode ceiling). Loaded here via --awq-streaming
+#       --streaming-mode full_resident (kvboost's own AWQ→Marlin loader, all
+#       weights resident on GPU) to dodge the broken transformers AWQ quantizer.
 #   --speculative-tree (+ draft)  (the #2 decode lever)
 #       SpecBlock-inspired tree speculative decoding — verifies several drafted
 #       tokens per target step; auto mode-select per request. Decode throughput.
-#   --attn-impl sage  (prefill lever; pairs with spec)
-#       INT8 SageAttention prefill via Triton (INT8 tensor-core QK^T on sm_86;
-#       no nvcc/flash-attn build). Decode (q_len==1) delegates to SDPA. One-time
-#       numerical self-check vs SDPA → permanent SDPA fallback on mismatch, so
-#       worst case is the SDPA baseline, never wrong. Watch the log for
-#       "sage self-check passed". Set ATTN=flashinfer instead to accelerate
-#       single-token DECODE attention (better when SPEC=0 + long context).
 #   --recompute-strategy none  (fastest TTFT on shared prefix)
 #       Reuses prefix KV at ~zero cost (like vLLM prefix caching) — lossless on
-#       this coding benchmark's shared prefix. Set RECOMPUTE=cacheblend_sparse
-#       for the OUT-OF-ORDER multiturn/RAG workload (faithful selective recompute
-#       where moved chunks would otherwise go stale).
+#       this benchmark's shared prefix. Set RECOMPUTE=cacheblend_sparse for the
+#       OUT-OF-ORDER multiturn/RAG workload (faithful selective recompute).
 #   --kv-cache-bits 8
 #       int8 KV STORAGE → ~2× cached-chunk capacity. (Dequants to fp16 for
 #       compute — adds reuse capacity, not decode bandwidth; that's weight quant.)
@@ -83,7 +108,7 @@ echo
 exec python -m kvboost.server \
     --model "$MODEL" \
     --dtype float16 \
-    --attn-impl "$ATTN" \
+    "${LOAD_ARGS[@]}" \
     --recompute-strategy "$RECOMPUTE" \
     --chunk-boundary-window 32 \
     --kv-cache-bits 8 \
@@ -96,31 +121,36 @@ exec python -m kvboost.server \
 
 
 # ── Optional add-ons / alternatives ──────────────────────────────────────────
-# FAIR int4-vs-int4 comparison: run vLLM on the SAME AWQ checkpoint (it also
-# uses Marlin) so the only difference is the engine, not the weights:
+# FASTEST-that-launches (default): AWQ int4 via kvboost's streaming loader. If
+# the streaming AWQ load itself errors (rare on a pure-transformer fp16 AWQ like
+# Qwen2.5), fall back to fp16 — you keep spec + sage, lose only int4:
+#     MODEL=Qwen/Qwen2.5-3B-Instruct ./start_kvboost.sh
+#
+# REGAIN sage WITH int4 (resident AWQ): repair the env so transformers' AWQ path
+# works, then force the resident load:
+#     pip install -U "gptqmodel" "transformers"        # realign the two, OR
+#     pip uninstall -y gptqmodel && pip install autoawq # AWQ via autoawq, not gptqmodel
+#     RESIDENT=1 ./start_kvboost.sh
+#   (Confirm in the logs you see "sage self-check passed".)
+#
+# FAIR int4-vs-int4 comparison: run vLLM on the SAME AWQ checkpoint (Marlin too):
 #     MODEL=Qwen/Qwen2.5-3B-Instruct-AWQ ./start_vllm.sh
 #
-# DISABLE the aggressive levers (toward the old fair-vs-vLLM baseline):
-#     MODEL=Qwen/Qwen2.5-3B-Instruct SPEC=0 ATTN=auto RECOMPUTE=cacheblend_sparse ./start_kvboost.sh
-#
-# FLASHINFER decode-attention (use instead of sage when SPEC=0): ATTN=flashinfer.
-# Routes only the single-token DECODE step through FlashInfer's CUDA kernel
-# (SDPA prefill + fallback, one-time self-check). Helps most at long context
-# where KV reads dominate. Needs `pip install flashinfer-python`.
+# FLASHINFER decode-attention (fp16 model, use with SPEC=0): ATTN=flashinfer.
+# Routes only single-token DECODE through FlashInfer's CUDA kernel (SDPA prefill
+# + fallback, one-time self-check). Helps most at long context.
 #
 # CUDA-GRAPH DECODE (--cuda-graph-decode): LEFT OFF here on purpose — it caused
-# recompile thrash on this box and was removed from this setup (commit
-# "Remove cuda graph decode"). It targets the per-token launch overhead (~36 of
-# ~56 ms/token) and stacks with int4, so if you've since fixed the re-capture
-# thrash it's a big decode-latency win — add it back and validate output vs a
-# run without it:
+# recompile thrash on this box and was removed from this setup (commit "Remove
+# cuda graph decode"). It targets per-token launch overhead (~36 of ~56 ms/token)
+# and stacks with int4, so if you've fixed the re-capture thrash, add it back and
+# validate output vs a run without it:
 #     ... --cuda-graph-decode
 #
 # MULTI-TURN CacheBlend run (where CacheBlend beats vLLM prefix caching): the
 # --mode multiturn workload reshuffles in-context files each turn (same files,
-# OUT OF ORDER) — prefix caching misses, CacheBlend reuses. Use the faithful
-# recompute path + content-aligned chunking (already on via --chunk-boundary-
-# window 32 so a moved file still chunks identically):
+# OUT OF ORDER). Use the faithful recompute path (content-aligned chunking is
+# already on via --chunk-boundary-window 32):
 #     RECOMPUTE=cacheblend_sparse ./start_kvboost.sh
 #   then: python bench_coding.py --backend kvboost --url http://localhost:9000 \
 #             --model "$MODEL" --mode multiturn --out kvboost_mt.json
