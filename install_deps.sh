@@ -157,6 +157,7 @@ log "python: $(python3 --version) (${PY_VER})"
 MODE="cpu"
 HAVE_NVCC=0
 NVCC_MM=""
+DRIVER_CUDA=""
 GPU_NAME=""
 
 if (( FORCE_CPU == 1 )); then
@@ -165,6 +166,13 @@ elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; the
     MODE="cuda"
     GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')"
     log "GPU detected: ${GPU_NAME:-unknown}"
+    # The DRIVER's max CUDA version (nvidia-smi header) is what gates which torch
+    # CUDA build can actually initialize. A torch built for a NEWER CUDA than the
+    # driver supports fails with "CUDA driver initialization failed" →
+    # torch.cuda.is_available()==False (the whole GPU is dead, not just flash-attn).
+    # This is the binding constraint, NOT nvcc (the toolkit, used only to compile).
+    DRIVER_CUDA="$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
+    [[ -n "${DRIVER_CUDA}" ]] && log "driver supports CUDA ${DRIVER_CUDA} → torch build will target ≤ this"
     if command -v nvcc >/dev/null 2>&1; then
         HAVE_NVCC=1
         NVCC_MM="$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
@@ -187,7 +195,11 @@ python -m pip install -U pip setuptools wheel >/dev/null
 # --- torch ------------------------------------------------------------------
 torch_cuda_candidates() {
     [[ -n "${TORCH_CUDA_TAG:-}" ]] && { echo "${TORCH_CUDA_TAG}"; return; }
-    case "${NVCC_MM:-}" in
+    # Choose the torch CUDA tag from the DRIVER's CUDA (what can run), falling
+    # back to nvcc only if the driver version is unknown. Tags are listed newest
+    # -first but never ABOVE the driver's CUDA — installing a higher one yields
+    # torch.cuda.is_available()==False on this driver.
+    case "${DRIVER_CUDA:-${NVCC_MM:-}}" in
         13.*)              echo "cu130 cu128 cu126" ;;
         12.8|12.9)         echo "cu128 cu126 cu124" ;;
         12.6|12.7)         echo "cu126 cu124 cu121" ;;
@@ -203,51 +215,13 @@ if [[ "${MODE}" == "cpu" ]]; then
     log "Installing CPU-only torch"
     python -m pip install --upgrade --index-url https://download.pytorch.org/whl/cpu "${TORCH_SPEC:-torch}"
 else
-    # Auto-pick a flash-attn-compatible torch. Installing the NEWEST torch
-    # usually means NO flash-attn wheel exists for it yet → slow source build /
-    # failure (exactly the torch-2.9-vs-flash-attn problem). Instead, query
-    # flash-attn's published wheels and pin torch to the newest MINOR that ships
-    # a prebuilt wheel for THIS box (CUDA major / python tag / arch). Skipped if
-    # the user pinned TORCH_SPEC or passed --skip-flash-attn.
-    if [[ -z "${TORCH_SPEC:-}" && "${SKIP_FLASH_ATTN}" == "0" ]]; then
-        log "Resolving newest torch with a prebuilt flash-attn wheel for this box..."
-        FA_TORCH_MINOR="$(CU_MAJOR="${NVCC_MM%%.*}" python - <<'PY' 2>/dev/null || true
-import json, os, re, sys, platform, urllib.request
-cu_major = os.environ.get("CU_MAJOR") or "12"          # default to CUDA 12 (no nvcc)
-py   = f"cp{sys.version_info.major}{sys.version_info.minor}"
-mach = platform.machine()
-# Matches FA2 wheels like flash_attn-2.7.4.post1+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
-# (deliberately NOT the FA4 flash_attn_4-...-py3-none-any.whl, which is Hopper/Blackwell).
-pat = re.compile(
-    r"flash_attn-[0-9][0-9.post]*\+cu(\d+)torch(\d+\.\d+)(?:\.\d+)?"
-    r"cxx11abi(?:TRUE|FALSE)-(cp\d+)-\w+-linux_(\w+)\.whl$")
-minors = set()
-for page in (1, 2, 3):
-    u = ("https://api.github.com/repos/Dao-AILab/flash-attention/"
-         f"releases?per_page=100&page={page}")
-    req = urllib.request.Request(u, headers={"User-Agent": "kvboost-installer"})
-    try:
-        rels = json.load(urllib.request.urlopen(req, timeout=30))
-    except Exception:
-        break
-    if not rels:
-        break
-    for rel in rels:
-        for a in rel.get("assets", []):
-            m = pat.match(a.get("name", ""))
-            if m and m.group(1).startswith(cu_major) and m.group(3) == py and m.group(4) == mach:
-                minors.add(m.group(2))
-if minors:
-    print(max(minors, key=lambda s: tuple(int(x) for x in s.split("."))))
-PY
-)"
-        if [[ -n "${FA_TORCH_MINOR}" ]]; then
-            TORCH_SPEC="torch==${FA_TORCH_MINOR}.*"
-            log "Pinning ${TORCH_SPEC} (newest torch with a prebuilt flash-attn wheel for this box)."
-        else
-            warn "No prebuilt flash-attn wheel found for any torch on this box; installing newest torch (flash-attn may source-build or be skipped)."
-        fi
-    fi
+    # The torch CUDA build is constrained by the driver (the cu-tag candidates
+    # above never exceed the driver's CUDA). We install the NEWEST torch on the
+    # first compatible index — on an older driver that naturally lands on an
+    # older torch (e.g. CUDA 12.4 driver → cu124 → torch ~2.6.x), which is
+    # exactly the range flash-attn ships prebuilt wheels for. So matching the
+    # driver fixes BOTH the dead-GPU (avail=False) and the no-flash-attn-wheel
+    # problems at once. Override the torch version with TORCH_SPEC if needed.
     installed=0
     for tag in $(torch_cuda_candidates); do
         log "Trying CUDA torch wheel: ${tag} (${TORCH_SPEC:-torch})"
