@@ -6,12 +6,16 @@
 #   * GPU, no nvcc                     -> CUDA torch + flash-attn (prebuilt wheel) + FlashInfer
 #   * GPU + nvcc (CUDA 12.x / 13.x)    -> full path incl. bundled kernel + flash-attn
 #
-# flash-attn is REQUIRED on any GPU box (it's the prefill backend you want): a
-# matching prebuilt wheel is installed when available (no nvcc needed), with a
-# source build as fallback. The install fails loudly if it can't be installed,
-# so you never silently end up on SDPA. The bundled kernel and FlashInfer stay
-# best-effort (the repo falls back to SDPA for those). Use --skip-flash-attn to
-# opt out. Every build is time-boxed and logged to install_deps.log.
+# The primary accelerated prefill path on a GPU box is now Triton: the 'sage'
+# (INT8 SageAttention) and 'triton_flash' (FP16 flash) backends JIT-compile
+# through the CUDA driver — no nvcc, no prebuilt-wheel matching, no multi-arch
+# source build. Triton ships with the CUDA torch wheel on Linux; we just verify
+# it imports. flash-attn is now OPTIONAL and best-effort (NEVER fatal): a
+# matching prebuilt wheel is installed when available, with a source build as
+# fallback, but if neither works the runtime simply uses SDPA / the Triton
+# kernels. The bundled CUDA kernel and FlashInfer are also best-effort. Use
+# --skip-flash-attn to opt out. Every build is time-boxed and logged to
+# install_deps.log.
 #
 # Usage
 # -----
@@ -288,19 +292,34 @@ if (( CAN_BUILD_EXT == 1 )); then
 fi
 
 if [[ "${MODE}" == "cuda" ]]; then
-    # FlashAttention-2 — REQUIRED (the prefill backend you want). Prebuilt wheel
-    # first (no nvcc needed), source build as fallback. Fatal if it can't go in.
+    # Triton — the PRIMARY accelerated kernel path (SageAttention INT8 prefill +
+    # FP16 'triton_flash'). JIT-compiles via the CUDA driver: no nvcc, no wheel
+    # matching, no multi-arch source build. Ships with the CUDA torch wheel on
+    # Linux; verify it imports and install best-effort if somehow missing.
+    if python -c 'import triton' 2>/dev/null; then
+        log "Triton present ($(python -c 'import triton; print(triton.__version__)')) — 'sage' / 'triton_flash' backends enabled."
+    else
+        warn "Triton not importable (unexpected with a CUDA torch wheel); installing best-effort."
+        python -m pip install -q triton \
+            || warn "triton install failed; 'sage'/'triton_flash' will fall back to SDPA."
+    fi
+
+    # FlashAttention-2 — OPTIONAL / best-effort now (Triton 'sage'/'triton_flash'
+    # is the recommended prefill path on Ampere). Prebuilt wheel first (no nvcc),
+    # source build as fallback. NEVER fatal: on failure the runtime uses the
+    # Triton kernels or SDPA.
     if (( SKIP_FLASH_ATTN == 1 )); then
-        warn "Skipping flash-attn at your request (--skip-flash-attn); prefill uses torch SDPA."
+        warn "Skipping flash-attn at your request (--skip-flash-attn); use --attn-impl sage / triton_flash, or SDPA."
     elif install_flash_attn; then
         log "FlashAttention-2 ready ($(python -c 'import flash_attn; print(flash_attn.__version__)'))"
     else
-        fail "flash-attn could not be installed (you asked for it explicitly).
-  See ${BUILD_LOG} for the exact build error. Most common cause: the torch
-  pulled from ${TORCH_CUDA_TAG:-the CUDA index} is newer than any published
-  flash-attn wheel. Fixes:
-    * pin torch to a release that has wheels:  TORCH_SPEC=torch==2.7.1 ./install_deps.sh
-    * or pin a flash-attn version:             FLASH_ATTN_SPEC=flash-attn==2.7.4.post1 ./install_deps.sh"
+        warn "flash-attn could not be installed (optional). See ${BUILD_LOG}.
+  This is fine — the recommended path no longer needs it: run the server with
+  --attn-impl sage (INT8 SageAttention prefill via Triton) or --attn-impl
+  triton_flash (FP16). To install flash-attn anyway, the usual fixes are:
+    * pin torch to a release with wheels:  TORCH_SPEC=torch==2.7.1 ./install_deps.sh
+    * or pin a flash-attn version:         FLASH_ATTN_SPEC=flash-attn==2.7.4.post1 ./install_deps.sh
+    * or limit the source build to Ampere: FLASH_ATTN_CUDA_ARCHS=80 ./install_deps.sh"
     fi
 
     # FlashInfer (decode attention) — JIT, best-effort, works without nvcc.
@@ -355,8 +374,16 @@ def have(mod):
 
 fa2  = have("flash_attn")
 fi   = have("flashinfer")
+tri  = have("triton")
 kern = have("kvboost._flash_attn_cuda")
+try:
+    from kvboost.kernels import sage_available
+    sage = sage_available()
+except Exception:
+    sage = False
 print(f"  info prefill backend  : {'flash_attention_2' if fa2 else 'torch SDPA (flash-attn not installed)'}")
+print(f"  info sage/triton flash: {'available (--attn-impl sage | triton_flash)' if sage else 'unavailable (triton missing → SDPA)'}")
+print(f"  info triton           : {'present' if tri else 'absent'}")
 print(f"  info decode  backend  : {'flashinfer' if fi else 'torch SDPA (flashinfer not installed)'}")
 print(f"  info bundled kernel   : {'kvboost._flash_attn_cuda' if kern else 'not built (SDPA patch path)'}")
 

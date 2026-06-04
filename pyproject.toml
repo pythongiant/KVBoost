@@ -40,6 +40,11 @@ dev = [
 ]
 cuda = [
     "ninja>=1.11",
+    # Triton backs the 'sage' (INT8 SageAttention) and 'triton_flash' kernels.
+    # JIT-compiled via the CUDA driver — no nvcc, no flash-attn-style wheel
+    # build. Ships with the CUDA torch wheel on Linux; pinned here so it's
+    # explicit. (Linux-only: Triton has no macOS/Windows wheels.)
+    "triton>=2.1 ; platform_system=='Linux'",
 ]
 streaming = [
     "safetensors>=0.4",

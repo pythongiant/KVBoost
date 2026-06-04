@@ -73,7 +73,8 @@ def parse_args():
     p.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"],
                    help="Model weight dtype (default: float16)")
     p.add_argument("--attn-impl", default="auto",
-                   choices=["auto", "flash_attention_2", "flashinfer", "sdpa", "eager"],
+                   choices=["auto", "flash_attention_2", "flashinfer",
+                            "sage", "triton_flash", "sdpa", "eager"],
                    help="Attention backend. 'auto' (default) uses "
                         "flash_attention_2 if installed (faster/lower-memory "
                         "prefill -> better TTFT; Ampere+ e.g. RTX 3060) and "
@@ -81,6 +82,10 @@ def parse_args():
                         "requires it (errors if missing). 'flashinfer' routes "
                         "DECODE attention through FlashInfer's CUDA kernel "
                         "(SDPA prefill + fallback; helps long-context decode). "
+                        "'sage' runs INT8 SageAttention on PREFILL via a Triton "
+                        "kernel (INT8 tensor-core QK^T on Ampere; no nvcc/build; "
+                        "SDPA fallback for decode/unsupported shapes). "
+                        "'triton_flash' is the FP16 Triton flash baseline. "
                         "'sdpa'/'eager' force.")
     p.add_argument("--compile", action="store_true", default=False,
                    help="torch.compile(mode='reduce-overhead') on the model: "

@@ -371,7 +371,14 @@ class InferenceEngine:
                     and silently falls back to ``"sdpa"`` if FA2 isn't
                     installed/supported. Pass ``"flash_attention_2"`` to
                     require it (raises if unavailable), or ``"sdpa"`` /
-                    ``"eager"`` to force a backend. Ignored on the streaming
+                    ``"eager"`` to force a backend. ``"sage"`` runs INT8
+                    SageAttention on prefill via a Triton kernel (no nvcc /
+                    no flash-attn build needed; INT8 tensor-core QKᵀ on
+                    Ampere, SDPA fallback for decode); ``"triton_flash"`` is
+                    the FP16 Triton flash baseline; ``"flashinfer"`` routes
+                    decode attention through FlashInfer. Each JIT/optional
+                    backend self-checks against SDPA on first use and
+                    disables itself on mismatch. Ignored on the streaming
                     path. To load a **quantized** checkpoint (AWQ/GPTQ →
                     Marlin int4 GEMM on Ampere, ~4× less weight bandwidth →
                     higher decode tok/s), just pass a quantized ``model_name``;

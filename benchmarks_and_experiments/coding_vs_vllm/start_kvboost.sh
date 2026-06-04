@@ -65,7 +65,6 @@ echo
 exec python -m kvboost.server \
     --model "$MODEL" \
     --dtype float16 \
-    --cuda-graph-decode \
     --attn-impl auto \
     --recompute-strategy cacheblend_sparse \
     --chunk-boundary-window 32\
