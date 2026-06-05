@@ -113,6 +113,7 @@ exec python -m kvboost.server \
     --dtype float16 \
     "${LOAD_ARGS[@]}" \
     --recompute-strategy "$RECOMPUTE" \
+    --cuda-graph-decode \
     --chunk-boundary-window 32 \
     --kv-cache-bits 8 \
     --max-cache-bytes "$MAX_CACHE_BYTES" \
