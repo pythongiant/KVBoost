@@ -49,75 +49,113 @@ def _try_resolve(candidates: tuple[tuple[str, str], ...]) -> Optional[Callable[.
     return None
 
 
-_GEMM_FN: Optional[Callable[..., Any]] = _try_resolve(_GEMM_CANDIDATES)
+def _resolve_gemm(
+    candidates: tuple[tuple[str, str], ...]
+) -> tuple[Optional[Callable[..., Any]], bool]:
+    """Resolve the GEMM fn AND whether it consumes the Marlin-repacked layout.
+
+    Only vLLM's ``awq_marlin_gemm`` reads the repacked layout; the autoawq
+    kernels (``gemm_forward_cuda`` / ``awq_gemm``) want the ORIGINAL AWQ packing,
+    so repacking the weights under them yields garbage. We track this so the
+    loader's repack step can no-op for the raw-layout kernels.
+    """
+    for module_name, attr in candidates:
+        try:
+            mod = __import__(module_name, fromlist=[attr])
+        except Exception:
+            continue
+        fn = getattr(mod, attr, None)
+        if fn is not None:
+            needs_repack = attr == "awq_marlin_gemm"
+            logger.debug(
+                "resolved %s.%s for AWQ GEMM (marlin_layout=%s)",
+                module_name, attr, needs_repack,
+            )
+            return fn, needs_repack
+    return None, False
+
+
+_GEMM_FN, _GEMM_NEEDS_REPACK = _resolve_gemm(_GEMM_CANDIDATES)
 _REPACK_FN: Optional[Callable[..., Any]] = _try_resolve(_REPACK_CANDIDATES)
 
 
 # ── Probe the kernel's call signature once at load time ──────────────────────
-# All known AWQ GEMM kernels use (x, qweight, qzeros, scales, last_arg) where
-# last_arg is either split_k_iters (autoawq style) or group_size (vLLM Marlin
-# style). We probe with tiny tensors here and cache the working call so the
-# hot forward path never pays try/except overhead.
+# AWQ int4 GEMM kernels DISAGREE on the call layout, so we can't assume one:
+#   * autoawq  awq_ext.gemm_forward_cuda : (x, qw, SCALES, ZEROS, split_k_iters)
+#   * vLLM     awq_gemm                  : (x, qw, ZEROS, SCALES, split_k_iters)
+#   * vLLM     awq_marlin_gemm           : (x, qw, ZEROS, SCALES, group_size)
+# They differ in BOTH the scales/zeros order AND the trailing int. We probe each
+# combination with tiny tensors and cache the first that runs. Because scales is
+# fp16 and zeros is int32, the WRONG scales/zeros order hits a kernel dtype check
+# and raises — so try/except reliably discriminates the order.
+# (An earlier version hard-coded only the vLLM (zeros, scales) order, which
+# silently disabled autoawq's awq_ext on every box that had it -> the slow torch
+# dequant fallback. That was the bug.)
 
-_SPLIT_K_ITERS = 8  # autoawq's default; tunes K-dim parallelism
+_SPLIT_K_ITERS = 8  # autoawq's default; tunes K-dim reduction parallelism
+
+# (label, scales_first, last_kind), most-preferred first. ``scales_first``
+# selects the autoawq (True) vs vLLM (False) order of the scales/zeros pair.
+_GEMM_SIG_CANDIDATES = (
+    ("autoawq (x,qw,scales,zeros,split_k)",    True,  "split_k"),
+    ("vllm    (x,qw,zeros,scales,split_k)",    False, "split_k"),
+    ("vllm    (x,qw,zeros,scales,group_size)", False, "group_size"),
+    ("autoawq (x,qw,scales,zeros,group_size)", True,  "group_size"),
+)
+
+
+def _make_gemm_caller(scales_first: bool, last_kind: str) -> Callable[..., Any]:
+    """Wrap _GEMM_FN so callers invoke it canonically as
+    ``caller(x_2d, qweight, qzeros, scales, group_size)`` regardless of the
+    kernel's native scales/zeros order or trailing-int convention."""
+    def _call(x_2d, qw, qz, sc, group_size):  # noqa: ANN001
+        last = _SPLIT_K_ITERS if last_kind == "split_k" else group_size
+        if scales_first:
+            return _GEMM_FN(x_2d, qw, sc, qz, last)
+        return _GEMM_FN(x_2d, qw, qz, sc, last)
+    return _call
 
 
 def _probe_gemm_signature() -> Optional[Callable[..., Any]]:
-    """Return a zero-argument callable that calls the resolved GEMM fn with the
-    correct arg order, or None if no kernel is available or the probe fails.
-
-    All known kernels share the layout:
-        fn(x_2d, qweight, qzeros, scales, last_arg)
-    where last_arg is split_k_iters (int) or group_size (int).
-    The old code had scales/qzeros SWAPPED on the first try, causing a
-    RuntimeError on every forward that silently fell through to the slow
-    torch dequant path.
+    """Return a caller invoking the resolved GEMM fn with the correct arg order,
+    or None if no kernel is available or every known signature fails the probe.
     """
     if _GEMM_FN is None:
         return None
 
     try:
         import torch as _torch
-        # Minimal tensors: in=128 (one group), out=16 (× pack=8 → 128 packed).
-        group_size_probe = 128
-        in_f, out_f = group_size_probe, 16
         device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
         if device.type != "cuda":
             return None
 
-        x_p       = _torch.zeros(1, in_f,   dtype=_torch.float16, device=device)
-        qw_p      = _torch.zeros(in_f, out_f, dtype=_torch.int32,   device=device)
-        scales_p  = _torch.ones(1, out_f * 8, dtype=_torch.float16, device=device)
-        qzeros_p  = _torch.zeros(1, out_f,    dtype=_torch.int32,   device=device)
+        # Minimal valid AWQ shapes: K=256 (2 groups of 128), N=256 (=32 × pack 8).
+        group_size_probe = 128
+        in_f, out_f = 256, 32
+        n_groups = in_f // group_size_probe
+        x_p      = _torch.zeros(1, in_f,            dtype=_torch.float16, device=device)
+        qw_p     = _torch.zeros(in_f, out_f,        dtype=_torch.int32,   device=device)
+        scales_p = _torch.ones(n_groups, out_f * 8, dtype=_torch.float16, device=device)
+        qzeros_p = _torch.zeros(n_groups, out_f,    dtype=_torch.int32,   device=device)
 
-        # Try split_k_iters style (autoawq / awq_ext).
-        try:
-            _GEMM_FN(x_p, qw_p, qzeros_p, scales_p, _SPLIT_K_ITERS)
-            logger.debug("marlin/awq GEMM: using split_k_iters signature")
-
-            def _call(x_2d, qw, qz, sc, *_):  # noqa: ANN001
-                return _GEMM_FN(x_2d, qw, qz, sc, _SPLIT_K_ITERS)
-
-            return _call
-        except (RuntimeError, TypeError):
-            pass
-
-        # Try group_size style (vLLM awq_marlin_gemm).
-        try:
-            _GEMM_FN(x_p, qw_p, qzeros_p, scales_p, group_size_probe)
-            logger.debug("marlin/awq GEMM: using group_size signature")
-
-            def _call(x_2d, qw, qz, sc, group_size):  # noqa: ANN001
-                return _GEMM_FN(x_2d, qw, qz, sc, group_size)
-
-            return _call
-        except (RuntimeError, TypeError):
-            pass
+        for label, scales_first, last_kind in _GEMM_SIG_CANDIDATES:
+            caller = _make_gemm_caller(scales_first, last_kind)
+            try:
+                out = caller(x_p, qw_p, qzeros_p, scales_p, group_size_probe)
+            except (RuntimeError, TypeError):
+                continue
+            # Guard against a silently-accepted wrong layout: the output must be
+            # (M, out_features) and finite.
+            if out.shape[0] != 1 or out.shape[-1] != out_f * 8 \
+                    or not _torch.isfinite(out).all():
+                continue
+            logger.info("marlin/awq GEMM: using %s signature", label)
+            return caller
 
         logger.warning(
-            "marlin/awq GEMM fn %r: neither split_k_iters nor group_size "
-            "signature worked during probe — disabling kernel. AWQ will use "
-            "ExLlamaV2 or the torch dequant fallback.",
+            "marlin/awq GEMM fn %r: no known signature worked during probe "
+            "(tried autoawq + vLLM orders x split_k/group_size) — disabling "
+            "kernel. AWQ will use ExLlamaV2 or the torch dequant fallback.",
             _GEMM_FN,
         )
         return None
@@ -181,7 +219,10 @@ def awq_marlin_repack(
     """Repack an AWQ ``qweight`` into Marlin's layout, if a repack kernel
     is available. Falls back to returning the input contiguous if not.
     """
-    if _REPACK_FN is None:
+    # Repack ONLY when the resolved GEMM actually consumes the Marlin layout
+    # (vLLM awq_marlin_gemm). The autoawq raw-layout kernels must keep the
+    # ORIGINAL AWQ packing, or the GEMM reads garbage.
+    if _REPACK_FN is None or not _GEMM_NEEDS_REPACK:
         return qweight.contiguous()
     try:
         return _REPACK_FN(qweight, in_features, out_features, num_bits)
