@@ -39,15 +39,25 @@ where::
     activation        = K × hidden_dim × 4_bytes  (per-layer, but
                         not all layers materialize simultaneously —
                         we cost the worst case: one layer's worth)
-    attention_scratch = K × N × n_heads × 4_bytes × 2  (scores + softmax
-                        intermediate; bounded by attention's O(KN)
-                        compute pattern)
+    attention_scratch = the LITERAL HBM the active attention backend
+                        allocates for one prefill forward (see
+                        ``_attention_scratch_bytes``)
+
+``attention_scratch`` is backend-specific, not a single worst-case
+constant. Only ``eager`` materializes the full ``K × N × n_heads`` fp32
+score matrix — the genuinely O(KN) term. Every flash/tiled backend
+kvboost actually runs (``flash_attention_2`` / ``sage`` / ``triton_flash``
+/ ``flashinfer`` / PyTorch ``sdpa`` on the fp16-causal-no-mask prefill
+path) keeps the scores in SRAM and allocates only per-call Q/K/V working
+buffers — linear in sequence length, not the K×N product. Modelling the
+math-backend worst case for those over-predicted peak by the chunk/seqlen
+ratio, so the planner now costs each backend's real allocation.
 
 These coefficients are derived from the same probe ``cost_model.py``
-runs at startup. Numbers are deliberately conservative — we add a
-15% safety margin on top of the prediction to absorb allocator
-fragmentation, scratchpads, and CUDA's reserved-but-unallocated
-blocks.
+runs at startup. We still add a 15% safety margin on top of the
+prediction to absorb allocator fragmentation, scratchpads, and CUDA's
+reserved-but-unallocated blocks, and the calibration tracker validates
+the per-backend model against measured peaks request by request.
 """
 
 from __future__ import annotations
@@ -360,6 +370,40 @@ class OOMPlanner:
         )
         self.head_dim = self.hidden_dim // max(self.num_heads, 1)
 
+        # Which attention backend prefill actually runs through. This
+        # decides whether peak scratch is the materialized O(K·N) fp32 score
+        # matrix (eager) or the tiled/linear footprint of a flash kernel.
+        # See ``_attention_scratch_bytes``.
+        self.attn_impl = self._detect_prefill_attn_impl()
+
+    # Backends whose prefill forward NEVER materializes the score matrix —
+    # the K×N scores live in on-chip SRAM tiles, so the only HBM transients
+    # are per-call Q/K/V working copies (linear in seq len). PyTorch SDPA
+    # belongs here on kvboost's prefill path: fp16, causal,
+    # ``attention_mask is None`` ⇒ it dispatches to the flash / mem-efficient
+    # kernel, never the math backend. ``eager`` (and anything unrecognized)
+    # is treated as materializing — the conservative side.
+    _TILED_ATTN_IMPLS = frozenset({
+        "sdpa", "flash_attention_2", "flash_attention_3",
+        "sage", "triton_flash", "flashinfer", "kvboost_cuda",
+    })
+
+    def _detect_prefill_attn_impl(self) -> str:
+        """Resolved attention impl HF committed to at load, lower-cased.
+
+        Read from ``model.config._attn_implementation`` — where transformers
+        records the backend it actually wired up, including our registered
+        ``sage`` / ``triton_flash`` keys. Returns ``"unknown"`` when the
+        attribute is absent so the caller falls back to the conservative
+        (materializing) scratch model. Note: when sage/triton_flash
+        self-disable at runtime they fall back to SDPA, which is still a
+        tiled kernel on this path — so the classification stays correct
+        without us having to watch their per-call runtime state.
+        """
+        cfg = getattr(self.engine.model, "config", None)
+        impl = getattr(cfg, "_attn_implementation", None)
+        return impl.lower() if isinstance(impl, str) else "unknown"
+
     # ── Memory estimation ────────────────────────────────────────────
 
     def _bytes_per_token_kv(self, kv_bits: int) -> float:
@@ -422,18 +466,56 @@ class OOMPlanner:
         # One chunk's hidden states, fp16 (2 bytes).
         chunk_activation_bytes = effective_chunk * self.hidden_dim * 2
 
-        # Attention scores at the worst-case prefill step: effective_chunk
-        # queries × all accumulated keys. 4 bytes (fp32 softmax accumulator
-        # in the SDPA math backend) × 2 (scores + softmax temp). This is
-        # the term that OOMs without chunking — bounding effective_chunk is
-        # exactly what the CacheBlend chunking fix enforces at runtime.
-        scratch_bytes = effective_chunk * prompt_tokens * self.num_heads * 4 * 2
+        # Literal attention-scratch allocation for the active backend — the
+        # materialized O(K·N) score matrix only for eager; the tiled/linear
+        # working set for the flash family. See _attention_scratch_bytes.
+        scratch_bytes = self._attention_scratch_bytes(
+            effective_chunk, prompt_tokens
+        )
 
         attention_transient = max(
             floor_bytes, chunk_activation_bytes + scratch_bytes
         )
         peak = kv_bytes + attention_transient
         return peak / (1024.0 ** 2)
+
+    def _attention_scratch_bytes(
+        self, effective_chunk: int, prompt_tokens: int
+    ) -> float:
+        """Literal peak attention-scratch HBM allocation, in bytes, for the
+        prefill backend in ``self.attn_impl``.
+
+        This used to be modelled as the SDPA *math* backend worst case
+        (``effective_chunk × prompt_tokens × n_heads`` fp32 scores ×2). That
+        allocation is real only for ``eager``. Every flash/tiled backend
+        kvboost runs keeps the scores in SRAM and never allocates the K×N
+        matrix in HBM, so for those we cost the *literal* transients the
+        kernel materializes — all linear in sequence length.
+        """
+        hd = self.head_dim
+        q_elems = effective_chunk * self.num_heads * hd        # this chunk's Q
+        kv_elems = prompt_tokens * self.num_kv_heads * hd       # full K (or V)
+
+        if self.attn_impl not in self._TILED_ATTN_IMPLS:
+            # eager (or unrecognized/forced-math): the full fp32 score matrix
+            # + softmax temporary. The genuinely O(K·N) term, and the reason
+            # chunking exists for this backend.
+            return effective_chunk * prompt_tokens * self.num_heads * 4 * 2
+
+        if self.attn_impl == "sage":
+            # INT8 SageAttention upcasts to fp32 before quantising
+            # (kernels/sage_attn._quant_per_token does ``q.float()``;
+            # _smooth_and_quant_k does ``k.float()`` then ``k - delta``).
+            # Per element: Q → fp32(4) + int8(1) + fp16 out(2);
+            # K → fp32(4) + (k−delta) fp32(4) + int8(1); V → fp16(2).
+            # Per-token scales (one fp32 per token-head) are negligible.
+            return q_elems * (4 + 1 + 2) + kv_elems * (4 + 4 + 1) + kv_elems * 2
+
+        # fp16 flash family (flash_attention_2 / triton_flash / flashinfer /
+        # sdpa): contiguous Q/K/V working copies (2 bytes) + fp16 output + a
+        # small fp32 logsumexp (one per query-head). Budget ~2 fp16 copies of
+        # K/V to cover ``.contiguous()`` plus the kernel's internal staging.
+        return (q_elems + 2 * kv_elems) * 2 + effective_chunk * self.num_heads * 4
 
     def _activation_floor_mb(self) -> float:
         """Per-forward activation working-set floor in MiB.
@@ -648,6 +730,12 @@ class OOMPlanner:
                 "num_kv_heads": self.num_kv_heads,
                 "head_dim": self.head_dim,
             },
+            "attn_impl": self.attn_impl,
+            "attn_scratch_model": (
+                "materialized" if self.attn_impl not in self._TILED_ATTN_IMPLS
+                else "sage_int8" if self.attn_impl == "sage"
+                else "tiled_fp16"
+            ),
             "free_vram_mb_now": self._free_vram_mb(),
             "calibration": self.calibration.stats(),
         }
