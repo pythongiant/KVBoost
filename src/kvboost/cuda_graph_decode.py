@@ -107,6 +107,23 @@ class CUDAGraphDecoder:
             torch.cuda.is_available() and self.device.type == "cuda"
 
     # ------------------------------------------------------------------
+    # Module classes whose forward calls a custom CUDA kernel (int4 AWQ GEMM,
+    # streaming weight rebind) that torch.compile cannot trace. Their presence
+    # graph-breaks the WHOLE forward: reduce-overhead captures an EMPTY CUDA
+    # graph (flooding "The CUDA Graph is empty") and gives no speedup. CUDA-graph
+    # decode only helps a plain fp16 model (native Linear → cuBLAS → traceable).
+    _UNCAPTURABLE_MODULES = ("StreamingQLinear",)
+
+    def _uncapturable_module(self) -> Optional[str]:
+        try:
+            for m in self.model.modules():
+                cls = type(m).__name__
+                if cls in self._UNCAPTURABLE_MODULES:
+                    return cls
+        except Exception:
+            pass
+        return None
+
     def _probe(self) -> bool:
         if self._config is None:
             return False
@@ -116,7 +133,21 @@ class CUDAGraphDecoder:
             return False
         if self.force_eager:
             return True
-        return torch.cuda.is_available() and self.device.type == "cuda"
+        if not torch.cuda.is_available() or self.device.type != "cuda":
+            return False
+        # Refuse models torch.compile can't capture (AWQ streaming / int4): they
+        # graph-break to an empty CUDA graph with no speedup, just noise.
+        kind = self._uncapturable_module()
+        if kind is not None:
+            log.warning(
+                "CUDA-graph decode disabled: model uses %s (custom int4/"
+                "streaming kernel) that torch.compile cannot capture — it would "
+                "graph-break to an empty CUDA graph with no speedup. CUDA-graph "
+                "decode targets the plain fp16 path; for int4 decode speed use a "
+                "real Marlin kernel instead.", kind,
+            )
+            return False
+        return True
 
     def applicable(self, batch_size: int = 1) -> bool:
         return self._ok and not self._disabled and batch_size == 1
