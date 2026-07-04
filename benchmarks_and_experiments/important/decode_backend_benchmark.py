@@ -102,20 +102,57 @@ def _measure_one(label: str, model_name: str, cuda_graph: bool,
                  *, attn: str, max_cache_bytes: int, prompt_tokens: int,
                  gen_tokens: int) -> DecodeResult:
     """Load one engine config, warm it up, then time steady-state decode."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     from kvboost.engine import InferenceEngine
 
     log.info("=== %s: loading %s (cuda_graph_decode=%s) ===",
              label, model_name, cuda_graph)
-    engine = InferenceEngine.from_pretrained(
-        model_name,
-        strict=False,
-        attn_implementation=attn,
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Explicit-dict device_map, mirroring server/__main__.py's standard load
+    # path: the bare-string form can leave AWQ-Marlin buffers on `meta`.
+    target = device if (":" in device or device in ("cpu", "mps")) else f"{device}:0"
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # DO NOT use InferenceEngine.from_pretrained here: it loads on CPU with no
+    # device_map, and __init__ skips .to(device) for quantized models (they
+    # can't be moved post-load) — so an AWQ checkpoint stays on CPU and the
+    # forward dies with a device mismatch (embed_tokens on cpu, ids on cuda).
+    # Replicate the server's real load: device_map={"": target} +
+    # low_cpu_mem_usage=False places AWQ/GPTQ-Marlin weights on the GPU at load
+    # time. transformers auto-detects a pre-quantized checkpoint's
+    # quantization_config; a plain fp16 checkpoint loads the same way.
+    want_fa2 = attn in ("auto", "flash_attention_2")
+    load_kwargs = dict(
+        dtype=torch.float16,
+        low_cpu_mem_usage=False,
+        device_map={"": target},
+        attn_implementation=("flash_attention_2" if want_fa2 else attn),
+    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    except Exception as e:
+        if not want_fa2:
+            raise
+        log.info("flash_attention_2 unavailable (%s); using sdpa", e)
+        load_kwargs["attn_implementation"] = "sdpa"
+        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    model.eval()
+
+    engine = InferenceEngine(
+        model=model,
+        tokenizer=tokenizer,
         max_cache_bytes=max_cache_bytes,
+        device=device,
         cuda_graph_decode=cuda_graph,
     )
     try:
-        prompt = _build_prompt(engine.tokenizer, prompt_tokens)
-        p_tokens = len(engine.tokenizer.encode(prompt))
+        prompt = _build_prompt(tokenizer, prompt_tokens)
+        p_tokens = len(tokenizer.encode(prompt))
         cgd_active = bool(getattr(engine, "_cgd", None) is not None
                           and engine._cgd.applicable())
 
