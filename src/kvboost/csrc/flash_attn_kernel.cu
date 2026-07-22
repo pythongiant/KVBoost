@@ -39,21 +39,6 @@
 constexpr int BR = 64;   // query tile rows
 constexpr int BC = 64;   // key/value tile cols
 
-// ── Warp helpers ──────────────────────────────────────────────────────────────
-__device__ __forceinline__ float warp_reduce_max(float val) {
-#pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1)
-        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, mask));
-    return val;
-}
-
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-#pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1)
-        val += __shfl_xor_sync(0xffffffff, val, mask);
-    return val;
-}
-
 // ── fp16 / bf16 load helpers ──────────────────────────────────────────────────
 template <typename scalar_t>
 __device__ __forceinline__ float to_float(scalar_t x);
@@ -118,9 +103,10 @@ __global__ void flash_attn_fwd_kernel(
     float* L_bh = L + ((long)b_idx * H + h_idx) * S;
 
     // ── Shared memory for K and V tiles ──────────────────────────────────────
-    // K tile: BC x HEAD_DIM, V tile: BC x HEAD_DIM
-    __shared__ float K_tile[BC][HEAD_DIM];
-    __shared__ float V_tile[BC][HEAD_DIM];
+    // Stored in native (fp16/bf16) precision so both tiles fit in 48 KB even at
+    // HEAD_DIM=128 (2 × 64 × 128 × 2B = 32 KB); converted to fp32 at point of use.
+    __shared__ scalar_t K_tile[BC][HEAD_DIM];
+    __shared__ scalar_t V_tile[BC][HEAD_DIM];
 
     // ── Thread-local registers: Q row, output accumulator ────────────────────
     float q_row_reg[HEAD_DIM];       // cached Q row (stays in registers)
@@ -148,86 +134,55 @@ __global__ void flash_attn_fwd_kernel(
         if (causal && kv_start > q_row)
             break;
 
-        // Collaborative load of K tile (BC x HEAD_DIM)
-        // Each thread loads one row of K (stride = 1 thread per K row using tid mod BC)
+        // Collaborative load of K and V tiles into shared memory. BR == BC, so
+        // each thread loads exactly one row of both K and V (native precision).
         for (int row = tid; row < BC; row += BR) {
             const int kv_row = kv_start + row;
             if (kv_row < S) {
                 const scalar_t* k_ptr = K_bh + kv_row * HEAD_DIM;
-#pragma unroll
-                for (int d = 0; d < HEAD_DIM; d++)
-                    K_tile[row][d] = to_float(k_ptr[d]);
-            } else {
-#pragma unroll
-                for (int d = 0; d < HEAD_DIM; d++)
-                    K_tile[row][d] = 0.0f;
-            }
-        }
-
-        // Collaborative load of V tile
-        for (int row = tid; row < BC; row += BR) {
-            const int kv_row = kv_start + row;
-            if (kv_row < S) {
                 const scalar_t* v_ptr = V_bh + kv_row * HEAD_DIM;
 #pragma unroll
-                for (int d = 0; d < HEAD_DIM; d++)
-                    V_tile[row][d] = to_float(v_ptr[d]);
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    K_tile[row][d] = k_ptr[d];
+                    V_tile[row][d] = v_ptr[d];
+                }
             } else {
 #pragma unroll
-                for (int d = 0; d < HEAD_DIM; d++)
-                    V_tile[row][d] = 0.0f;
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    K_tile[row][d] = from_float<scalar_t>(0.0f);
+                    V_tile[row][d] = from_float<scalar_t>(0.0f);
+                }
             }
         }
         __syncthreads();
 
-        // ── Compute QK^T for this thread's Q row ─────────────────────────────
+        // ── Online-softmax accumulation for this thread's Q row ──────────────
+        // Single fused pass: each score is computed once, then the FlashAttn-2
+        // running-max update rescales prior state and folds in key j.
         if (q_row < S) {
-            // Find tile row-max for online softmax update
-            float m_new = m;
-
             for (int j = 0; j < BC; j++) {
                 const int kv_row = kv_start + j;
                 if (kv_row >= S) break;
+                if (causal && kv_row > q_row) break;   // mask future keys
 
-                // Causal: mask future keys
-                if (causal && kv_row > q_row) break;
-
+                // score_j = scale * (q · k_j)
                 float qk = 0.0f;
 #pragma unroll
                 for (int d = 0; d < HEAD_DIM; d++)
-                    qk += q_row_reg[d] * K_tile[j][d];
+                    qk += q_row_reg[d] * to_float(K_tile[j][d]);
                 qk *= scale;
 
-                m_new = fmaxf(m_new, qk);
-            }
+                const float m_new = fmaxf(m, qk);
+                const float alpha = expf(m - m_new);    // rescale factor for old max
+                const float p     = expf(qk - m_new);   // weight of key j
 
-            // Rescale accumulator for new max
-            float alpha = expf(m - m_new);
-            float l_new = l * alpha;
-#pragma unroll
-            for (int d = 0; d < HEAD_DIM; d++) acc[d] *= alpha;
-
-            // Accumulate softmax(QK^T) * V
-            for (int j = 0; j < BC; j++) {
-                const int kv_row = kv_start + j;
-                if (kv_row >= S) break;
-                if (causal && kv_row > q_row) break;
-
-                float qk = 0.0f;
+                l = l * alpha + p;
 #pragma unroll
                 for (int d = 0; d < HEAD_DIM; d++)
-                    qk += q_row_reg[d] * K_tile[j][d];
-                qk *= scale;
+                    acc[d] = acc[d] * alpha + p * to_float(V_tile[j][d]);
 
-                float p = expf(qk - m_new);
-                l_new += p;
-#pragma unroll
-                for (int d = 0; d < HEAD_DIM; d++)
-                    acc[d] += p * V_tile[j][d];
+                m = m_new;
             }
-
-            m = m_new;
-            l = l_new;
         }
         __syncthreads();
     }
